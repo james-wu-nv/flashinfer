@@ -184,7 +184,11 @@ class PagedAttention:
     """
 
     def __init__(
-        self, device: Optional[torch.device] = None, *, use_cuda_graph: bool = False
+        self,
+        device: Optional[torch.device] = None,
+        *,
+        use_cuda_graph: bool = False,
+        workspace_buffer: Optional[torch.Tensor] = None,
     ):
         """
         - ``use_cuda_graph``: reserve metadata storage so ``run()`` can be
@@ -194,10 +198,21 @@ class PagedAttention:
           a later plan that would change any of them is rejected, and a plan
           that fails midway restores the previous plan's buffers.  Use one
           instance per graph bucket.
+        - ``workspace_buffer``: optional caller-owned scratch workspace
+          (contiguous 1-D uint8 on ``device``; the legacy wrappers' 128 MB
+          convention) that every backend's kernels run on — pass the buffer
+          the engine already shares with its legacy wrappers.  By default
+          every instance on a device shares one lazily allocated
+          library-owned pool, so holding one instance per graph bucket costs
+          no workspace per bucket.  Instances sharing a workspace must not run
+          concurrently on different streams; pass a private buffer where that
+          isolation is needed.
         """
         from .experimental.paged_attention import PagedAttentionController
 
-        self._impl = PagedAttentionController(device, use_cuda_graph=use_cuda_graph)
+        self._impl = PagedAttentionController(
+            device, use_cuda_graph=use_cuda_graph, workspace_buffer=workspace_buffer
+        )
 
     @property
     def device(self) -> torch.device:

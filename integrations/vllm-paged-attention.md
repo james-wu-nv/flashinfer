@@ -28,9 +28,13 @@ with decode and wait for the decode follow-up).
 +    window_left=self.window_left,      # uniform per batch, as today
 +    need_lse=False,                    # DCP stays on the current path (below)
 +)
-+# constructed ONCE here (it owns 128 MB workspace; per-build construction
-+# would re-allocate every scheduler step)
-+self._prefill_attn = PagedAttention(self.device)
++# constructed ONCE here (per-build construction would redo backend setup every
++# scheduler step).  Workspace: pass the global buffer vLLM already shares with
++# its legacy wrappers; without it, instances share a per-device library pool,
++# so one instance per cudagraph bucket costs no workspace per bucket.
++self._prefill_attn = PagedAttention(
++    self.device, workspace_buffer=self._get_workspace_buffer()
++)
 ```
 
 Deletes on the prefill side: the `prefill_use_trtllm` predicate

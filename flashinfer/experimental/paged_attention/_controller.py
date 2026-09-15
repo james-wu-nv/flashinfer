@@ -18,6 +18,7 @@ its generated backends.
 from __future__ import annotations
 
 import math
+import threading
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
 import torch
@@ -36,17 +37,72 @@ from ._graph import GraphBuffers, Transaction
 from ._planning import Derived, validate_causal_envelope
 from ._selection import resolve_paged_attention
 
+# ---------------------------------------------------------------------------
+# Scratch workspace.  Every backend runs on plain scratch (the role of the
+# legacy wrappers' caller-owned float_workspace_buffer; trtllm-gen carves its
+# softmax-stats/scratch regions out of the same kind of buffer).  An engine
+# holds one controller per CUDA-graph bucket, so the workspace is ONE lazily
+# allocated pool per device shared by every instance, unless the caller passes
+# its own (e.g. the buffer it already shares with legacy wrappers).  Sharing
+# follows the legacy wrappers' rule: instances sharing a workspace must not
+# run concurrently on different streams.
+# ---------------------------------------------------------------------------
+_WORKSPACE_BYTES = 128 * 1024 * 1024  # the legacy wrappers' documented default
+_shared_workspaces: Dict[torch.device, torch.Tensor] = {}
+_shared_workspaces_lock = threading.Lock()
+
+
+def _shared_workspace(device: torch.device) -> torch.Tensor:
+    with _shared_workspaces_lock:
+        ws = _shared_workspaces.get(device)
+        if ws is None:
+            ws = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+            _shared_workspaces[device] = ws
+        return ws
+
+
+def _validate_workspace_buffer(buf: Any, device: torch.device) -> torch.Tensor:
+    """Caller-supplied scratch workspace -> flat uint8 view on ``device``."""
+    _expect(
+        isinstance(buf, torch.Tensor),
+        f"workspace_buffer must be a torch.Tensor, got {type(buf).__name__}",
+    )
+    _expect(
+        buf.device == device,
+        f"workspace_buffer lives on {buf.device} but this instance is bound to {device}",
+    )
+    _expect(
+        buf.dim() == 1 and buf.is_contiguous(),
+        "workspace_buffer must be a contiguous 1-D byte tensor, got shape "
+        f"{tuple(buf.shape)}",
+    )
+    _expect(
+        buf.dtype in (torch.uint8, torch.int8),
+        f"workspace_buffer must be uint8/int8, got {buf.dtype}",
+    )
+    return buf.view(torch.uint8)
+
 
 class PagedAttentionController:
     def __init__(
-        self, device: Optional[torch.device] = None, *, use_cuda_graph: bool = False
+        self,
+        device: Optional[torch.device] = None,
+        *,
+        use_cuda_graph: bool = False,
+        workspace_buffer: Optional[torch.Tensor] = None,
     ):
         dev = torch.device(device) if device is not None else torch.device("cuda")
         if dev.type == "cuda" and dev.index is None:
             dev = torch.device("cuda", torch.cuda.current_device())
         self.device = dev
         self._backends: Dict[Any, Any] = {}
-        self._workspace: Optional[torch.Tensor] = None
+        # the caller's scratch buffer, or (lazily, on the first plan) the
+        # per-device shared one — never a per-instance allocation
+        self._workspace: Optional[torch.Tensor] = (
+            _validate_workspace_buffer(workspace_buffer, dev)
+            if workspace_buffer is not None
+            else None
+        )
         # CUDA-graph mode: reserved storage sized by the first plan (_graph.py)
         self._use_cuda_graph = use_cuda_graph
         self._graph: Optional[GraphBuffers] = None
@@ -67,15 +123,9 @@ class PagedAttentionController:
     def resolution(self) -> Optional[Resolution]:
         return self._resolution
 
-    def _shared_workspace(self) -> torch.Tensor:
-        # One scratch workspace shared by the fa/cudnn backends (they never
-        # run concurrently within one instance).  trtllm-gen keeps a private
-        # zero-initialized buffer: its kernels rely on counter semantics that
-        # a scribbled-on shared buffer would violate.
+    def _scratch_workspace(self) -> torch.Tensor:
         if self._workspace is None:
-            self._workspace = torch.empty(
-                128 * 1024 * 1024, dtype=torch.uint8, device=self.device
-            )
+            self._workspace = _shared_workspace(self.device)
         return self._workspace
 
     # ------------------------------ plan ------------------------------
@@ -223,7 +273,7 @@ class PagedAttentionController:
                 name,
                 self.device,
                 kv_layout,
-                self._shared_workspace(),
+                self._scratch_workspace(),
                 graph_capacity=self._graph.capacity
                 if self._graph is not None
                 else None,

@@ -34,7 +34,9 @@ multimodal / deterministic mode).  Explicitly OUT of the v1 diff:
 +    need_lse=True,                    # merge_state consumes LSE
 +    kv_input_form="page_indices",     # the flat kv_indices sglang builds
 +)
-+self.prefill_attn = PagedAttention(self.device)
++# workspace_buffer: hand it the workspace sglang already shares with its
++# legacy wrappers; omitted, instances share a per-device library pool
++self.prefill_attn = PagedAttention(self.device, workspace_buffer=self.workspace_buffer)
 ```
 
 `backend="fa2"` pinning becomes unnecessary: at page_size=1 the

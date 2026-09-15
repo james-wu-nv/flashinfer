@@ -215,7 +215,10 @@ answers at engine init which backends can run a configuration and why the
 others cannot; ``plan()`` declares the LSE base (``lse_mode``) and ``run()``
 takes the per-layer ``sm_scale`` and, for an fp8 KV cache, the per-tensor
 ``k_scale`` / ``v_scale``. ``PagedAttention(use_cuda_graph=True)`` reserves
-metadata storage so a captured ``run()`` can be re-planned and replayed. Calling any of these is the opt-in (an
+metadata storage so a captured ``run()`` can be re-planned and replayed; the
+kernel workspace is shared per device (or caller-supplied via
+``workspace_buffer=``), so one instance per graph bucket costs no workspace per
+bucket. Calling any of these is the opt-in (an
 ``ExperimentalWarning`` is emitted once); see the tracking issue
 `#5007 <https://github.com/flashinfer-ai/flashinfer/issues/5007>`_ for the
 graduation plan.
