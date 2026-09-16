@@ -1,8 +1,11 @@
 """fa2/fa3 backend: the existing BatchPrefillWithPagedKVCacheWrapper.
 
-Dialect: CSR page metadata + host arrays for the split-KV scheduler
-(computed from the mirrors the contract layer guarantees — zero-sync).
-The generated FA wrapper holds its own plan state, so this backend keeps one
+Dialect: CSR page metadata + host arrays for the split-KV scheduler.  The
+host arrays are the pinned int32 views the derivation layer computed from the
+mirrors (``FORM_HOST_ARRAYS``), so the wrapper's ``non_blocking`` uploads of
+them are real asynchronous copies; from pageable memory they would each be a
+blocking staging copy (ledger M6, the vLLM pin_host_range_buf lesson).  The
+generated FA wrapper holds its own plan state, so this backend keeps one
 wrapper instance as stable storage and re-plans it in place.
 
 Features: ``logits_soft_cap`` and ``custom_mask`` go to the wrapper's plan()
@@ -22,7 +25,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from .._contracts import LN2, PlanMetadata
-from .._planning import FORM_KV_PAGE_INDICES, Derived
+from .._planning import FORM_HOST_ARRAYS, FORM_KV_PAGE_INDICES, Derived
 from ._capabilities import _BackendPlanUnsupportedError
 
 
@@ -60,9 +63,9 @@ def _envelope_mask(custom_mask: torch.Tensor, meta: PlanMetadata) -> torch.Tenso
 
 
 class _FaBackend:
-    # CSR page ids on device; the page indptr / last-page lengths travel as
-    # host arrays (the wrapper uploads them itself)
-    DERIVED_NEEDS = frozenset({FORM_KV_PAGE_INDICES})
+    # CSR page ids on device; the indptr / last-page lengths / KV lengths
+    # travel as pinned host arrays (the wrapper uploads them itself)
+    DERIVED_NEEDS = frozenset({FORM_KV_PAGE_INDICES, FORM_HOST_ARRAYS})
 
     def __init__(
         self, device, kv_layout, workspace, backend: str = "fa2", graph_capacity=None
@@ -194,17 +197,6 @@ class _FaBackend:
                 f"{tuple(idx.stride())}: the kernel walks the flat page-id list as a "
                 "packed int32 array — pass kv_page_indices.contiguous()"
             )
-        qo_host = meta.qo_indptr_cpu.to(torch.int32)
-        kv_lens_host = meta.kv_seq_lens_cpu.to(torch.int32)
-        page = meta.page_size
-        pages_host = (kv_lens_host + page - 1) // page
-        kv_indptr_host = torch.cat(
-            [
-                torch.zeros(1, dtype=torch.int32),
-                torch.cumsum(pages_host, 0, dtype=torch.int32),
-            ]
-        )
-        last_len_host = ((kv_lens_host - 1) % page + 1).to(torch.int32)
         custom_mask = (
             _envelope_mask(meta.custom_mask, meta)
             if meta.custom_mask is not None
@@ -218,15 +210,20 @@ class _FaBackend:
                 self._sink_wrappers[key] = wrapper
         else:
             wrapper = self._wrapper
+        # Host arrays: pinned views the derivation layer already computed, so
+        # nothing is allocated or derived here and every upload the wrapper
+        # issues from them is asynchronous.  seq_lens= and
+        # max_token_per_sequence= hand the wrapper values it would otherwise
+        # recompute from the indptrs on the host.
         wrapper.plan(
-            qo_host,
-            kv_indptr_host,
+            derived.require("qo_indptr_host"),
+            derived.require("kv_page_indptr_host"),
             idx,
-            last_len_host,
+            derived.require("kv_last_page_len_host"),
             meta.num_qo_heads,
             meta.num_kv_heads,
             meta.head_dim_qk,
-            page,
+            meta.page_size,
             head_dim_vo=meta.head_dim_vo,
             # with a custom mask the wrapper selects MaskMode.CUSTOM and the
             # causal envelope is already folded into the mask above
@@ -236,6 +233,8 @@ class _FaBackend:
             logits_soft_cap=meta.logits_soft_cap,  # None -> 0.0 (off) in the wrapper
             q_data_type=meta.q_dtype,
             kv_data_type=meta.kv_dtype,
+            seq_lens=derived.require("kv_seq_lens_host"),
+            max_token_per_sequence=meta.max_q_len,
         )
         # publish only after the wrapper's plan returned
         self._active = wrapper
