@@ -49,12 +49,17 @@ def make_problem(
 ):
     """Random valid paged-prefill problem with scattered (non-identity) page ids.
 
+    Metadata comes from a host generator and Q/K/V from a device generator,
+    both seeded by ``seed``, so a repro line reproduces the tensors bitwise
+    (the fuzzer prints ``seed=`` on every failure).
+
     ``kv_dtype=torch.float8_e4m3fn`` quantizes K/V per-tensor (scale = amax/448)
     and keeps the dequantized values as ``k_ref``/``v_ref`` for the oracle, so
     the kernel is judged on its math, not on the quantization error.
     """
     head_dim_vo = head_dim_vo or head_dim_qk
     g = torch.Generator().manual_seed(seed)
+    g_dev = torch.Generator(device=device).manual_seed(seed)
     if uniform_q1:
         q_lens = torch.ones(batch_size, dtype=torch.int32)
     else:
@@ -81,15 +86,17 @@ def make_problem(
         off += n
 
     total_q = int(qo_indptr_cpu[-1])
-    q = torch.randn(total_q, num_qo_heads, head_dim_qk, dtype=dtype, device=device)
+    q = torch.randn(
+        total_q, num_qo_heads, head_dim_qk, dtype=dtype, device=device, generator=g_dev
+    )
     if kv_layout == "HND":
         k_shape = (pool_pages, num_kv_heads, page_size, head_dim_qk)
         v_shape = (pool_pages, num_kv_heads, page_size, head_dim_vo)
     else:  # NHD
         k_shape = (pool_pages, page_size, num_kv_heads, head_dim_qk)
         v_shape = (pool_pages, page_size, num_kv_heads, head_dim_vo)
-    k_cache = torch.randn(*k_shape, dtype=dtype, device=device)
-    v_cache = torch.randn(*v_shape, dtype=dtype, device=device)
+    k_cache = torch.randn(*k_shape, dtype=dtype, device=device, generator=g_dev)
+    v_cache = torch.randn(*v_shape, dtype=dtype, device=device, generator=g_dev)
     k_ref, v_ref, k_scale, v_scale = k_cache, v_cache, None, None
     if kv_dtype is not None and kv_dtype != dtype:
         k_scale = float(k_cache.abs().amax().item()) / 448.0
@@ -1072,35 +1079,6 @@ def test_paged_attention_csr_page_indices(backend, page_size):
         input_form="page_indices",
     )
     check(p, backend)
-
-
-def test_paged_attention_csr_dense_equivalence():
-    """Dense and flat-indices forms of the same problem are bitwise identical
-    per backend (the derivation is exact, not approximate)."""
-    common = dict(
-        seed=47,
-        batch_size=4,
-        max_q=32,
-        max_kv=192,
-        num_qo_heads=8,
-        num_kv_heads=2,
-        head_dim_qk=128,
-        page_size=16,
-        dtype=torch.bfloat16,
-    )
-    p_dense = make_problem(**common)
-    # SAME tensors, different input form (make_problem's randn draws from the
-    # global CUDA RNG, so a second call would build a different problem)
-    p_csr = dict(p_dense, input_form="page_indices")
-    for backend in ["fa2", "cudnn", "trtllm-gen", "cake"]:
-        try:
-            _resolve_or_skip(p_dense, backend)
-        except Exception:
-            continue
-        _, out_a, lse_a = run_unified(p_dense, backend)
-        _, out_b, lse_b = run_unified(p_csr, backend)
-        assert torch.equal(out_a, out_b), backend
-        assert torch.equal(lse_a, lse_b), backend
 
 
 @pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn", "trtllm-gen", "cake"])

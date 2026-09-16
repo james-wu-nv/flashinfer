@@ -24,7 +24,11 @@ Mechanics:
       (e.g. non-monotonic indptr): the ONLY acceptable outcome is a raise.
 - Every failure prints a standalone repro line (seed + mutation).
 
-Trials per backend via FI_UNIFIED_FUZZ_TRIALS (default 30).
+Trials per backend via FI_UNIFIED_FUZZ_TRIALS (default 30).  Each test prints
+its effective counts (sampled / filtered by resolve / executed / outcome) so a
+report can tell a 30-trial run from a run where resolve() filtered everything
+(``pytest -s`` or ``-rP`` shows them).  ``make_problem`` seeds both the host
+and the device generator, so the printed ``seed=`` reproduces Q/K/V bitwise.
 
 Known gaps (documented caller contract; the corresponding mutations are
 marked xfail rather than dropped, so the gap stays visible in reports):
@@ -416,13 +420,14 @@ def _run_and_check(p, backend, causal, repro, window_left=-1, lse_mode="base2"):
 def test_fuzz_valid_configs(backend):
     """Valid configs must run AND be correct — capability honesty included:
     if resolve() admits it, no excuse is accepted at run time."""
-    ran = 0
+    ran = filtered = 0
     for trial in range(TRIALS):
         seed = 10_000 + trial
         rng = random.Random(seed)
         cfg = _sample_config(rng)
         p = _build(seed, cfg)
         if not _backend_runnable(p, backend, cfg["causal"], cfg["window_left"]):
+            filtered += 1
             continue
         repro = f"backend={backend} seed={seed} cfg={cfg}"
         outcome, _ = _run_and_check(
@@ -438,6 +443,9 @@ def test_fuzz_valid_configs(backend):
             f"the backend cannot run [{repro}]"
         )
         ran += 1
+    print(
+        f"[fuzz valid] backend={backend} sampled={TRIALS} filtered={filtered} ran={ran}"
+    )
     if ran == 0:
         pytest.skip(f"no valid trial runnable for backend {backend} on this GPU")
 
@@ -453,8 +461,10 @@ def test_fuzz_reject_or_correct(backend, mutation):
             "documented trusted input (see module docstring Known gaps): "
             "value-level block-table validation needs a device-side pass"
         )
-    checked = 0
-    for trial in range(max(3, TRIALS // 5)):
+    checked = filtered = 0
+    outcomes = {"rejected": 0, "rejected_runtime": 0, "correct": 0}
+    n_trials = max(3, TRIALS // 5)
+    for trial in range(n_trials):
         seed = 20_000 + trial
         rng = random.Random(seed)
         cfg = _sample_config(rng)
@@ -467,6 +477,7 @@ def test_fuzz_reject_or_correct(backend, mutation):
         cfg["page_size"] = max(cfg["page_size"], 16)
         p = _build(seed, cfg)
         if not _backend_runnable(p, backend, cfg["causal"]):
+            filtered += 1
             continue
         mutated = mutate(p)
         wl = mutated.get("_window_left_override", -1)
@@ -485,19 +496,27 @@ def test_fuzz_reject_or_correct(backend, mutation):
                 merged, backend, cfg["causal"], repro, window_left=wl
             )
             assert outcome in ("rejected", "correct")
+            outcomes[outcome] += 1
         else:
             try:
                 run_unified(mutated, backend, causal=cfg["causal"], window_left=wl)
             except CLEAN as e:
                 assert str(e), f"empty error message [{repro}]"
+                outcomes["rejected"] += 1
             except RuntimeError as e:
                 # kernel-level rejection is acceptable only if it is loud and
                 # synchronous; record it distinctly so we can tighten later.
                 assert str(e), f"empty RuntimeError [{repro}]"
+                outcomes["rejected_runtime"] += 1
             else:
                 raise AssertionError(
                     f"self-contradictory input was ACCEPTED silently [{repro}]"
                 )
         checked += 1
+    print(
+        f"[fuzz mutation] backend={backend} mutation={name} sampled={n_trials} "
+        f"filtered={filtered} checked={checked} "
+        + " ".join(f"{k}={v}" for k, v in outcomes.items())
+    )
     if checked == 0:
         pytest.skip(f"no runnable trial for backend {backend}")
