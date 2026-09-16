@@ -1039,6 +1039,66 @@ def test_cudnn_writes_packed_lse_directly(max_q):
     assert with_lse and all("cudnn" in e for e in with_lse), with_lse
 
 
+def _cudnn_probe_module_or_skip():
+    from flashinfer.cudnn.prefill import _cudnn_supports_direct_seqlens
+    from flashinfer.experimental.paged_attention._backends import cudnn_backend
+
+    if not _cudnn_supports_direct_seqlens(torch.bfloat16, mixed=True):
+        pytest.skip("this cuDNN / frontend has no direct paged seq-lens path")
+    return cudnn_backend
+
+
+def test_cudnn_packed_lse_probe_caches_only_the_backends_answer(monkeypatch):
+    """The one-time probe caches False only when cuDNN declines the graph
+    (cudnnGraphNotSupportedError).  Any other failure propagates uncached: it
+    used to be swallowed and cached as False for the process lifetime, so one
+    transient error routed every later LSE plan to the gather fallback."""
+    import cudnn
+
+    cb = _cudnn_probe_module_or_skip()
+    dev = torch.device("cuda")
+    ws = torch.empty(16, dtype=torch.int8, device=dev)  # never reached by the fakes
+    monkeypatch.setattr(cb, "_PACKED_LSE_SUPPORTED", {})
+
+    def transient(device, workspace):
+        raise RuntimeError("transient")
+
+    monkeypatch.setattr(cb, "_probe_packed_lse", transient)
+    with pytest.raises(RuntimeError, match="transient"):
+        cb._packed_lse_supported(dev, ws)
+    assert dev not in cb._PACKED_LSE_SUPPORTED
+
+    def declined(device, workspace):
+        raise cudnn.cudnnGraphNotSupportedError("ragged stats not supported")
+
+    monkeypatch.setattr(cb, "_probe_packed_lse", declined)
+    assert cb._packed_lse_supported(dev, ws) is False
+    assert cb._PACKED_LSE_SUPPORTED[dev] is False
+    # once per device: a later success is not consulted
+    monkeypatch.setattr(cb, "_probe_packed_lse", lambda device, workspace: None)
+    assert cb._packed_lse_supported(dev, ws) is False
+    monkeypatch.setattr(cb, "_PACKED_LSE_SUPPORTED", {})
+    assert cb._packed_lse_supported(dev, ws) is True
+
+
+def test_cudnn_packed_lse_probe_is_sync_free():
+    """The probe's toy inputs reach the device through one pinned
+    asynchronous upload: no blocking copy, no sync, so the first LSE plan on
+    a device is as zero-sync as the later ones (and a sync-debug trip cannot
+    poison the cached answer)."""
+    cb = _cudnn_probe_module_or_skip()
+    dev = torch.device("cuda")
+    ws = torch.empty(128 << 20, dtype=torch.int8, device=dev)
+    cb._probe_packed_lse(dev, ws)  # warm: graph build, allocator
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        cb._probe_packed_lse(dev, ws)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("window_left", [0, 16, 127])
 def test_paged_attention_sliding_window(backend, window_left):
