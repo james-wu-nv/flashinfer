@@ -111,16 +111,69 @@ def _bind_device(
     return dev, int(props.major), int(props.minor), int(dev.index)
 
 
-# Static heuristic placeholder (proposal §5.2: to be seeded from the benchmark
-# suite; it only has to beat consumer tables that rot).  Order = preference.
-HEURISTIC_ORDER: Dict[int, Tuple[str, ...]] = {
-    # cake right after trtllm-gen: same dialect and envelope, so it is the
-    # natural next candidate when trtllm-gen declines a batch
-    10: ("trtllm-gen", "cake", "cudnn", "fa2"),
-    9: ("fa3", "fa2", "cudnn"),
-    8: ("fa2", "cudnn"),
-    12: ("fa2", "cudnn"),
+# Static preference order per compute-capability major, bucketed by the
+# caller's ``max_q_len`` hint (proposal §5.2: seeded from the benchmark suite;
+# it only has to beat consumer tables that rot).  Each entry is
+# ``(bound, order)``: the order applies to a hint ``<= bound``; entries are
+# ascending and the last one (``bound=None``) is the default, used with no hint
+# or a hint above every bound.  ``auto`` stays a static selection: the hint is
+# the only shape fact it reads, and plan() never reorders.
+#
+# sm_100 numbers (B200, bf16, GQA 32/8, head_dim 128, page 16, causal, dense
+# table, CUDA-graph ``run`` medians in µs; full sweep in
+# reports/unified-prefill-implementation-20260916/wp-k.md).  trtllm-gen and
+# cake run the paged CONTEXT kernel for every batch, whose per-request tile
+# is sized for prefill, so at decode / speculative query lengths it reads the
+# whole KV of a request for a handful of tokens and fa2's split-KV decode
+# schedule wins:
+#   B=32, kv=4096:   q=1   fa2  92   trtllm-gen  513  cudnn  143  (fa2 5.6x)
+#                    q=8   fa2 247   trtllm-gen  588  cudnn  515  (2.4x)
+#                    q=16  fa2 248   trtllm-gen  618  cudnn  516  (2.5x)
+#                    q=64  fa2 491   trtllm-gen  667  cudnn  518  (1.4x)
+#                    q=256 fa2 OOM   trtllm-gen  697  cudnn  670  (crossover)
+#   B=1,  kv=1024:   q=16  fa2  12   trtllm-gen   18                (1.5x)
+#                    q=64  fa2  20   trtllm-gen   18                (0.9x)
+#   trtllm-gen / fa2 over the 12 (batch, kv_len) cells: q<=16 min 1.00
+#   (B=8, kv=1024, q=16 tie) median 2.5-5.3 max 9.5; q=64 min 0.47 median
+#   1.31; q>=256 always < 1 (0.25-0.84).  The bound below is the largest
+#   q_len at which fa2 is at least as fast as trtllm-gen on every measured
+#   cell; sweep in wp-k-sweep.csv.
+HEURISTIC_ORDER: Dict[int, Tuple[Tuple[Optional[int], Tuple[str, ...]], ...]] = {
+    10: (
+        # decode / speculative: fa2 first, then the context kernels
+        (16, ("fa2", "trtllm-gen", "cake", "cudnn")),
+        # default (chunked / full prefill, or no hint): cake right after
+        # trtllm-gen — same dialect and envelope, so it is the natural next
+        # candidate when trtllm-gen declines a batch
+        (None, ("trtllm-gen", "cake", "cudnn", "fa2")),
+    ),
+    9: ((None, ("fa3", "fa2", "cudnn")),),
+    8: ((None, ("fa2", "cudnn")),),
+    12: ((None, ("fa2", "cudnn")),),
 }
+
+
+def heuristic_order(cc_major: int, max_q_len: Optional[int] = None) -> Tuple[str, ...]:
+    """The static preference order for ``cc_major`` under the ``max_q_len``
+    hint (``None`` = no hint: the default bucket); empty for an unknown major."""
+    for bound, order in HEURISTIC_ORDER.get(cc_major, ()):
+        if bound is None or (max_q_len is not None and max_q_len <= bound):
+            return order
+    return ()
+
+
+def _expect_max_q_len_hint(max_q_len: Optional[int]) -> None:
+    _expect(
+        max_q_len is None
+        or (
+            isinstance(max_q_len, int)
+            and not isinstance(max_q_len, bool)
+            and max_q_len >= 1
+        ),
+        "max_q_len must be None (no hint) or a positive host int: the largest "
+        "number of query tokens per request the batches planned with this "
+        f"Resolution will have, got {max_q_len!r}",
+    )
 
 
 def resolve_paged_attention(
@@ -142,6 +195,7 @@ def resolve_paged_attention(
     logits_soft_cap: Optional[float] = None,
     custom_mask: bool = False,
     sinks: bool = False,
+    max_q_len: Optional[int] = None,
     backend: str = "auto",
 ) -> Resolution:
     """Static backend resolution — no plan state, no tensors.
@@ -154,6 +208,11 @@ def resolve_paged_attention(
     ``logits_soft_cap`` / ``custom_mask`` / ``sinks`` declare the features the
     plans will use; a backend that cannot apply one is excluded (with the
     reason) rather than dropping it silently.
+
+    ``max_q_len`` is an optional shape hint: the batches planned with this
+    Resolution have at most this many query tokens per request.  It selects
+    the candidate ORDER (``HEURISTIC_ORDER`` bucket) — never the candidate
+    set — and is pinned in ``config``, so plan() rejects a batch above it.
     """
     if head_dim_vo is None:
         head_dim_vo = head_dim_qk
@@ -177,10 +236,11 @@ def resolve_paged_attention(
         )
     _expect_window_left(window_left)
     _expect_page_size(page_size, kv_input_form)
+    _expect_max_q_len_hint(max_q_len)
     logits_soft_cap = _normalize_logits_soft_cap(logits_soft_cap)
     custom_mask, sinks = bool(custom_mask), bool(sinks)
 
-    order = HEURISTIC_ORDER.get(cc_major, ())
+    order = heuristic_order(cc_major, max_q_len)
     if backend != "auto":
         if backend not in CAPABILITIES:
             raise ValueError(
@@ -241,6 +301,7 @@ def resolve_paged_attention(
             logits_soft_cap,
             custom_mask,
             sinks,
+            max_q_len,
             cc_major,
             cc_minor,
             device_index,
@@ -248,4 +309,4 @@ def resolve_paged_attention(
     )
 
 
-__all__ = ["HEURISTIC_ORDER", "PROBES", "resolve_paged_attention"]
+__all__ = ["HEURISTIC_ORDER", "PROBES", "heuristic_order", "resolve_paged_attention"]

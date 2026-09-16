@@ -30,7 +30,7 @@ from ._contracts import PagedAttentionMetadata, PlanMetadata, Resolution
 from ._controller import PagedAttentionController, workspace_requirements
 from ._graph import GraphBuffers, GraphCapacity
 from ._planning import DERIVED_FORMS, Derived, HostArrays, derive
-from ._selection import HEURISTIC_ORDER, resolve_paged_attention
+from ._selection import HEURISTIC_ORDER, heuristic_order, resolve_paged_attention
 
 __all__ = [
     "CAPABILITIES",
@@ -48,6 +48,7 @@ __all__ = [
     "Resolution",
     "derive",
     "derived_needs",
+    "heuristic_order",
     "resolve_paged_attention",
     "workspace_requirements",
 ]
