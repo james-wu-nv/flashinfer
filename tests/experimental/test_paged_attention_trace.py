@@ -756,3 +756,37 @@ def test_import_flashinfer_does_not_load_the_experimental_package():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip().endswith("ok")
+
+
+# ── committed example fixture ────────────────────────────────────────────────
+
+FIXTURE = (
+    Path(__file__).parents[1]
+    / "trace"
+    / "fi_trace_out"
+    / "paged_attention_dense_h32_kv8_dqk128_dvo128_ps16_layout1_causal1_wl-1_lse1.json"
+)
+
+
+def test_committed_fixture_matches_current_template():
+    """The JSON emitted by tests/trace/example.py (opt-in branch) must stay in
+    sync with the template: same schema, same rendered reference and init."""
+    doc = json.loads(FIXTURE.read_text())
+    n_req, total_q, np_pf, page_size = 4, 512, 32, 16
+    tpl = _paged_attention_template(kv_layout=1, causal=1, lse_mode=1)
+    fresh = tpl.build_fi_trace_fn(FI_API_TAG[len("fi_api:") :])(
+        q=torch.empty(total_q, 32, 128, dtype=torch.bfloat16),
+        kv_cache=(
+            torch.empty(n_req * np_pf, page_size, 8, 128, dtype=torch.bfloat16),
+            torch.empty(n_req * np_pf, page_size, 8, 128, dtype=torch.bfloat16),
+        ),
+        qo_indptr=torch.arange(n_req + 1, dtype=torch.int32) * 128,
+        kv_seq_lens=torch.full((n_req,), np_pf * page_size, dtype=torch.int32),
+        block_tables=torch.arange(n_req * np_pf, dtype=torch.int32).view(n_req, np_pf),
+    )
+    assert doc["name"] == FIXTURE.stem == fresh["name"]
+    assert doc == fresh
+    init_fn = _exec(doc["init"])["_paged_attention_init"]
+    assert inspect.signature(init_fn) == inspect.signature(_paged_attention_init)
+    ref_fn = _exec(doc["reference"])["_paged_attention_reference"]
+    assert inspect.signature(ref_fn) == inspect.signature(_paged_attention_reference)

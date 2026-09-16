@@ -256,6 +256,30 @@ rows record the resolved backend (``auto`` is a static selection, not
 autotuning). The benchmark generates fp16/bf16 Q and KV; see
 ``benchmarks/README.md`` for the columns.
 
+Tracing the unified API
+-----------------------
+
+``run()`` carries a `flashinfer-bench <https://github.com/flashinfer-ai/flashinfer-bench>`_
+trace template. After ``plan()``, ``flashinfer.fi_trace(attn.run, q=q,
+kv_cache=(k, v))`` returns (and with ``save_dir=`` writes) the definition of
+the planned contract, and ``FLASHINFER_TRACE_DUMP=1`` exports it automatically
+on the first ``run()`` of each definition. The trace is read-only and
+sync-free: it takes the plan-owned ``qo_indptr``, ``kv_seq_lens`` and the
+page table (the dense block table, or the live prefix of the flat page ids)
+from the last successful ``plan()``, so it describes what ``run()`` executes
+even after a rejected re-plan, and in CUDA-graph mode it points at the
+reserved storage a captured ``run()`` reads. The identity of a definition is
+the plan's paging form (``paged_attention_dense`` / ``paged_attention_csr``),
+KV layout, causal flag, sliding window, LSE mode and geometry, encoded as
+integer Const axes so the exported reference can be called with the same
+values: ``kv_layout`` 0/1 = HND/NHD, ``causal`` 0/1, ``window_left`` -1 =
+unlimited, ``lse_mode`` 0/1/2 = none/base-2/natural log. The resolved backend
+is not part of the identity, so fa2, fa3, cuDNN and trtllm-gen traces of one
+plan compare against the same definition. Tracing requires the planned
+instance: ``PagedAttention.run.fi_trace(...)`` and a trace before ``plan()``
+raise instead of guessing. With the fa2/fa3 backends auto-dump also emits the
+nested legacy ``gqa_paged_prefill`` definition of the wrapper they run on.
+
 .. currentmodule:: flashinfer.prefill
 
 .. autosummary::
