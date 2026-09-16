@@ -32,6 +32,7 @@ from ._contracts import (
     Resolution,
     _expect,
     _expect_lse_mode,
+    _expect_pinned_device,
     _expect_window_left,
     resolve_config_key,
 )
@@ -200,6 +201,11 @@ class PagedAttentionController:
             self._workspace = _shared_workspace(self.device)
         return self._workspace
 
+    def _device_binding(self) -> Tuple[int, int, int]:
+        """``(cc_major, cc_minor, device_index)`` of the device this instance runs on."""
+        props = torch.cuda.get_device_properties(self.device)
+        return int(props.major), int(props.minor), int(self.device.index)
+
     # ------------------------------ plan ------------------------------
 
     def plan(
@@ -242,8 +248,9 @@ class PagedAttentionController:
             validate_causal_envelope(metadata.qo_indptr_cpu, metadata.kv_seq_lens_cpu)
 
         if isinstance(backend, Resolution):
-            # Level-1 pinning (proposal §5.3): verify the plan config matches
-            # what the engine resolved at init, then choose within the set.
+            # Level-1 pinning (proposal §5.3): verify the plan config AND the
+            # device binding match what the engine resolved at init, then
+            # choose within the set.
             want = resolve_config_key(
                 num_qo_heads,
                 num_kv_heads,
@@ -257,13 +264,15 @@ class PagedAttentionController:
                 need_lse,
                 window_left,
                 kv_input_form,
+                *self._device_binding(),
             )
             _expect(
-                backend.config == want,
+                backend.config[:-1] == want[:-1],
                 "plan() arguments do not match the pinned Resolution "
-                f"(resolved {backend.config}, got {want}) — re-run "
+                f"(resolved {backend.config[:-1]}, got {want[:-1]}) — re-run "
                 "resolve_paged_attention() with the new configuration",
             )
+            _expect_pinned_device(backend.device_binding, want[-1])
             resolution = backend
         else:
             resolution = resolve_paged_attention(

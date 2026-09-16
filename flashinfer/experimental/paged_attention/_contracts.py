@@ -70,8 +70,20 @@ def resolve_config_key(
     need_lse,
     window_left,
     kv_input_form,
+    cc_major,
+    cc_minor,
+    device_index,
 ) -> Tuple:
-    """The observational config a Resolution is pinned to (drift detection)."""
+    """The observational config a Resolution is pinned to (drift detection).
+
+    The last element is the device binding ``(cc_major, cc_minor,
+    device_index)``: a Resolution resolved on one device must not be handed
+    to a controller bound to another device or compute capability, because
+    the probes (fa3's SM90a check, cubin availability) answered for the
+    device they were given.  ``cc_minor``/``device_index`` are ``None`` when
+    the caller resolved from an explicit ``cc_major`` without a device; such a
+    Resolution is pinned to the compute-capability major only.
+    """
     return (
         num_qo_heads,
         num_kv_heads,
@@ -85,6 +97,31 @@ def resolve_config_key(
         need_lse,
         window_left,
         kv_input_form,
+        (cc_major, cc_minor, device_index),
+    )
+
+
+def _expect_pinned_device(resolved: Tuple, want: Tuple) -> None:
+    """Reject a Resolution whose device binding does not cover ``want``.
+
+    ``resolved`` / ``want`` are the trailing device triples of two config
+    keys.  A ``None`` in the resolved triple means "not pinned on this axis"
+    (explicit-``cc_major`` resolution) and matches anything.
+    """
+    r_major, r_minor, r_index = resolved
+    w_major, w_minor, w_index = want
+    _expect(
+        r_major == w_major and (r_minor is None or r_minor == w_minor),
+        "the pinned Resolution was resolved for compute capability "
+        f"sm_{r_major}{'x' if r_minor is None else r_minor} but this instance runs on "
+        f"sm_{w_major}{w_minor} — the probes answered for another GPU; re-run "
+        "resolve_paged_attention(device=...) on the target device",
+    )
+    _expect(
+        r_index is None or r_index == w_index,
+        f"the pinned Resolution was resolved on cuda:{r_index} but this instance "
+        f"is bound to cuda:{w_index} — resolve once per device (or resolve from "
+        "an explicit cc_major to pin the compute capability only)",
     )
 
 
@@ -92,27 +129,48 @@ def resolve_config_key(
 class Resolution:
     """Init-time resolution result (proposal §5.3, level 1).
 
-    ``backends`` is the pinned, ordered candidate set: every member is
-    runnable for the declared configuration and observationally identical at
-    the contract level (same dtypes, same LSE availability), so a later
-    plan-time choice within this set cannot surprise the engine.  Pass the
-    whole Resolution to ``plan(backend=...)`` to enforce the pinning:
-    plan() verifies its arguments match ``config`` and chooses only within
-    ``backends``.
+    ``backends`` is the pinned, ordered candidate set: every member passed
+    the static capability check and the environment probes for the declared
+    configuration on the resolved device, and is observationally identical
+    at the contract level (same dtypes, same LSE availability), so a later
+    plan-time choice within this set cannot surprise the engine.  Membership
+    is support *evidence*, not a guarantee: a candidate may still decline a
+    specific batch at plan time with a typed unsupported signal, in which case
+    plan() continues to the next member (see ``PagedAttentionController``).
+    Pass the whole Resolution to ``plan(backend=...)`` to enforce the
+    pinning: plan() verifies its arguments and its device match ``config``
+    and chooses only within ``backends``.
     """
 
     backends: Tuple[str, ...]
     excluded: Dict[str, str] = field(default_factory=dict)
     kv_layout: str = "HND"
-    # the resolve-time observational config, used by plan() to detect drift
+    # the resolve-time observational config, used by plan() to detect drift;
+    # its last element is the device binding (cc_major, cc_minor, device_index)
     config: Tuple = ()
 
     @property
     def chosen(self) -> str:
         return self.backends[0]
 
+    @property
+    def device_binding(self) -> Tuple:
+        """``(cc_major, cc_minor, device_index)`` this Resolution answers for."""
+        return self.config[-1] if self.config else (None, None, None)
+
     def explain(self) -> str:
-        lines = [f"candidates (preference order): {list(self.backends)}"]
+        cc_major, cc_minor, index = self.device_binding
+        if cc_major is not None:
+            where = (
+                f"sm_{cc_major}{cc_minor}, cuda:{index}"
+                if cc_minor is not None
+                else f"sm_{cc_major}x (compute-capability major only; not "
+                "pinned to a device)"
+            )
+            lines = [f"resolved for: {where}"]
+        else:
+            lines = []
+        lines.append(f"candidates (preference order): {list(self.backends)}")
         for name, reason in self.excluded.items():
             lines.append(f"excluded {name}: {reason}")
         return "\n".join(lines)
@@ -341,5 +399,6 @@ __all__ = [
     "PagedAttentionMetadata",
     "PlanMetadata",
     "Resolution",
+    "_expect_pinned_device",
     "resolve_config_key",
 ]
