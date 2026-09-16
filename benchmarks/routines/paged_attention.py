@@ -87,7 +87,12 @@ LSE_TOL = dict(rtol=2e-2, atol=3e-2)
 # pages that belong to nobody, so the oracle comparison catches it.
 TABLE_SLACK_COLUMNS = 3
 POOL_SLACK_PAGES = 8
-WORKSPACE_BYTES = 128 * 1024 * 1024
+# One caller-owned scratch buffer handed to the facade AND to the legacy APIs,
+# sized like testBatchPrefillWithPagedKVCacheWrapper's. The facade's default
+# per-device pool is 128 MB, which fa2's split-KV planner overflows at
+# B=1 q=kv=2048 x 32 heads; passing the same larger buffer to both sides
+# keeps the comparison about the API path, not the pool size.
+WORKSPACE_BYTES = 512 * 1024 * 1024
 
 
 def _load_reference_oracle():
@@ -486,7 +491,9 @@ def _bench_unified(args, case, backend, ctx):
         phases.set_all(_error_status(exc))
         if args.verbose >= 2:
             traceback.print_exc()
-        return phases, None
+        # the kernel was admitted by resolve(); the legacy row shows whether
+        # its public API fails on the same inputs too
+        return phases, resolved
 
     recheck = None
     if ctx["reference"] is not None:
@@ -944,10 +951,10 @@ def testPagedAttention(args):
         if resolved is not None and resolved not in legacy_targets:
             legacy_targets.append(resolved)
     if args.pa_legacy:
-        # one legacy row set per concrete kernel that ran through the facade
-        # (`auto` contributes the backend it resolved to; duplicates collapse)
+        # one legacy row set per concrete kernel the facade admitted (`auto`
+        # contributes the backend it resolved to; duplicates collapse)
         if not legacy_targets:
-            print("[INFO] --pa_legacy: no unified candidate planned; no legacy rows")
+            print("[INFO] --pa_legacy: no unified candidate resolved; no legacy rows")
         for backend in legacy_targets:
             res.extend(_bench_legacy(args, case, backend, ctx).rows)
     return res
