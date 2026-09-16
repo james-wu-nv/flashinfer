@@ -23,6 +23,7 @@ How to add a new template
    - ``sampling.py``   — top-k / top-p sampling
    - ``gemm.py``       — bf16 / fp8 GEMM
    - ``attention.py``  — gqa_paged, gqa_ragged, mla_paged, dsa_paged
+   - ``paged_attention.py`` — experimental unified PagedAttention (gqa_paged)
    - ``gdn.py``        — gated delta-net decode
    - ``moe.py``        — mixture-of-experts
    Create a new file for a genuinely new op_type (e.g. ``conv.py``).

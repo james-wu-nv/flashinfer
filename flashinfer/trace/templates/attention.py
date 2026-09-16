@@ -38,6 +38,10 @@ the backend column indicates which kernel the API wraps.
 | ``cudnn_batch_decode``          | batched           | paged, separate k/v       | block_tables            | decode  | cuDNN (no plan) |
 | ``cudnn_batch_prefill``         | batched, var-len  | paged or contiguous       | actual_seq_lens_*       | prefill | cuDNN (no plan) |
 +---------------------------------+-------------------+---------------------------+-------------------------+---------+-----------------+
+
+The experimental unified ``flashinfer.prefill.PagedAttention`` (dense block
+table or flat page ids, HND or NHD, plan-owned masking / window / LSE base) is
+traced by ``paged_attention.py`` in this package (``paged_attention_{dense,csr}``).
 """
 
 from functools import lru_cache
