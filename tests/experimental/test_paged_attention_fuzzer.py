@@ -246,14 +246,57 @@ def m_block_tables_negative(p):
 
 def m_q_noncontig(p):
     # fused-QKV-style slice: valid semantics, strided storage.  Backends
-    # that can address it must be correct; token-offset backends must
-    # REJECT rather than silently mis-address (the #3921 multiplier trap).
+    # that can address it (fa2/fa3/trtllm-gen) must be correct; the
+    # token-offset backend (cuDNN) must REJECT rather than silently
+    # mis-address (the #3921 multiplier trap).
     p = _clone(p)
     total, h, d = p["q"].shape
     fused = torch.randn(total, 3 * h, d, dtype=p["q"].dtype, device=p["q"].device)
     fused[:, :h, :] = p["q"]
     p["q"] = fused[:, :h, :]
     assert not p["q"].is_contiguous()
+    return p
+
+
+def m_q_inner_stride_2(p):
+    # head_dim interleaved: buf[..., ::2].  The FA and trtllm-gen bindings pass
+    # token/head strides only and misread it silently (native probe in
+    # test_paged_attention_strides.py), so the controller must REJECT it for
+    # every backend before any launch; the ground truth stays well-defined.
+    p = _clone(p)
+    q = p["q"]
+    buf = torch.randn(*q.shape[:-1], 2 * q.shape[-1], dtype=q.dtype, device=q.device)
+    buf[..., ::2] = q
+    p["q"] = buf[..., ::2]
+    assert p["q"].stride(-1) == 2
+    return p
+
+
+def m_block_tables_row_stride_view(p):
+    # block_tables[:, :w] of a wider capacity table (row stride > width), the
+    # view an engine takes to trim its table: trtllm-gen walks the table as a
+    # packed array and must reject; cuDNN's stride-driven graph and the FA
+    # derivation address it correctly.
+    p = _clone(p)
+    bt = p["block_tables"]
+    b, w = bt.shape
+    wide = torch.zeros(b, w + 3, dtype=bt.dtype, device=bt.device)
+    wide[:, :w] = bt
+    p["block_tables"] = wide[:, :w]
+    assert p["block_tables"].stride(0) == w + 3
+    return p
+
+
+def m_kv_page_indices_noncontiguous(p):
+    # a strided view as the flat page-id list: the FA kernels walk it as a
+    # raw pointer and must reject; dense-needing backends gather and stay
+    # correct.
+    p = _clone(p)
+    p["input_form"] = "page_indices"
+    live = p["kv_page_indices"]
+    inter = torch.stack([live, torch.full_like(live, -7)], dim=1).flatten()
+    p["kv_page_indices"] = inter[::2]
+    assert p["kv_page_indices"].stride(0) == 2
     return p
 
 
@@ -312,6 +355,9 @@ MUTATIONS = [
     ("block_tables_1d", False, m_block_tables_1d),
     ("page_size_mismatch", False, m_page_size_mismatch),
     ("q_noncontig", True, m_q_noncontig),
+    ("q_inner_stride_2", True, m_q_inner_stride_2),
+    ("block_tables_row_stride_view", True, m_block_tables_row_stride_view),
+    ("kv_page_indices_noncontiguous", True, m_kv_page_indices_noncontiguous),
     ("out_wrong_dtype", False, m_out_wrong_dtype),
     ("lse_wrong_dtype", False, m_lse_wrong_dtype),
     ("block_tables_negative", False, m_block_tables_negative),
