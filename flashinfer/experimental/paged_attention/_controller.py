@@ -17,6 +17,7 @@ its generated backends.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import threading
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
@@ -83,6 +84,61 @@ def _validate_workspace_buffer(buf: Any, device: torch.device) -> torch.Tensor:
     return buf.view(torch.uint8)
 
 
+# ---------------------------------------------------------------------------
+# Frozen contract of a captured graph.  A captured graph keeps launching the
+# kernels the first graph-mode plan chose, with the kernel variant (causal,
+# window, dtypes, head dims, LSE base, ...) baked in.  Every backend would
+# accept a later plan() that changed one of those and the graph would silently
+# replay stale results (mla-alignment F1: causal=True captured, causal=False
+# re-planned and accepted).  So the first successful graph-mode plan freezes
+# the chosen backend plus every PlanMetadata field that is not a per-batch
+# value; a semantic kwarg added to PlanMetadata later is frozen automatically.
+# ---------------------------------------------------------------------------
+_PER_BATCH_FIELDS = frozenset(
+    {
+        "qo_indptr",
+        "kv_seq_lens",
+        "block_tables",
+        "qo_indptr_cpu",
+        "kv_seq_lens_cpu",
+        "batch_size",
+        "max_q_len",
+        "max_kv_len",
+    }
+)
+
+
+def _semantic_fields() -> Tuple[str, ...]:
+    """PlanMetadata fields a captured graph depends on: all but the per-batch values."""
+    return tuple(
+        f.name
+        for f in dataclasses.fields(PlanMetadata)
+        if f.name not in _PER_BATCH_FIELDS
+    )
+
+
+def _frozen_contract(backend: str, meta: PlanMetadata) -> Dict[str, Any]:
+    contract: Dict[str, Any] = {
+        "backend": backend,
+        "dense_table": meta.block_tables is not None,
+    }
+    for name in _semantic_fields():
+        contract[name] = getattr(meta, name)
+    return contract
+
+
+def _check_frozen_contract(frozen: Dict[str, Any], current: Dict[str, Any]) -> None:
+    for key, want in frozen.items():
+        got = current.get(key)
+        if got != want:
+            raise ValueError(
+                f"CUDA graph re-plan: {key} changed from {want!r} (captured) to "
+                f"{got!r}; the captured graph would keep launching the kernels "
+                "planned for the old configuration — construct a new "
+                "PagedAttention for the new configuration and recapture"
+            )
+
+
 class PagedAttentionController:
     def __init__(
         self,
@@ -106,6 +162,8 @@ class PagedAttentionController:
         # CUDA-graph mode: reserved storage sized by the first plan (_graph.py)
         self._use_cuda_graph = use_cuda_graph
         self._graph: Optional[GraphBuffers] = None
+        # what the first successful graph-mode plan froze (_frozen_contract)
+        self._frozen: Optional[Dict[str, Any]] = None
         # published plan state (swapped together, only on success)
         self._planned = False
         self._backend_name: Optional[str] = None
@@ -269,6 +327,12 @@ class PagedAttentionController:
             kv_seq_lens_cpu=metadata.kv_seq_lens_cpu,
         )
 
+        # graph mode: the frozen contract is checked before any reserved
+        # buffer is written (the staging copies run inside the transaction)
+        contract = _frozen_contract(name, meta) if gb is not None else None
+        if self._frozen is not None:
+            _check_frozen_contract(self._frozen, contract)
+
         key = (name, kv_layout)
         candidate = self._backends.get(key)
         if candidate is None:
@@ -291,6 +355,7 @@ class PagedAttentionController:
         # publish — nothing above mutated the published state
         if gb is not None:
             self._graph = gb
+            self._frozen = contract
         self._backends[key] = candidate
         self._active = candidate
         self._backend_name = name
