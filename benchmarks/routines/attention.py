@@ -570,6 +570,16 @@ def parse_attention_args(line, parser):
         ),
     )
     parser.add_argument(
+        "--pa_skip_refcheck",
+        action="store_true",
+        default=False,
+        help=(
+            "PagedAttention only: time without the fp32 oracle gate (which is "
+            "otherwise always on for this routine); for shapes the fp32 oracle "
+            "cannot hold. Contradicts --refcheck."
+        ),
+    )
+    parser.add_argument(
         "--pa_legacy",
         action="store_true",
         default=False,

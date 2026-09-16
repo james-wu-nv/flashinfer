@@ -3,7 +3,10 @@
 Times the experimental :class:`flashinfer.prefill.PagedAttention` facade on
 ONE set of inputs for every requested backend.  Each candidate is gated on
 the fp32 oracle (``tests/experimental/paged_attention_reference.py``) before
-it is timed, and every (backend, phase) pair yields one CSV row:
+it is timed — always, not only with ``--refcheck`` (the oracle is fp32 torch
+on the benchmarked shapes; ``--pa_skip_refcheck`` turns the gate off for a
+shape the oracle cannot hold, and the rows then say so) — and every
+(backend, phase) pair yields one CSV row:
 
 ``plan``
     Build the per-step :class:`PagedAttentionMetadata` (with host mirrors, as
@@ -22,7 +25,8 @@ it is timed, and every (backend, phase) pair yields one CSV row:
     for a model with N attention layers sharing one plan.
 
 Rows for unsupported / erroring / incorrect candidates are KEPT with a
-``status`` column (never dropped, never NaN-only).  ``static_backend`` is
+``status`` column (never dropped, never NaN-only) and ``refcheck_passed``
+(True / False, empty when no comparison happened).  ``static_backend`` is
 the facade's static choice (``resolve_paged_attention(...).chosen``);
 ``resolved_backend`` is the backend the plan actually ran (``attn.backend``
 after ``plan()``), which differs when a candidate declined the batch at
@@ -114,7 +118,7 @@ def _load_reference_oracle():
         / "paged_attention_reference.py"
     )
     if not path.is_file():
-        raise FileNotFoundError(f"--refcheck needs the fp32 oracle at {path}")
+        raise FileNotFoundError(f"the fp32 oracle gate needs {path}")
     spec = importlib.util.spec_from_file_location("paged_attention_reference", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -314,6 +318,7 @@ class _PhaseRows:
             row["phase"] = phase
             row["layers"] = layers
             row["status"] = ""
+            row["refcheck_passed"] = ""
             row["timing_metric"] = timing_metric if phase == "run" else "host_wall"
             row["page_size"] = args.page_size
             row["batch_size"] = args.batch_size
@@ -352,6 +357,10 @@ class _PhaseRows:
                 f"{self.rows[0]['backend']}({resolved_backend})/"
                 f"{self.rows[0]['api_variant']}"
             )
+
+    def set_refcheck(self, passed):
+        for row in self.rows:
+            row["refcheck_passed"] = passed
 
     def set_all(self, status):
         for row in self.rows:
@@ -393,6 +402,7 @@ def _time_candidate(args, phases, case, plan_once, run_once, recheck, use_cuda_g
                     problem = recheck()
                     if problem is not None:
                         row["status"] = f"incorrect (timed run): {problem}"
+                        row["refcheck_passed"] = False
                         print(f"[ERROR] {phases.label} {phase}: {row['status']}")
                         continue
             else:
@@ -549,6 +559,7 @@ def _bench_unified(args, case, backend, ctx):
         problem = _check_against_oracle(
             got_out, got_lse, ref_out, ref_lse, args.lse_mode
         )
+        phases.set_refcheck(problem is None)
         if problem is not None:
             phases.set_all(f"incorrect: {problem}")
             print(f"[ERROR] {phases.label}: output mismatch against the fp32 oracle")
@@ -833,6 +844,7 @@ def _bench_legacy(args, case, backend, ctx):
             return check(case["out"], provider.last_lse)
 
         problem = check(got_out, got_lse)
+        phases.set_refcheck(problem is None)
         if problem is not None:
             phases.set_all(f"incorrect: {problem}")
             print(f"[ERROR] {phases.label}: output mismatch against the fp32 oracle")
@@ -857,8 +869,8 @@ def testPagedAttention(args):
        per-request lengths and the dense or CSR ``PagedAttentionMetadata``.
     2. Resolves and plans each requested backend (``fa2 fa3 cudnn trtllm-gen
        auto``); unsupported ones are recorded, not dropped.
-    3. With ``--refcheck``, compares output (and requested LSE) against the
-       fp32 oracle before any timing.
+    3. Compares output (and requested LSE) against the fp32 oracle before any
+       timing (always; ``--pa_skip_refcheck`` opts out).
     4. Times the ``plan``, ``run`` and ``step`` phases (see module docstring).
 
     Args:
@@ -962,7 +974,23 @@ def testPagedAttention(args):
         reference=None,
         reference_error=None,
     )
-    if args.refcheck:
+    if args.pa_skip_refcheck:
+        if args.refcheck:
+            print(
+                "[ERROR] --refcheck and --pa_skip_refcheck contradict each other. "
+                "Exiting."
+            )
+            return res
+        print(
+            "[WARNING] --pa_skip_refcheck: candidates are timed without the fp32 "
+            "oracle gate; refcheck_passed stays empty"
+        )
+    else:
+        if not args.refcheck and args.verbose >= 1:
+            print(
+                "[INFO] PagedAttention gates every candidate on the fp32 oracle "
+                "(--refcheck is implied; --pa_skip_refcheck turns it off)"
+            )
         try:
             reference_paged_prefill = _load_reference_oracle()
             with torch.no_grad():
