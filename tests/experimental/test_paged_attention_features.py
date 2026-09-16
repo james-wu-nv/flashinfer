@@ -341,7 +341,7 @@ def _sinks(p, seed=0):
     )
 
 
-@pytest.mark.parametrize("backend", ["fa2", "fa3", "trtllm-gen"])
+@pytest.mark.parametrize("backend", ["fa2", "fa3", "trtllm-gen", "cake"])
 @pytest.mark.parametrize("causal,window_left", [(True, -1), (True, 16), (False, -1)])
 @pytest.mark.parametrize("lse_mode", ["base2", "basee"])
 def test_attention_sinks(backend, causal, window_left, lse_mode):
@@ -377,7 +377,7 @@ def test_attention_sinks(backend, causal, window_left, lse_mode):
     assert not torch.allclose(ref_lse, plain_lse, **LSE_TOL)
 
 
-@pytest.mark.parametrize("backend", ["fa2", "trtllm-gen"])
+@pytest.mark.parametrize("backend", ["fa2", "trtllm-gen", "cake"])
 def test_attention_sinks_are_a_per_run_value(backend):
     """One plan, two run() calls with different sinks (per-layer values)."""
     p = make_problem(seed=113, **_SHAPE)
