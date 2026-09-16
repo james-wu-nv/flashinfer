@@ -752,6 +752,61 @@ def test_warm_plan_uploads_from_pinned_memory_only(backend, input_form):
     assert not any("DtoH" in e for e in events), events  # zero-sync plan
 
 
+@pytest.mark.parametrize("max_q", [32, 1])
+def test_cudnn_writes_packed_lse_directly(max_q):
+    """cuDNN writes the packed (tokens, h) LSE into the caller's buffer (ledger
+    M12): through batch_offsets_stats for max_q > 1, and as the padded
+    (b, 1, h) layout that IS the packed layout at max_q == 1 (where cuDNN
+    9.25 writes no stats with a ragged offset) - no gather kernel, no copy,
+    and the same numbers as the oracle.  On a cuDNN without ragged stats the
+    backend falls back to the gather path and this test only checks the
+    numbers."""
+    p = make_problem(
+        seed=39,
+        batch_size=4,
+        max_q=max_q,
+        max_kv=256,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+        uniform_q1=max_q == 1,
+    )
+    _resolve_or_skip(p, "cudnn")
+    ref_out, ref_lse = reference_paged_prefill(
+        p["q"],
+        p["k_ref"],
+        p["v_ref"],
+        p["qo_indptr_cpu"],
+        p["kv_seq_lens_cpu"],
+        p["block_tables"],
+        p["page_size"],
+        True,
+        lse_base="e",
+    )
+    lse_buf = torch.full(
+        (p["q"].shape[0], p["num_qo_heads"]),
+        float("nan"),
+        dtype=torch.float32,
+        device=p["device"],
+    )
+    attn, out, lse = run_unified(
+        {**p, "_lse_override": lse_buf}, "cudnn", lse_mode="basee"
+    )
+    assert lse is lse_buf  # written in place, whichever path
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+    if not attn._impl._active.lse_written_packed:
+        pytest.skip("this cuDNN takes the gather fallback (probe failed)")
+    # the direct path: run() with a natural-log LSE enqueues only cuDNN's own
+    # work (its SDPA kernels and, at max_q == 1, its stats memset) - no torch
+    # gather kernel and no copy
+    kv = (p["k_cache"], p["v_cache"])
+    with_lse = _gpu_activity(lambda: attn.run(p["q"], kv, lse=lse_buf))
+    assert with_lse and all("cudnn" in e for e in with_lse), with_lse
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("window_left", [0, 16, 127])
 def test_paged_attention_sliding_window(backend, window_left):
