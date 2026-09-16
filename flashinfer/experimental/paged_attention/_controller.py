@@ -402,7 +402,11 @@ class PagedAttentionController:
             candidate = self._backends.get(key)
             if candidate is None:
                 # construction only (no plan state); cached so a candidate
-                # that keeps declining is not rebuilt on every plan
+                # that keeps declining is not rebuilt on every plan — except
+                # while a first graph-mode plan's capacity is still unpublished:
+                # a backend built against it (reserved CSR buffers, row budget)
+                # must go with the capacity if that plan fails, so it is cached
+                # at publication below instead
                 candidate = make_backend(
                     name,
                     self.device,
@@ -410,7 +414,8 @@ class PagedAttentionController:
                     self._scratch_workspace(),
                     graph_capacity=gb.capacity if gb is not None else None,
                 )
-                self._backends[key] = candidate
+                if gb is None or self._graph is not None:
+                    self._backends[key] = candidate
             try:
                 candidate.preflight(meta)
             except _BackendPlanUnsupportedError as exc:
@@ -430,6 +435,7 @@ class PagedAttentionController:
                 f"(candidates {list(resolution.backends)}: {detail})"
             )
         name, candidate, meta, derived, needs_dense = chosen
+        key = (name, kv_layout)
 
         # graph mode: the frozen contract is checked before any reserved
         # buffer is written (the staging copies run inside the transaction)
@@ -459,6 +465,7 @@ class PagedAttentionController:
                 k: v for k, v in contract.items() if k in _PLAN_PARAMS
             }
             self._frozen_plan_kwargs["backend"] = name
+        self._backends[key] = candidate
         self._active = candidate
         self._backend_name = name
         self._resolution = resolution
