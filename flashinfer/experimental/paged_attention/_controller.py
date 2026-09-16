@@ -32,6 +32,7 @@ from ._backends import (
     _BackendPlanUnsupportedError,
     derived_needs,
     make_backend,
+    workspace_bound,
 )
 from ._contracts import (
     PagedAttentionMetadata,
@@ -71,6 +72,88 @@ def _shared_workspace(device: torch.device) -> torch.Tensor:
             ws = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
             _shared_workspaces[device] = ws
         return ws
+
+
+def workspace_requirements(
+    capacity: GraphCapacity,
+    *,
+    device: Optional[torch.device] = None,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    head_dim_vo: Optional[int] = None,
+    q_dtype: torch.dtype,
+    kv_dtype: Optional[torch.dtype] = None,
+    kv_layout: str = "HND",
+    causal: bool = True,
+    need_lse: bool = True,
+    window_left: int = -1,
+    logits_soft_cap: Optional[float] = None,
+    custom_mask: bool = False,
+    use_sinks: bool = False,
+    use_cuda_graph: bool = True,
+    backend: Union[str, Resolution] = "auto",
+) -> int:
+    """Conservative scratch-workspace bytes for every plan within ``capacity``.
+
+    The maximum over the backends that resolve for the configuration (or the
+    one named / the pinned ``Resolution``) of each backend's own bound
+    (``_backends.workspace_bound``); an engine sizes ``workspace_buffer``
+    with it before capture instead of discovering an overflow in a planner.
+    Zero-sync and tensor-free; needs the target ``device`` for its SM count
+    and opt-in shared memory (the default is the current CUDA device).
+    """
+    _expect(
+        isinstance(capacity, GraphCapacity),
+        "workspace_requirements() takes a GraphCapacity (the batch geometry: "
+        f"batch size, total query tokens, maxes, page size), got {type(capacity).__name__}",
+    )
+    dev = torch.device(device) if device is not None else torch.device("cuda")
+    if dev.type == "cuda" and dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
+    head_dim_vo = head_dim_vo if head_dim_vo is not None else head_dim_qk
+    kv_dtype = kv_dtype if kv_dtype is not None else q_dtype
+    if isinstance(backend, Resolution):
+        candidates = backend.backends
+    else:
+        candidates = resolve_paged_attention(
+            device=dev,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            page_size=capacity.page_size,
+            kv_layout=kv_layout,
+            causal=causal,
+            need_lse=need_lse,
+            window_left=window_left,
+            kv_input_form=capacity.kv_input_form,
+            logits_soft_cap=logits_soft_cap,
+            custom_mask=custom_mask,
+            sinks=use_sinks,
+            backend=backend,
+        ).backends
+    props = torch.cuda.get_device_properties(dev)
+    geometry = dict(
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        kv_dtype=kv_dtype,
+        page_size=capacity.page_size,
+        batch_size=capacity.batch_size,
+        total_q_tokens=capacity.total_q_tokens,
+        max_q_len=capacity.max_q_len,
+        max_kv_len=capacity.max_kv_len,
+        need_lse=need_lse,
+        window_left=window_left,
+        use_cuda_graph=use_cuda_graph,
+        sm_count=int(props.multi_processor_count),
+        smem_optin=getattr(props, "shared_memory_per_block_optin", None),
+    )
+    return max(workspace_bound(name, **geometry) for name in candidates)
 
 
 def _validate_workspace_buffer(buf: Any, device: torch.device) -> torch.Tensor:
@@ -816,4 +899,4 @@ def _expect_not_capturing(what: str) -> None:
         )
 
 
-__all__ = ["PagedAttentionController"]
+__all__ = ["PagedAttentionController", "workspace_requirements"]
