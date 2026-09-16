@@ -685,9 +685,11 @@ with the constraint named.
 `kv_seq_lens[i] == 0` is legal and marks a padding row (vLLM's CUDA-graph
 padding fills `seq_lens` with 0 and the table row with its null block;
 SGLang's fill value 1 is an ordinary live row). The library guarantees that no page of that row
-is read, that the output row is finite, and that every other row is
-unchanged; the row's output values and LSE are unspecified by contract. Every
-current backend writes a zero output row and an LSE of `-inf`, measured on
+is read and that every other row is unchanged; the row's output and LSE are
+unspecified by contract and may be left unwritten, so an engine must never
+read a padding row. fa2/fa3 and cuDNN write a zero output row and an LSE of
+`-inf`, trtllm-gen leaves the rows untouched (measured with a NaN-poisoned
+output allocation), cake declines the batch; measured on
 B200 with the native calls (`wp-c.md` §3). Implementation: value validation
 rejects only negative lengths; the causal envelope exempts padding rows; the
 derived last-page length of a padding row is `page_size` by the

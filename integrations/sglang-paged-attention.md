@@ -7,7 +7,7 @@ multimodal / deterministic mode). Explicitly OUT of the v1 diff:
 - the radix-extend cascade, BOTH halves. The paged (prefix) half runs
   `causal=False` over `kv = prefix_lens` (`forward_extend`, `:1428`), and
   no-prefix requests have `prefix_len == 0`, i.e. zero-length KV rows. Those
-  are accepted as padding rows now (finite output, LSE unspecified), but the
+  are accepted as padding rows now (output and LSE unspecified, possibly unwritten), but the
   cascade merge (`_safe_merge_state`, `:1437`) consumes the prefix half's
   LSE, which the contract does not define for them; it waits for the ragged
   follow-up anyway. The CUDA-graph fill value 1

@@ -1075,7 +1075,8 @@ def test_replan_toggles_padding_rows(backend, input_form):
     tokens, maxes, table width) while a row toggles between live and padding
     (kv_len 0) across re-plans - what an engine's graph bucket sees as
     requests come and go.  Each replay computes the live rows of the batch
-    it was re-planned for; padding rows stay finite."""
+    it was re-planned for; padding rows are not read (their contents are
+    unspecified and may be left unwritten)."""
     pool = 24
     a, live_a, pad_a = _padded_problem(
         seed=71,
@@ -1126,9 +1127,9 @@ def test_replan_toggles_padding_rows(backend, input_form):
 
     def check(p, live):
         torch.cuda.synchronize()
-        assert torch.isfinite(out.float()).all()
         ref_out, ref_lse = reference(p)
         m = live.to(dev)
+        assert torch.isfinite(out.float()[m]).all()
         torch.testing.assert_close(out.float()[m], ref_out[m], **OUT_TOL)
         torch.testing.assert_close(lse[m], ref_lse[m], **LSE_TOL)
 
