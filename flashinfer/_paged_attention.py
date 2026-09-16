@@ -278,12 +278,13 @@ class PagedAttention:
         - ``workspace_buffer``: optional caller-owned scratch workspace
           (contiguous 1-D uint8 or int8 on ``device``) that every backend's
           kernels run on — pass the buffer the engine already shares with its
-          legacy wrappers.  By default every instance on a device shares one
-          lazily allocated library-owned 128 MiB pool (the legacy wrappers'
-          convention), so holding one instance per graph bucket costs no
-          workspace per bucket; that default has been observed to overflow
-          the fa2 split-KV planner on a single 2048-token, 32-head prefill,
-          so pass the engine's larger buffer where such shapes occur.
+          legacy wrappers, sized with :meth:`workspace_requirements` for the
+          largest geometry it will plan.  By default every instance on a
+          device shares one lazily allocated library-owned 512 MiB pool (the
+          upper end of the engines' own defaults for these kernels), so
+          holding one instance per graph bucket costs no workspace per
+          bucket.  ``plan()`` raises ``ValueError`` naming the required bytes
+          when a batch's planner allocation would not fit the buffer in use.
           Instances sharing a workspace must not run concurrently on
           different streams; pass a private buffer where that isolation is
           needed.

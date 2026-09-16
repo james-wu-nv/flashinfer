@@ -59,8 +59,22 @@ from ._selection import resolve_paged_attention
 # its own (e.g. the buffer it already shares with legacy wrappers).  Sharing
 # follows the legacy wrappers' rule: instances sharing a workspace must not
 # run concurrently on different streams.
+#
+# Default size.  The fa2 split-KV planner is the only consumer whose need
+# grows with the geometry (formulas in _backends/fa_backend.py); the legacy
+# wrappers' documented 128 MiB overflows it on an ordinary prefill shape
+# (ledger M14: one request, q = kv = 2048, 32 query / 8 KV heads, head_dim
+# 128, graph mode needs 129 MiB).  512 MiB is the upper end of what the
+# engines settled on for the same kernels (vLLM 394 MiB, SGLang 384 MiB and
+# 512 MiB for Qwen2/3); on a B200 (148 SMs) it covers, for 32/8 heads at
+# head_dim 128, eager prefill of any batch (75 MiB), decode graph buckets up
+# to 1024 requests (322 MiB) and 4096-token graph prefill (258 MiB).  It is
+# one allocation per device.  Anything larger -- an 8192-token single-request
+# graph capture (516 MiB), MQA with 32 query heads (516 MiB eager) -- is a
+# caller-owned buffer sized by workspace_requirements(); plan() rejects a
+# buffer the planner would overflow before any kernel-side error.
 # ---------------------------------------------------------------------------
-_WORKSPACE_BYTES = 128 * 1024 * 1024  # the legacy wrappers' documented default
+_WORKSPACE_BYTES = 512 * 1024 * 1024
 _shared_workspaces: Dict[torch.device, torch.Tensor] = {}
 _shared_workspaces_lock = threading.Lock()
 

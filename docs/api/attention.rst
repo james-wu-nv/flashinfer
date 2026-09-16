@@ -231,9 +231,15 @@ rejected; ``update(metadata)`` then re-plans each step's batch into the
 reserved storage so the captured ``run()`` replays it. A batch must fit the
 capacity: batch size, paging form and page size exactly, total query tokens
 and host maxes at most the capacity's, which is what the kernels are planned
-with. The kernel workspace is shared per device (or caller-supplied via
-``workspace_buffer=``), so one instance per graph bucket costs no workspace per
-bucket. Calling any of these is the opt-in (an
+with. The kernel workspace is shared per device (a 512 MiB pool) or
+caller-supplied via ``workspace_buffer=``, so one instance per graph bucket
+costs no workspace per bucket; ``PagedAttention.workspace_requirements()``
+returns, for a :class:`~flashinfer.prefill.GraphCapacity` and a model
+configuration, a conservative bound on the bytes the resolvable backends'
+planners carve out of that buffer (the fa2 split-KV scratch dominates), so an
+engine can size the buffer before capture, and ``plan()`` rejects a buffer a
+batch would overflow with a ``ValueError`` naming the required bytes. Calling
+any of these is the opt-in (an
 ``ExperimentalWarning`` is emitted once); see the tracking issue
 `#5007 <https://github.com/flashinfer-ai/flashinfer/issues/5007>`_ for the
 graduation plan.
@@ -300,7 +306,7 @@ With the fa2/fa3 backends auto-dump also emits the nested legacy
     resolve_paged_attention
 
 .. autoclass:: PagedAttention
-    :members: plan, update, run, explain, backend
+    :members: plan, update, run, explain, backend, workspace_requirements
 
     .. automethod:: __init__
 
