@@ -8,9 +8,10 @@ script measures, on the experimental ``flashinfer.prefill.PagedAttention``:
   (c) graph-mode re-plan (``PagedAttention(use_cuda_graph=True)``, every plan
       after the first one, which fixes the capture shapes),
 
-as synchronized wall time (median of ``--repeat`` runs; the wall includes the
-``torch.cuda.synchronize()`` that waits for whatever the call enqueued), plus
-the GPU-side activity one warm call enqueues, taken from ``torch.profiler``:
+as host time (the call alone; what an asynchronous plan() costs the engine)
+and synchronized wall time (call + ``torch.cuda.synchronize()``, which also
+waits for whatever else the GPU is running), both medians of ``--repeat``
+runs, plus the GPU-side activity one warm call enqueues, from ``torch.profiler``:
 kernel launches and memcpys by kind.  ``Memcpy HtoD (Pageable -> Device)`` is
 reported on its own because a non_blocking upload from pageable memory is a
 blocking staging copy on the host - the failure mode this benchmark exists to
@@ -144,17 +145,27 @@ class Problem:
 # ----------------------------------------------------------------------------
 
 
-def wall_us(fns: List[Callable[[], object]], warmup: int) -> Dict[str, float]:
-    """Synchronized wall time of each call in ``fns`` (one fresh input per
-    call); the first ``warmup`` calls are discarded."""
+def wall_us(
+    fns: List[Callable[[], object]], warmup: int, *, sync: bool = True
+) -> Dict[str, float]:
+    """Wall time of each call in ``fns`` (one fresh input per call); the
+    first ``warmup`` calls are discarded.  ``sync=True`` waits for the GPU
+    after every call (the cost as an engine that synchronizes per step sees
+    it, inflated by whatever else the GPU is running); ``sync=False`` is the
+    host time of enqueueing the call, the number that matters for a plan()
+    that is meant to be asynchronous."""
     values = []
     for i, fn in enumerate(fns):
-        torch.cuda.synchronize()
+        if sync:
+            torch.cuda.synchronize()
         t = time.perf_counter_ns()
         fn()
-        torch.cuda.synchronize()
+        if sync:
+            torch.cuda.synchronize()
         if i >= warmup:
             values.append((time.perf_counter_ns() - t) / 1000)
+    if not sync:
+        torch.cuda.synchronize()
     return dict(
         median=statistics.median(values),
         min=min(values),
@@ -252,6 +263,9 @@ def bench_cell(
     n = repeat + warmup
     # (a) metadata construction
     row["meta_us"] = wall_us([lambda: prob.metadata(form, mirrors)] * n, warmup)
+    row["meta_cpu_us"] = wall_us(
+        [lambda: prob.metadata(form, mirrors)] * n, warmup, sync=False
+    )
     row["meta_gpu"] = gpu_activity(lambda: prob.metadata(form, mirrors))
 
     # (b) eager plan on a fresh metadata object each time (derivation is
@@ -262,6 +276,12 @@ def bench_cell(
         (lambda md=md: attn.plan(md, backend=resolution, **spec)) for md in mds
     ]
     row["plan_us"] = wall_us(plan_calls, warmup)
+    mds = [prob.metadata(form, mirrors) for _ in range(n)]
+    row["plan_cpu_us"] = wall_us(
+        [(lambda md=md: attn.plan(md, backend=resolution, **spec)) for md in mds],
+        warmup,
+        sync=False,
+    )
     md = prob.metadata(form, mirrors)
     row["plan_gpu"] = gpu_activity(lambda: attn.plan(md, backend=resolution, **spec))
     row["chosen"] = attn.backend
@@ -275,6 +295,12 @@ def bench_cell(
         (lambda md=md: attn_g.plan(md, backend=resolution, **spec)) for md in mds_g
     ]
     row["replan_us"] = wall_us(replan_calls, warmup)
+    mds_g = [prob.metadata(form, mirrors) for _ in range(n)]
+    row["replan_cpu_us"] = wall_us(
+        [(lambda md=md: attn_g.plan(md, backend=resolution, **spec)) for md in mds_g],
+        warmup,
+        sync=False,
+    )
     md = prob.metadata(form, mirrors)
     row["replan_gpu"] = gpu_activity(
         lambda: attn_g.plan(md, backend=resolution, **spec)
@@ -303,24 +329,31 @@ def print_tables(rows: List[Dict[str, object]], with_run: bool) -> None:
     def us(v: Optional[Dict[str, float]]) -> str:
         return f"{v['median']:.1f}" if v else "-"
 
-    print("\n### timing (median synchronized wall, us)\n")
-    hdr = "| shape | backend | form | mirrors | metadata | plan (eager) | re-plan (graph) |"
+    print(
+        "\n### timing, median us: host = call without synchronization, "
+        "wall = call + torch.cuda.synchronize()\n"
+    )
+    hdr = (
+        "| shape | backend | form | mirrors | metadata host | metadata wall | "
+        "plan host | plan wall | re-plan host | re-plan wall |"
+    )
     if with_run:
-        hdr += " run |"
+        hdr += " run wall |"
     print(hdr)
     print("|" + "---|" * (hdr.count("|") - 1))
     for r in rows:
         if r.get("status") != "ok":
             print(
                 f"| {r['shape']} | {r['backend']} | {r['form']} | "
-                f"{'yes' if r['mirrors'] else 'no'} | {r.get('status')} | | |"
+                f"{'yes' if r['mirrors'] else 'no'} | {r.get('status')} | | | | | |"
                 + (" |" if with_run else "")
             )
             continue
         line = (
             f"| {r['shape']} | {r['backend']} | {r['form']} | "
-            f"{'yes' if r['mirrors'] else 'no'} | {us(r['meta_us'])} | "
-            f"{us(r['plan_us'])} | {us(r['replan_us'])} |"
+            f"{'yes' if r['mirrors'] else 'no'} | {us(r['meta_cpu_us'])} | "
+            f"{us(r['meta_us'])} | {us(r['plan_cpu_us'])} | {us(r['plan_us'])} | "
+            f"{us(r['replan_cpu_us'])} | {us(r['replan_us'])} |"
         )
         if with_run:
             line += f" {us(r.get('run_us'))} |"
