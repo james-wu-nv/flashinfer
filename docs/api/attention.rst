@@ -214,9 +214,16 @@ optional CPU mirrors for a zero-sync plan); :func:`resolve_paged_attention`
 answers at engine init which backends can run a configuration and why the
 others cannot; ``plan()`` declares the LSE base (``lse_mode``) and ``run()``
 takes the per-layer ``sm_scale`` and, for an fp8 KV cache, the per-tensor
-``k_scale`` / ``v_scale``. ``PagedAttention(use_cuda_graph=True)`` reserves
-metadata storage so a captured ``run()`` can be re-planned and replayed; the
-kernel workspace is shared per device (or caller-supplied via
+``k_scale`` / ``v_scale``. CUDA graphs follow a three-stage lifecycle:
+``PagedAttention(graph_capacity=GraphCapacity(...))`` reserves the metadata
+storage of one graph bucket at construction (``use_cuda_graph=True`` infers
+the capacity from the first plan); the first graph-mode ``plan()`` freezes the
+backend and every semantic argument, and a later plan that changes one is
+rejected; ``update(metadata)`` then re-plans each step's batch into the
+reserved storage so the captured ``run()`` replays it. A batch must fit the
+capacity: batch size, paging form and page size exactly, total query tokens
+and host maxes at most the capacity's, which is what the kernels are planned
+with. The kernel workspace is shared per device (or caller-supplied via
 ``workspace_buffer=``), so one instance per graph bucket costs no workspace per
 bucket. Calling any of these is the opt-in (an
 ``ExperimentalWarning`` is emitted once); see the tracking issue
@@ -231,12 +238,15 @@ graduation plan.
     resolve_paged_attention
 
 .. autoclass:: PagedAttention
-    :members: plan, run, explain, backend
+    :members: plan, update, run, explain, backend
 
     .. automethod:: __init__
 
 .. autoclass:: PagedAttentionMetadata
     :members: dense, csr
+
+.. autoclass:: GraphCapacity
+    :members: from_metadata
 
 flashinfer.prefill
 ==================

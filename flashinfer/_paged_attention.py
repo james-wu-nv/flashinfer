@@ -45,13 +45,38 @@ Design rules enforced (each traces to a documented failure mode):
     because it selects a compiled kernel variant on the FA backends.
 
 Prototype simplifications (documented, not hidden):
-- dtypes: fp16/bf16 only.  fp8/nvfp4 are capability axes, out of scope here.
+- dtypes: fp16/bf16 activations; an fp8 (e4m3) KV cache with per-tensor
+  ``k_scale`` / ``v_scale`` at ``run()`` where the capability table declares
+  it (fa2).  fp8 Q and nvfp4 are undeclared axes.
 - Heuristic order is a static per-arch placeholder, to be seeded from the
   benchmark suite (proposal §5.2).  Autotune hook (§5.4) is not wired.
-- CUDA-graph capture mode (pinned metadata buffers, replay-safe re-plan) is
-  not wired; run() is capture-shaped (no allocs with out=/lse=, no syncs)
-  but the plan-under-capture story is follow-up work.
 - ``sinks`` / custom masks / soft-cap are absent capability axes.
+
+CUDA-graph lifecycle — three stages (``experimental/paged_attention/_graph.py``):
+
+1.  Construct.  ``PagedAttention(device, graph_capacity=GraphCapacity(...))``
+    reserves the metadata storage a captured ``run()`` reads, sized by the
+    capacity (batch size, total query tokens, host maxes, page size, block
+    table width or flat page-id capacity) — one instance per graph bucket.
+    ``use_cuda_graph=True`` is the compatibility form: the capacity is
+    inferred from the first plan.  A first plan that fails installs nothing.
+2.  First ``plan()`` freezes.  The first successful graph-mode plan fixes the
+    backend and every semantic ``plan()`` argument (causal, window, LSE base,
+    dtypes, heads, head dims, layout, paging form, page size): the captured
+    kernels bake them in.  A later ``plan()`` that changes one is rejected
+    before anything is written — construct a new instance and recapture.
+3.  ``update(metadata)`` per step.  Only the batch changes.  It is staged
+    into the reserved storage (rolled back on failure) and must fit the
+    capacity: batch size, paging form and page size exact; total query
+    tokens, host maxes and flat page-id length at most the capacity's.
+    Capacity substitution: backends are planned with, and the captured
+    kernels keep reading, the CAPACITY ``max_q_len`` / ``max_kv_len``; a
+    batch's own maxes are only validated against them.  ``q`` / ``out`` /
+    ``lse`` are the capture buffers, sized to the capacity's rows; rows past
+    the batch are neither read nor written.  ``plan()`` and ``update()`` are
+    rejected while the current stream is capturing.  ``sm_scale`` /
+    ``k_scale`` / ``v_scale`` are launch scalars: a captured graph keeps the
+    values it was captured with.
 
 Paging metadata comes in exactly one of two forms (never both):
 - dense ``block_tables (b, max_pages)`` — vLLM-native; page_size >= 8
@@ -186,6 +211,20 @@ class PagedAttention:
                       backend=res)          # pinned candidate set (or a string)
             for layer in model:
                 out, lse = attn.run(q, (k_cache, v_cache), sm_scale=layer.scale)
+
+    One CUDA-graph bucket (the module docstring describes the lifecycle)::
+
+        cap = GraphCapacity(batch_size=256, total_q_tokens=1024, max_q_len=4,
+                            max_kv_len=8192 * 16, page_size=16, table_width=8192)
+        attn = PagedAttention(device, graph_capacity=cap)
+        attn.plan(md0, num_qo_heads=8, num_kv_heads=2, head_dim_qk=128,
+                  q_dtype=torch.bfloat16, backend=res)   # freezes backend + semantics
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            attn.run(q_buf, (k_cache, v_cache), out=out_buf, lse=lse_buf)
+        for step in engine:
+            attn.update(md_step)   # only the batch changes; must fit ``cap``
+            g.replay()
     """
 
     def __init__(
@@ -278,7 +317,9 @@ class PagedAttention:
         Publication is transactional: a failing ``plan()`` leaves the previous
         plan runnable (see ``experimental/paged_attention/_controller.py`` for
         the one generated-FA caveat).  In CUDA-graph mode the new batch is
-        staged into reserved storage and rolled back on failure.
+        staged into reserved storage and rolled back on failure; it must fit
+        the :class:`GraphCapacity` and keep the semantic arguments the first
+        graph-mode plan froze (use :meth:`update` to pass only the metadata).
         """
         self._impl.plan(
             metadata,
