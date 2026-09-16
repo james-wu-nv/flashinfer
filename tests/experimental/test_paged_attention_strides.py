@@ -312,3 +312,73 @@ def test_native_query_stride_probe(backend, layout, workspace):
             f"{tuple(q.stride())}) correctly — update NATIVE_Q_OUTCOME and relax "
             "the matching controller/capability check"
         )
+
+
+# ---------------------------------------------------------------------------
+# Unified contract: what the controller/backends must reject or handle.
+# ---------------------------------------------------------------------------
+
+BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen"]
+
+
+def _plan(p, backend, **plan_kw):
+    from flashinfer.prefill import PagedAttention
+
+    from .test_paged_attention_prototype import make_metadata
+
+    _skip_unless_runnable(p, backend)
+    kw = dict(
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim_qk"],
+        q_dtype=p["dtype"],
+        kv_layout=p.get("kv_layout", "HND"),
+        lse_mode="base2",
+        backend=backend,
+    )
+    kw.update(plan_kw)
+    attn = PagedAttention(torch.device(p["device"]))
+    attn.plan(make_metadata(p), **kw)
+    return attn
+
+
+def _check_unified(attn, p, q):
+    out, lse = attn.run(q, (p["k_cache"], p["v_cache"]))
+    ref_out, ref_lse = _oracle(p)
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+    return out, lse
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_run_rejects_non_unit_inner_stride(backend):
+    """q.stride(-1) != 1 is a silent misread on fa2/trtllm-gen (native probe)
+    and a graph-build error on cuDNN: the controller rejects it for EVERY
+    backend before any launch, as a ValueError naming the constraint."""
+    p = _problem()
+    attn = _plan(p, backend)
+    with pytest.raises(ValueError, match=r"stride\(-1\) == 1"):
+        attn.run(q_inner_stride_2(p), (p["k_cache"], p["v_cache"]))
+    # the same values in an addressable layout still run
+    _check_unified(attn, p, p["q"])
+
+
+@pytest.mark.parametrize("which", ["q", "k_cache", "v_cache", "out", "lse"])
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_run_rejects_foreign_device(backend, which):
+    """Every run() tensor must live on the instance's device: backends take raw
+    pointers, so a CPU (or other-GPU) tensor is a fault or a misread."""
+    p = _problem()
+    attn = _plan(p, backend)
+    q, k, v = p["q"], p["k_cache"], p["v_cache"]
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[0], q.shape[1], dtype=torch.float32, device=q.device)
+    tensors = dict(q=q, k_cache=k, v_cache=v, out=out, lse=lse)
+    tensors[which] = tensors[which].cpu()
+    with pytest.raises(ValueError, match=f"{which} lives on cpu"):
+        attn.run(
+            tensors["q"],
+            (tensors["k_cache"], tensors["v_cache"]),
+            out=tensors["out"],
+            lse=tensors["lse"],
+        )

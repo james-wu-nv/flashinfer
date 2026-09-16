@@ -441,6 +441,20 @@ class PagedAttentionController:
             "(pages, num_kv_heads, page_size, head_dim) [HND]",
         )
         k_cache, v_cache = kv_cache
+        # Device placement: every backend launches on self.device and takes
+        # raw pointers; a tensor elsewhere is a fault or a silent misread.
+        for name, t in (
+            ("q", q),
+            ("k_cache", k_cache),
+            ("v_cache", v_cache),
+            ("out", out),
+            ("lse", lse),
+        ):
+            _expect(
+                t is None or t.device == self.device,
+                f"{name} lives on {getattr(t, 'device', None)} but this instance "
+                f"is bound to {self.device}",
+            )
         layout = m.kv_layout
         h_pos, ps_pos = (1, 2) if layout == "HND" else (2, 1)
         shape_word = (
@@ -501,12 +515,27 @@ class PagedAttentionController:
                 q.shape[0] == total,
                 f"q has {q.shape[0]} tokens but qo_indptr sums to {total}",
             )
+        # Query ABI shared by every backend: the FA2/FA3 and trtllm-gen bindings
+        # pass only the token and head strides (the kernels assume a dense
+        # head_dim), so a non-unit inner stride is silently misread (native
+        # probe: max abs error 1.5 / 1.3 against 0.0025); cuDNN rejects it in
+        # graph construction.  See tests/experimental/test_paged_attention_strides.py.
+        _expect(
+            q.stride(-1) == 1,
+            f"q must be dense along head_dim (stride(-1) == 1), got strides "
+            f"{tuple(q.stride())} — every backend addresses q by token/head "
+            "stride only; pass a view whose last dim is unit-stride (a head "
+            "slice of a fused QKV buffer is fine) or a packed copy",
+        )
         cap = CAPABILITIES[self._backend_name]
         if cap.requires_contiguous_q and not q.is_contiguous():
             raise ValueError(
-                f"backend {self._backend_name!r} requires contiguous packed q "
-                "(token-unit addressing assumes packed THD); call "
-                ".contiguous() or pin a strided-capable backend (fa2/fa3)"
+                f"backend {self._backend_name!r} requires packed q, got strides "
+                f"{tuple(q.stride())}: it addresses each request by token-unit "
+                "ragged offsets scaled by num_qo_heads*head_dim, so a head slice "
+                "of a fused QKV buffer (token stride > H*D) is misaddressed — "
+                "pass a packed (T, H, D) copy or pin a strided-capable backend "
+                "(fa2/fa3/trtllm-gen)"
             )
         if out is not None:
             _expect(
@@ -515,10 +544,9 @@ class PagedAttentionController:
                 "out must be contiguous (total_q_tokens, num_qo_heads, head_dim_vo)",
             )
             _expect(
-                out.dtype == m.q_dtype and out.device == q.device,
-                f"out must match q dtype/device ({m.q_dtype}, {q.device}), "
-                f"got ({out.dtype}, {out.device}) — allocate with "
-                "torch.empty(..., dtype=q.dtype, device=q.device)",
+                out.dtype == m.q_dtype,
+                f"out must match q dtype {m.q_dtype}, got {out.dtype} — "
+                "allocate with torch.empty(..., dtype=q.dtype, device=q.device)",
             )
         if lse is not None:
             _expect(
@@ -529,11 +557,10 @@ class PagedAttentionController:
             _expect(
                 tuple(lse.shape) == (q.shape[0], m.num_qo_heads)
                 and lse.dtype == torch.float32
-                and lse.is_contiguous()
-                and lse.device == q.device,
-                "lse must be contiguous fp32 (total_q_tokens, num_qo_heads) "
-                f"on {q.device} — the LSE contract is packed fp32 in the planned "
-                "base for every backend",
+                and lse.is_contiguous(),
+                "lse must be contiguous fp32 (total_q_tokens, num_qo_heads) — "
+                "the LSE contract is packed fp32 in the planned base for every "
+                "backend",
             )
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(m.head_dim_qk)
