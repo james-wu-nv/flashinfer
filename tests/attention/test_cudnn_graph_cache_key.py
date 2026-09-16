@@ -26,6 +26,7 @@ from flashinfer.cudnn import (
     cudnn_batch_decode_with_kv_cache,
     cudnn_batch_prefill_with_kv_cache,
 )
+from flashinfer.cudnn import decode as cudnn_decode
 from flashinfer.cudnn import prefill as cudnn_prefill
 from flashinfer.utils import get_compute_capability
 
@@ -415,4 +416,181 @@ def test_cudnn_prefill_failed_build_leaves_no_cache_entry():
             _paged_call(p, workspace, block_tables=wide)
             torch.cuda.synchronize()
     out, _ = _paged_call(p, workspace)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# Decode analogs (ledger M15 leftover): decode.py had the same key gap and the
+# same decorator order as prefill.py.
+# ---------------------------------------------------------------------------
+
+
+def _decode_problem(
+    device, *, batch_size, width, page_size=16, num_heads=4, head_dim=128, spare=3
+):
+    """Exact-width paged decode problem (kv_len == width * page_size, one query
+    token per request) with a random page permutation.  ``wide`` is a
+    capacity table with ``spare`` extra columns, ``view`` its live prefix (row
+    stride width + spare) and ``packed`` the contiguous copy."""
+    kv_len = width * page_size
+    pool_pages = batch_size * width + 8
+    q = torch.randn(
+        batch_size, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_cache = torch.randn(
+        pool_pages, num_heads, page_size, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v_cache = torch.randn_like(k_cache)
+    perm = torch.randperm(pool_pages, dtype=torch.int32, device=device)
+    wide = torch.zeros(batch_size, width + spare, dtype=torch.int32, device=device)
+    wide[:, :width] = perm[: batch_size * width].view(batch_size, width)
+    view = wide[:, :width]
+    packed = view.contiguous()
+    assert view.stride(0) == width + spare and packed.stride(0) == width
+    seq_lens_kv = torch.full(
+        (batch_size, 1, 1, 1), kv_len, dtype=torch.int32, device=device
+    )
+
+    def reference():
+        outs = []
+        for i in range(batch_size):
+            pages = packed[i].to(torch.int64)
+            k_i = (
+                k_cache[pages]
+                .permute(1, 0, 2, 3)
+                .reshape(num_heads, -1, head_dim)
+                .float()
+            )
+            v_i = (
+                v_cache[pages]
+                .permute(1, 0, 2, 3)
+                .reshape(num_heads, -1, head_dim)
+                .float()
+            )
+            scores = torch.einsum("hd,hkd->hk", q[i].float(), k_i) / math.sqrt(head_dim)
+            outs.append(torch.einsum("hk,hkd->hd", torch.softmax(scores, -1), v_i))
+        return torch.stack(outs)
+
+    return dict(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        seq_lens_kv=seq_lens_kv,
+        wide=wide,
+        view=view,
+        block_tables=packed,
+        kv_len=kv_len,
+        head_dim=head_dim,
+        reference=reference,
+    )
+
+
+def _decode_call(p, workspace, *, block_tables=None, k_cache=None, v_cache=None):
+    return cudnn_batch_decode_with_kv_cache(
+        p["q"],
+        p["k_cache"] if k_cache is None else k_cache,
+        p["v_cache"] if v_cache is None else v_cache,
+        1.0 / math.sqrt(p["head_dim"]),
+        workspace,
+        max_sequence_kv=p["kv_len"],
+        actual_seq_lens_kv=p["seq_lens_kv"],
+        block_tables=p["block_tables"] if block_tables is None else block_tables,
+    )
+
+
+@pytest.mark.parametrize("order", ["view_then_contiguous", "contiguous_then_view"])
+def test_cudnn_decode_block_table_strides_in_graph_cache_key(order):
+    """Decode analog of the prefill stride test: the decode graph binds
+    block_tables with tensor_like() (row stride baked in) while the key held
+    only ``block_tables is not None``.  Replaying the column-view graph on a
+    contiguous table of the same shape read past the table (measured on
+    B200: CUDA illegal memory access at the next synchronize)."""
+    device = "cuda:0"
+    _skip_if_unsupported(device)
+    torch.manual_seed(0)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    p = _decode_problem(device, batch_size=3, width=8)
+    ref = p["reference"]()
+    tables = (
+        (p["view"], p["block_tables"])
+        if order == "view_then_contiguous"
+        else (p["block_tables"], p["view"])
+    )
+    for table in tables:
+        strides = tuple(table.stride())
+        out = _decode_call(p, workspace, block_tables=table)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            out.float(),
+            ref,
+            atol=2e-2,
+            rtol=2e-2,
+            msg=lambda m, st=strides: (
+                f"decode block_tables strides {st}: stale-stride graph replay?\n{m}"
+            ),
+        )
+
+
+def test_cudnn_decode_table_width_in_graph_cache_key():
+    """The ledger scenario: the same batch (same max_kv, same KV pool) once
+    with its exact width-64 table and once with the contiguous width-67
+    capacity table it lives in.  Both are valid decode inputs (unlike
+    prefill, decode's finalize accepts an over-wide table), so with the old
+    key — which had no table shape — the second call silently replayed the
+    width-64 graph on the width-67 table (row stride 67 read as 64).  The two
+    calls must build distinct entries and both match the reference."""
+    device = "cuda:0"
+    _skip_if_unsupported(device)
+    torch.manual_seed(0)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    p = _decode_problem(device, batch_size=2, width=64)
+    ref = p["reference"]()
+    keys = set()
+    for table in (p["block_tables"], p["wide"]):
+        assert table.is_contiguous()
+        keys.add(
+            cudnn_decode._sdpa_decode_key_fn(
+                p["q"],
+                p["k_cache"],
+                p["v_cache"],
+                1.0 / math.sqrt(p["head_dim"]),
+                max_sequence_kv=p["kv_len"],
+                actual_seq_lens_kv=p["seq_lens_kv"],
+                block_tables=table,
+            )
+        )
+        out = _decode_call(p, workspace, block_tables=table)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            out.float(),
+            ref,
+            atol=2e-2,
+            rtol=2e-2,
+            msg=lambda m, w=table.shape[1]: (
+                f"decode table width {w}: stale-width graph replay?\n{m}"
+            ),
+        )
+    assert len(keys) == 2, "width-64 and width-67 tables must not share a cache entry"
+
+
+def test_cudnn_decode_failed_build_leaves_no_cache_entry():
+    """Decode analog of the prefill poisoning test.  A build that fails at
+    finalize (here: page size 3, "block size needs to be ... a power of 2")
+    must not leave a half-built graph in the cache: retrying raises the same
+    cuDNN error, not "attn_scale with tensor and value cannot be set at the
+    same time", and a valid same-process call stays correct."""
+    device = "cuda:0"
+    _skip_if_unsupported(device)
+    torch.manual_seed(1)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    p = _decode_problem(device, batch_size=3, width=8)
+    ref = p["reference"]()
+    out = _decode_call(p, workspace)
+    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+    bad = _decode_problem(device, batch_size=2, width=4, page_size=3)
+    for _ in range(2):  # the second attempt must fail the same way
+        with pytest.raises(RuntimeError, match="power of 2"):
+            _decode_call(bad, workspace)
+            torch.cuda.synchronize()
+    out = _decode_call(p, workspace)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
