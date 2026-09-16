@@ -268,6 +268,9 @@ class PagedAttentionController:
                 need_lse,
                 window_left,
                 kv_input_form,
+                None,  # logits_soft_cap: plan-time feature kwargs land next
+                False,  # custom_mask
+                False,  # sinks
                 *self._device_binding(),
             )
             _expect(

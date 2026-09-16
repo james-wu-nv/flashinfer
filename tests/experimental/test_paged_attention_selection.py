@@ -265,3 +265,47 @@ def test_preflight_runs_before_any_reserved_buffer_write(monkeypatch):
     assert gb is not None
     for buf in (gb.qo_indptr, gb.kv_seq_lens, gb.block_tables, gb.kv_page_indices):
         assert not buf.any(), "reserved storage was written before preflight"
+
+
+# --------------------------------------------------------------------------
+# feature axes: soft cap / custom mask / sinks are selection facts
+# --------------------------------------------------------------------------
+
+
+def test_features_exclude_backends_with_reasons():
+    """`auto` must reject backends that cannot apply a requested feature
+    (and say so) instead of dropping the feature silently."""
+    res = resolve_paged_attention(cc_major=10, logits_soft_cap=30.0, **_CFG)
+    assert res.excluded["cudnn"] == "logits soft cap not supported"
+    assert res.excluded["trtllm-gen"] == "logits soft cap not supported"
+    assert "fa2" in res.backends
+    assert res.config[-4:-1] == (30.0, False, False)
+
+    res = resolve_paged_attention(cc_major=9, custom_mask=True, **_CFG)
+    assert res.excluded["fa3"] == "custom attention mask not supported"
+    assert res.excluded["cudnn"] == "custom attention mask not supported"
+    assert res.backends == ("fa2",)
+    assert res.config[-4:-1] == (None, True, False)
+
+    res = resolve_paged_attention(cc_major=10, sinks=True, **_CFG)
+    assert res.excluded["cudnn"] == "attention sinks not supported"
+    assert set(res.backends) == {"trtllm-gen", "fa2"}
+    assert res.config[-4:-1] == (None, False, True)
+
+    # a configuration only cuDNN could run + a feature cuDNN lacks: loud
+    with pytest.raises(ValueError, match="cudnn: logits soft cap not supported"):
+        resolve_paged_attention(
+            cc_major=10,
+            logits_soft_cap=50.0,
+            **dict(_CFG, head_dim_qk=192, head_dim_vo=128),
+        )
+
+
+def test_logits_soft_cap_is_normalized_and_validated():
+    off = resolve_paged_attention(cc_major=10, logits_soft_cap=0.0, **_CFG)
+    plain = resolve_paged_attention(cc_major=10, **_CFG)
+    assert off.config == plain.config  # 0 means off, like the legacy wrappers
+    assert "cudnn" in off.backends
+    for bad in (-1.0, float("nan"), float("inf"), "30"):
+        with pytest.raises(ValueError, match="logits_soft_cap"):
+            resolve_paged_attention(cc_major=10, logits_soft_cap=bad, **_CFG)
