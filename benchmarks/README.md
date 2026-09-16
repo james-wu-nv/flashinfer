@@ -267,6 +267,7 @@ The output CSV will contain detailed metrics including:
 | `--pa_layers`            | PagedAttention only: layer counts N for the `step` phase (one plan followed by N `run()` calls); one CSV row per value. Default `1 32`. |
 | `--pa_legacy`            | PagedAttention only: also time the same inputs through the legacy public API of each resolved backend as `api_variant=legacy` rows. |
 | `--pa_skip_refcheck`     | PagedAttention only: time without the fp32 oracle gate, which is otherwise always on for this routine (`--refcheck` is implied). For shapes the fp32 oracle cannot hold; contradicts `--refcheck`. |
+| `--pa_max_q_len_hint`    | PagedAttention only: pass `max_q_len=N` to `resolve_paged_attention()`, the shape hint that selects the candidate order of `auto` (fa2 first at small query lengths on SM100); `plan()` rejects a batch whose max query length exceeds it. Default: no hint. |
 
 ### PagedAttention Routine (experimental unified paged attention)
 
