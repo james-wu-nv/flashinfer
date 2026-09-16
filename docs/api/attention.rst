@@ -232,7 +232,11 @@ rejected; ``update(metadata)`` then re-plans each step's batch into the
 reserved storage so the captured ``run()`` replays it. A batch must fit the
 capacity: batch size, paging form and page size exactly, total query tokens
 and host maxes at most the capacity's, which is what the kernels are planned
-with. The kernel workspace is shared per device (a 512 MiB pool) or
+with. Run once eagerly after the plan and before capturing; with the Cake
+backend that eager ``run()`` must use the very ``q`` / ``k_cache`` /
+``v_cache`` tensors the capture will bind (its TMA descriptors are created
+eagerly and pinned at capture; a new binding inside capture raises a
+``RuntimeError`` asking for the prewarm). The kernel workspace is shared per device (a 512 MiB pool) or
 caller-supplied via ``workspace_buffer=``, so one instance per graph bucket
 costs no workspace per bucket; ``PagedAttention.workspace_requirements()``
 returns, for a :class:`~flashinfer.prefill.GraphCapacity` and a model

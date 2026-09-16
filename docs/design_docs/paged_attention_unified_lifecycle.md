@@ -430,6 +430,19 @@ when the current stream is capturing. `plan()` in graph mode is also rejected
 during capture. `update()` has no stream binding; call it on the stream the
 graph is replayed on.
 
+**Warm-up before capture.** Every backend needs one eager `run()` after the
+plan and before capture for its lazy work (module load, cuDNN graph build).
+Cake additionally binds `q`, `k_cache` and `v_cache` through TMA descriptors
+keyed by storage address, shape and strides, created eagerly and pinned when
+capture first replays them; a q/k/v binding that never ran eagerly is refused
+inside the capture with `RuntimeError("... prewarm each Cake FMHA
+tensor/layout binding before CUDA Graph capture")` (ledger M18). The rule for
+cake is therefore: run the exact `q`, `k_cache` and `v_cache` tensors you
+will capture once eagerly first; `out` and `lse` are plain pointers and may
+differ. The refused capture is clean: no device fault, the instance and the
+stream stay usable, and an eager run on those tensors followed by a new
+capture succeeds.
+
 **`run()` under a captured graph.** `q`, `out` and `lse` are the capture
 buffers. The controller accepts `total_q_tokens <= q.shape[0] <=
 capacity.total_q_tokens` and checks `out` and `lse` against `q.shape[0]`
@@ -854,7 +867,7 @@ because the controller, not the backend, owns the reserved storage.
 | M14 | The 128 MiB shared default workspace overflows the fa2 split-KV planner on a single 2048-token request with 32 heads. | WP-I adds `workspace_requirements()`; pass the engine's buffer meanwhile. |
 | M15 | `flashinfer/cudnn/decode.py` keeps the older graph-cache key and decorator order that the prefill path fixed. | Out of this package; recorded. |
 | M16 | trtllm-gen and cake compute silently wrong results when the V cache's page stride differs from the K cache's (independently allocated pools); cuDNN and fa2 are correct. | Rejected at `run()` in the trtllm-gen backend (a `ValueError` naming the stride constraint); `tests/experimental/test_paged_attention_coverage.py::test_tc05_strided_inputs[trtllm-gen-kv_independent_strides]` pins it. |
-| M18 | Cake raises "prewarm each Cake FMHA tensor/layout binding before CUDA Graph capture" when a new tensor binding first appears inside capture (the benchmark's cold-L2 rotating buffers). | Needs a prewarm at plan or first run, or a capability entry. |
+| M18 | Cake creates its TMA descriptors for `q`, `k_cache` and `v_cache` (storage address, shape, strides) eagerly and pins them at capture; a `run()` whose q/k/v binding was never run eagerly raises `RuntimeError("... prewarm each Cake FMHA tensor/layout binding before CUDA Graph capture")` inside the capture (the benchmark's cold-L2 rotating buffers). | Documented rule, not fixable from `plan()` (it sees no tensors): run the exact `q`, `k_cache`, `v_cache` once eagerly before capturing them; `out` and `lse` may be fresh. The failed capture is clean (no device fault, instance reusable). `tests/experimental/test_paged_attention_cuda_graph.py::test_cake_capture_requires_an_eager_run_on_the_captured_tensors`. |
 | — | `auto` is a static order. On SM100 it picks trtllm-gen for a decode-shaped batch (B=32, q=1, kv=4096) that fa2 runs about five times faster in the benchmark smoke run. | Shape-bucket order table is wave-2 work; the benchmark's `resolved_backend` column shows the regret. |
 | — | `custom_mask` with graph mode raises `ValueError`: the FA wrapper's packed-mask storage is not part of `GraphCapacity`. | Follow-up. |
 | — | The generated-FA backend re-plans its wrapper in place; a failure inside that plan can leave backend-internal state ahead of the published metadata. | Same caveat as the MLA generated backends. |
