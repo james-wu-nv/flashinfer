@@ -1,4 +1,5 @@
-"""Regression tests: the cuDNN graph-cache keys must include attn scale.
+"""Regression tests: the cuDNN graph-cache keys must include everything the
+built graph bakes in — attn scale, and the page table's strides.
 
 The cuDNN SDPA graph bakes ``attn_scale`` in as a compile-time constant, but
 ``_sdpa_prefill_key_fn`` did not include it in the process-global graph-cache
@@ -178,5 +179,97 @@ def test_cudnn_decode_scale_in_graph_cache_key():
             rtol=2e-2,
             msg=lambda m, s=scale, sm=scale_mult: (
                 f"decode scale={s} (mult {sm}): stale-scale graph replay?\n{m}"
+            ),
+        )
+
+
+@pytest.mark.parametrize("order", ["view_then_contiguous", "contiguous_then_view"])
+def test_cudnn_prefill_block_table_strides_in_graph_cache_key(order):
+    """The paged graph binds block_tables with tensor_like(), so its strides
+    are baked in, but the key held only ``block_tables is not None``.  A graph
+    built for a column view of a wider table (row stride > width) replayed on
+    a contiguous table of the same shape — or the reverse — read the wrong
+    pages (71.7% wrong elements, found by the PagedAttention fuzzer)."""
+    device = "cuda:0"
+    _skip_if_unsupported(device)
+
+    torch.manual_seed(0)
+    batch_size, num_heads, head_dim, page_size = 3, 4, 128, 16
+    kv_len, q_len = 120, 32
+    width = (kv_len + page_size - 1) // page_size
+    pool_pages = batch_size * width + 8
+    q_lens = torch.full((batch_size,), q_len, dtype=torch.int32, device=device)
+    kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32, device=device)
+    zero = torch.zeros(1, dtype=torch.int32, device=device)
+    qo_indptr = torch.cat([zero, torch.cumsum(q_lens, 0)]).int()
+    q = torch.randn(
+        batch_size * q_len, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_cache = torch.randn(
+        pool_pages, num_heads, page_size, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v_cache = torch.randn_like(k_cache)
+    # a capacity-width table (3 spare columns) whose live prefix is a random
+    # page permutation; the narrow view keeps its row stride width + 3
+    perm = torch.randperm(pool_pages, dtype=torch.int32, device=device)
+    wide = torch.zeros(batch_size, width + 3, dtype=torch.int32, device=device)
+    wide[:, :width] = perm[: batch_size * width].view(batch_size, width)
+    view = wide[:, :width]
+    packed = view.contiguous()
+    assert view.stride(0) == width + 3 and packed.stride(0) == width
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    def reference():
+        outs = []
+        for i in range(batch_size):
+            pages = packed[i].to(torch.int64)
+            k_i = (
+                k_cache[pages]
+                .permute(1, 0, 2, 3)
+                .reshape(num_heads, -1, head_dim)[:, :kv_len]
+                .float()
+            )
+            v_i = (
+                v_cache[pages]
+                .permute(1, 0, 2, 3)
+                .reshape(num_heads, -1, head_dim)[:, :kv_len]
+                .float()
+            )
+            q_i = q[i * q_len : (i + 1) * q_len].float()
+            scores = torch.einsum("qhd,hkd->hqk", q_i, k_i) / math.sqrt(head_dim)
+            qpos = torch.arange(q_len, device=device).unsqueeze(1)
+            kpos = torch.arange(kv_len, device=device).unsqueeze(0)
+            allowed = kpos <= (kv_len - q_len) + qpos
+            scores = scores.masked_fill(~allowed.unsqueeze(0), float("-inf"))
+            outs.append(torch.einsum("hqk,hkd->qhd", torch.softmax(scores, -1), v_i))
+        return torch.cat(outs)
+
+    ref = reference()
+    tables = (view, packed) if order == "view_then_contiguous" else (packed, view)
+    for table in tables:
+        strides = tuple(table.stride())
+        out, _ = cudnn_batch_prefill_with_kv_cache(
+            q,
+            k_cache,
+            v_cache,
+            1.0 / math.sqrt(head_dim),
+            workspace,
+            max_token_per_sequence=q_len,
+            max_sequence_kv=kv_len,
+            actual_seq_lens_q=q_lens.view(batch_size, 1, 1, 1),
+            actual_seq_lens_kv=kv_lens.view(batch_size, 1, 1, 1),
+            block_tables=table,
+            causal=True,
+            return_lse=True,
+            batch_offsets_q=qo_indptr,
+            batch_offsets_units="tokens",
+        )
+        torch.testing.assert_close(
+            out.float(),
+            ref,
+            atol=2e-2,
+            rtol=2e-2,
+            msg=lambda m, st=strides: (
+                f"block_tables strides {st}: stale-stride graph replay?\n{m}"
             ),
         )

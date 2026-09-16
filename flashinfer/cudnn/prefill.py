@@ -186,6 +186,13 @@ def _sdpa_prefill_key_fn(
         tuple(q.stride()),
         tuple(k_cache.stride()),
         tuple(v_cache.stride()),
+        # The page table is bound with tensor_like(), so its strides are baked
+        # into the graph as well: a graph built for a column view of a wider
+        # table (row stride > width) replayed on a contiguous table of the same
+        # shape reads the wrong pages (71.7% wrong elements; found by the
+        # PagedAttention fuzzer's block_tables_row_stride_view mutation).
+        tuple(block_tables.shape) if block_tables is not None else None,
+        tuple(block_tables.stride()) if block_tables is not None else None,
         k_cache.dtype,
         v_cache.dtype,
         o_data_type,

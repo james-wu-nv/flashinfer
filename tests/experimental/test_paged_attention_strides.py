@@ -559,3 +559,21 @@ def test_capacity_width_block_table_graph_mode(backend):
         torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
         torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
         attn.plan(make_metadata(p), **plan_kw)
+
+
+@pytest.mark.parametrize("order", ["view_then_contiguous", "contiguous_then_view"])
+def test_cudnn_graph_cache_keys_block_table_strides(order):
+    """Regression: the cuDNN prefill graph cache keyed on q/k/v strides but not
+    on the page table's, while the graph bakes the table's strides in.  A
+    graph built for block_tables[:, :w] of a wider table (row stride w+3)
+    replayed on a contiguous (b, w) table of the same shape read the wrong
+    pages (71.7% wrong elements) — in one process, in either order."""
+    p, w = _with_capacity_table(_problem(seed=107))
+    view = p["block_tables"][:, :w]
+    packed = view.contiguous()
+    first, second = (
+        (view, packed) if order == "view_then_contiguous" else (packed, view)
+    )
+    for table in (first, second):
+        q = dict(p, block_tables=table)
+        _check_unified(_plan(q, "cudnn"), q, q["q"])
