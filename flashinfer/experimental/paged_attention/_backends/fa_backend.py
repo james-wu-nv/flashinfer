@@ -8,10 +8,16 @@ wrapper instance as stable storage and re-plans it in place.
 Features: ``logits_soft_cap`` and ``custom_mask`` go to the wrapper's plan()
 (the kernel's own soft-cap variant; the mask in the legacy flattened
 per-request layout, ANDed here with the causal / sliding-window envelope
-because MaskMode.CUSTOM replaces the kernel's causal mask).
+because MaskMode.CUSTOM replaces the kernel's causal mask).  Attention sinks
+are the ``AttentionSink`` JIT variant (``BatchAttentionWithAttentionSinkWrapper``):
+the default wrapper's ``run(sinks=)`` is forwarded to the kernel only on the
+trtllm-gen path, so a sink plan selects the variant wrapper here and passes
+the sink tensor as the variant's additional run() argument.
 """
 
 from __future__ import annotations
+
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -57,41 +63,85 @@ class _FaBackend:
     def __init__(
         self, device, kv_layout, workspace, backend: str = "fa2", graph_capacity=None
     ):
-        from ....prefill import BatchPrefillWithPagedKVCacheWrapper
-
         self.name = backend
         self._device = device
+        self._kv_layout = kv_layout
+        self._workspace = workspace
         self._graph_capacity = graph_capacity
-        if graph_capacity is None:
-            self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                workspace, kv_layout, backend=backend
+        # The default-variant wrapper is the stable storage for plain plans;
+        # attention sinks need the AttentionSink JIT variant, whose module is
+        # specialized per (dtypes, head dims, sliding window), so those
+        # wrappers are built on first use and kept alongside it.
+        self._wrapper = self._make_wrapper(None)
+        self._sink_wrappers: Dict[Tuple, Any] = {}
+        self._active = self._wrapper
+        self._lse_mode = "none"
+        self._use_sinks = False
+        self._total_q_tokens = 0
+        self._head_dim_vo = 0
+
+    def _graph_bufs(self) -> Dict[str, torch.Tensor]:
+        # The wrapper's own CUDA-graph protocol: it copies each plan's CSR
+        # metadata into these reserved buffers, so the captured kernel keeps
+        # reading valid pointers across re-plans.
+        cap = self._graph_capacity
+        if cap is None:
+            return {}
+        b = cap.batch_size
+        i32 = dict(dtype=torch.int32, device=self._device)
+        return dict(
+            use_cuda_graph=True,
+            qo_indptr_buf=torch.zeros(b + 1, **i32),
+            paged_kv_indptr_buf=torch.zeros(b + 1, **i32),
+            paged_kv_indices_buf=torch.zeros(cap.flat_capacity, **i32),
+            paged_kv_last_page_len_buf=torch.zeros(b, **i32),
+        )
+
+    def _make_wrapper(self, sink_key: Optional[Tuple]):
+        if sink_key is None:
+            from ....prefill import BatchPrefillWithPagedKVCacheWrapper
+
+            wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                self._workspace,
+                self._kv_layout,
+                backend=self.name,
+                **self._graph_bufs(),
             )
         else:
-            # The wrapper's own CUDA-graph protocol: it copies each plan's CSR
-            # metadata into these reserved buffers, so the captured kernel
-            # keeps reading valid pointers across re-plans.
-            b = graph_capacity.batch_size
-            i32 = dict(dtype=torch.int32, device=device)
-            self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
-                workspace,
-                kv_layout,
-                use_cuda_graph=True,
-                qo_indptr_buf=torch.zeros(b + 1, **i32),
-                paged_kv_indptr_buf=torch.zeros(b + 1, **i32),
-                paged_kv_indices_buf=torch.zeros(graph_capacity.flat_capacity, **i32),
-                paged_kv_last_page_len_buf=torch.zeros(b, **i32),
-                backend=backend,
+            from ....attention._core import BatchAttentionWithAttentionSinkWrapper
+
+            q_dtype, kv_dtype, head_dim_qk, head_dim_vo, window_left = sink_key
+            wrapper = BatchAttentionWithAttentionSinkWrapper(
+                self._workspace,
+                self._kv_layout,
+                backend=self.name,
+                q_data_type=q_dtype,
+                kv_data_type=kv_dtype,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                window_left=window_left,
+                **self._graph_bufs(),
             )
+        if self._graph_capacity is not None:
             # The wrapper fixes its row budget from the first plan it sees and
             # afterwards accepts any total_num_rows <= that budget (its CPU
             # scheduler plans for the budget; the kernel reads the live row
             # count from the int workspace).  Seeding it with the capacity
             # lets the first batch be smaller than the bucket; this poke goes
             # away when the backend calls the FA module directly.
-            self._wrapper._max_total_num_rows = graph_capacity.total_q_tokens
-        self._lse_mode = "none"
-        self._total_q_tokens = 0
-        self._head_dim_vo = 0
+            wrapper._max_total_num_rows = self._graph_capacity.total_q_tokens
+        return wrapper
+
+    @staticmethod
+    def _sink_key(meta: PlanMetadata) -> Tuple:
+        # the variant module only distinguishes windowed / unwindowed
+        return (
+            meta.q_dtype,
+            meta.kv_dtype,
+            meta.head_dim_qk,
+            meta.head_dim_vo,
+            -1 if meta.window_left < 0 else 0,
+        )
 
     def preflight(self, meta: PlanMetadata) -> None:
         """Batch-specific checks; typed unsupported only, no allocation."""
@@ -101,6 +151,22 @@ class _FaBackend:
             if not is_sm90a_supported(self._device):
                 raise _BackendPlanUnsupportedError(
                     f"fa3 needs SM90a and CUDA >= 12.3; {self._device} does not qualify"
+                )
+        if meta.use_sinks:
+            # The AttentionSink variant owns the softmax update: it has no
+            # soft-cap hook, and its combination with MaskMode.CUSTOM and
+            # with fp8 KV dequantization is not verified by any suite.
+            if meta.logits_soft_cap is not None:
+                raise _BackendPlanUnsupportedError(
+                    f"{self.name} AttentionSink kernel variant has no logits soft cap"
+                )
+            if meta.custom_mask is not None:
+                raise _BackendPlanUnsupportedError(
+                    f"{self.name} attention sinks with a custom mask are not verified"
+                )
+            if meta.kv_dtype != meta.q_dtype:
+                raise _BackendPlanUnsupportedError(
+                    f"{self.name} attention sinks with an fp8 KV cache are not verified"
                 )
         if meta.custom_mask is not None and self._graph_capacity is not None:
             # Not a fallback case (no other backend takes custom masks): the
@@ -140,7 +206,15 @@ class _FaBackend:
             if meta.custom_mask is not None
             else None
         )
-        self._wrapper.plan(
+        if meta.use_sinks:
+            key = self._sink_key(meta)
+            wrapper = self._sink_wrappers.get(key)
+            if wrapper is None:
+                wrapper = self._make_wrapper(key)
+                self._sink_wrappers[key] = wrapper
+        else:
+            wrapper = self._wrapper
+        wrapper.plan(
             qo_host,
             kv_indptr_host,
             derived.kv_page_indices,
@@ -159,9 +233,12 @@ class _FaBackend:
             q_data_type=meta.q_dtype,
             kv_data_type=meta.kv_dtype,
         )
+        # publish only after the wrapper's plan returned
+        self._active = wrapper
         self._lse_mode = meta.lse_mode
         self._total_q_tokens = meta.total_q_tokens
         self._head_dim_vo = meta.head_dim_vo
+        self._use_sinks = meta.use_sinks
 
     def run(
         self,
@@ -174,12 +251,8 @@ class _FaBackend:
         sm_scale: float,
         k_scale=None,
         v_scale=None,
+        sinks=None,
     ):
-        # The generated-FA wrapper reads sm_scale from plan-time state and its
-        # run() has no override, while the kernel takes it as a launch arg.
-        # Setting it here keeps sm_scale a per-run (per-layer) value; this
-        # poke goes away when the backend calls the FA module directly.
-        self._wrapper._sm_scale = sm_scale
         need_lse = self._lse_mode != "none"
         rows, n = q.shape[0], self._total_q_tokens
         if rows != n:
@@ -199,15 +272,34 @@ class _FaBackend:
             lse_v = lse[:n] if lse is not None else None
         else:
             q_v, out_v, lse_v = q, out, lse
-        r = self._wrapper.run(
-            q_v,
-            (k_cache, v_cache),
-            k_scale=k_scale,  # fp8 KV: folded into the softmax scale by the wrapper
-            v_scale=v_scale,  # fp8 KV: applied to the output by the kernel path
-            out=out_v,
-            lse=lse_v,
-            return_lse=need_lse,
-        )
+        if self._use_sinks:
+            # AttentionSink variant: the sink tensor and sm_scale are the
+            # module's additional run() arguments (positional, in that order)
+            r = self._active.run(
+                q_v,
+                (k_cache, v_cache),
+                sinks,
+                sm_scale,
+                out=out_v,
+                lse=lse_v,
+                return_lse=need_lse,
+            )
+        else:
+            # The generated-FA wrapper reads sm_scale from plan-time state and
+            # its run() has no override, while the kernel takes it as a launch
+            # arg.  Setting it here keeps sm_scale a per-run (per-layer)
+            # value; this poke goes away when the backend calls the FA module
+            # directly.
+            self._active._sm_scale = sm_scale
+            r = self._active.run(
+                q_v,
+                (k_cache, v_cache),
+                k_scale=k_scale,  # fp8 KV: folded into the softmax scale by the wrapper
+                v_scale=v_scale,  # fp8 KV: applied to the output by the kernel path
+                out=out_v,
+                lse=lse_v,
+                return_lse=need_lse,
+            )
         if not need_lse:
             return (out if out is not None else r), None
         out_t, lse_t = r

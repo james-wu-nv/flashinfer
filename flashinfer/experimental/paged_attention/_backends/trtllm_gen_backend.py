@@ -2,7 +2,8 @@
 
 Dialect: the unified form natively (this is where the canonical form came
 from); the only derivations are cum_kv_seq_lens and the bmm scale fold
-(bmm1 = sm_scale for unquantized, bmm2 = 1.0).
+(bmm1 = sm_scale for unquantized, bmm2 = 1.0).  Attention sinks are a native
+run-time argument.
 
 Buffers: the 128 MB workspace is ordinary softmax-stats/scratch and is the
 shared one every backend runs on (the legacy wrapper's trtllm-gen branch uses
@@ -105,6 +106,7 @@ class _TrtllmGenBackend:
         sm_scale: float,
         k_scale=None,
         v_scale=None,
+        sinks=None,
     ):
         from ....prefill import trtllm_batch_context_with_kv_cache
 
@@ -131,6 +133,10 @@ class _TrtllmGenBackend:
             out=out,
             lse=lse,
             return_lse=meta.need_lse,
+            # (num_qo_heads,) fp32; the kernel folds it into the softmax
+            # denominator and its LSE (measured on B200: matches
+            # logaddexp(lse, sink) to 2e-6)
+            sinks=sinks,
             multi_ctas_kv_counter_buffer=self._counter,
         )
         if meta.need_lse:

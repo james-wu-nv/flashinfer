@@ -130,12 +130,14 @@ class _CudnnBackend:
         sm_scale: float,
         k_scale=None,
         v_scale=None,
+        sinks=None,
     ):
         from ....cudnn import cudnn_batch_prefill_with_kv_cache
 
         meta, derived = self._meta, self._derived
         assert meta is not None and derived is not None
         assert self._block_tables is not None  # needs_dense contract
+        assert sinks is None  # capability-excluded (supports_sinks=False)
         b = meta.batch_size
         if self._permute_kv:
             k_cache = k_cache.permute(0, 2, 1, 3)
