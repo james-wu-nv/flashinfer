@@ -184,7 +184,7 @@ class _TrtllmGenBackend:
                 "k_cache and v_cache must share one layout; got K strides "
                 f"{tuple(k_cache.stride())} vs V strides {tuple(v_cache.stride())} "
                 "(independent K/V pools with different page strides are "
-                "supported by the fa2/fa3 and cudnn backends)"
+                "supported by the fa2 and cudnn backends)"
             )
         result = trtllm_batch_context_with_kv_cache(
             q,
