@@ -173,6 +173,7 @@ _BACKEND_CLASS = {
     "fa3": fa_backend._FaBackend,
     "cudnn": cudnn_backend._CudnnBackend,
     "trtllm-gen": trtllm_gen_backend._TrtllmGenBackend,
+    "cake": trtllm_gen_backend._TrtllmGenBackend,
 }
 
 
@@ -289,7 +290,7 @@ def test_features_exclude_backends_with_reasons():
 
     res = resolve_paged_attention(cc_major=10, sinks=True, **_CFG)
     assert res.excluded["cudnn"] == "attention sinks not supported"
-    assert set(res.backends) == {"trtllm-gen", "fa2"}
+    assert set(res.backends) == {"trtllm-gen", "cake", "fa2"}
     assert res.config[-4:-1] == (None, False, True)
 
     # a configuration only cuDNN could run + a feature cuDNN lacks: loud

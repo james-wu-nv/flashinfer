@@ -28,6 +28,7 @@ _FACTORIES: Dict[str, Callable] = {
     "fa3": lambda dev, layout, ws, cap: _FaBackend(dev, layout, ws, "fa3", cap),
     "cudnn": lambda dev, layout, ws, cap: _CudnnBackend(dev, layout, ws, cap),
     "trtllm-gen": lambda dev, layout, ws, cap: _TrtllmGenBackend(dev, layout, ws),
+    "cake": lambda dev, layout, ws, cap: _TrtllmGenBackend(dev, layout, ws, "cake"),
 }
 
 

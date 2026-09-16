@@ -49,7 +49,7 @@ from .test_paged_attention_prototype import make_problem, run_unified
 from .paged_attention_reference import reference_paged_prefill
 
 TRIALS = int(os.environ.get("FI_UNIFIED_FUZZ_TRIALS", "30"))
-BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen", "auto"]
+BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen", "cake", "auto"]
 
 OUT_TOL = dict(atol=2e-2, rtol=2e-2)
 LSE_TOL = dict(atol=3e-2, rtol=2e-2)

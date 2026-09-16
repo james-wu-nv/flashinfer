@@ -53,6 +53,19 @@ def _probe_trtllm(device: Optional[torch.device]) -> Optional[str]:
     return None
 
 
+def _probe_cake(device: Optional[torch.device]) -> Optional[str]:
+    # The Cake FMHA product ships exact targets only (sm_100a / sm_103a) and
+    # raises for any other Blackwell part; the capability table can only
+    # gate the major, so the minor is checked here when a device is known.
+    if device is not None:
+        from ...utils import get_compute_capability
+
+        cc = get_compute_capability(device)
+        if cc not in ((10, 0), (10, 3)):
+            return f"cake ships sm_100a / sm_103a cubins only, not sm_{cc[0]}{cc[1]}"
+    return None
+
+
 # Environment probes: things the static capability table cannot know
 # (installed packages, toolkit level). Run only for capability-admitted
 # backends so explain() stays cheap.  Every probe answers for the TARGET
@@ -63,6 +76,7 @@ PROBES: Dict[str, Callable[[Optional[torch.device]], Optional[str]]] = {
     "fa3": lambda device: _probe_fa("fa3", device),
     "cudnn": _probe_cudnn,
     "trtllm-gen": _probe_trtllm,
+    "cake": _probe_cake,
 }
 
 
@@ -100,7 +114,9 @@ def _bind_device(
 # Static heuristic placeholder (proposal §5.2: to be seeded from the benchmark
 # suite; it only has to beat consumer tables that rot).  Order = preference.
 HEURISTIC_ORDER: Dict[int, Tuple[str, ...]] = {
-    10: ("trtllm-gen", "cudnn", "fa2"),
+    # cake right after trtllm-gen: same dialect and envelope, so it is the
+    # natural next candidate when trtllm-gen declines a batch
+    10: ("trtllm-gen", "cake", "cudnn", "fa2"),
     9: ("fa3", "fa2", "cudnn"),
     8: ("fa2", "cudnn"),
     12: ("fa2", "cudnn"),

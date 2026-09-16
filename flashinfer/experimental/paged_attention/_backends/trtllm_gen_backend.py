@@ -1,4 +1,6 @@
-"""trtllm-gen backend: trtllm_batch_context_with_kv_cache.
+"""trtllm-gen backend: trtllm_batch_context_with_kv_cache (and, with
+``backend="cake"``, the separately versioned Cake FMHA product behind the same
+front door — one class, the product name is the only difference).
 
 Dialect: the unified form natively (this is where the canonical form came
 from); the only derivations are cum_kv_seq_lens and the bmm scale fold
@@ -32,9 +34,8 @@ _KERNEL_PAGE_SIZES = frozenset({16, 32, 64, 128, 256, 512, 1024})
 
 
 class _TrtllmGenBackend:
-    name = "trtllm-gen"
-
-    def __init__(self, device, kv_layout, workspace):
+    def __init__(self, device, kv_layout, workspace, backend: str = "trtllm-gen"):
+        self.name = backend  # "trtllm-gen" or "cake"
         self._workspace = workspace  # the controller's shared scratch
         self._kv_layout = kv_layout
         self._device = device
@@ -47,12 +48,12 @@ class _TrtllmGenBackend:
         """Batch-specific checks; typed unsupported only, no allocation."""
         if meta.page_size not in _KERNEL_PAGE_SIZES:
             raise _BackendPlanUnsupportedError(
-                f"trtllm-gen has no paged context kernel for page_size "
+                f"{self.name} has no paged context kernel for page_size "
                 f"{meta.page_size} (shipped: {sorted(_KERNEL_PAGE_SIZES)})"
             )
         if not meta.causal and meta.window_left >= 0:
             raise _BackendPlanUnsupportedError(
-                "trtllm-gen has no non-causal sliding-window context kernel "
+                f"{self.name} has no non-causal sliding-window context kernel "
                 "(window_left >= 0 requires causal=True)"
             )
 
@@ -138,11 +139,12 @@ class _TrtllmGenBackend:
             # logaddexp(lse, sink) to 2e-6)
             sinks=sinks,
             multi_ctas_kv_counter_buffer=self._counter,
+            backend=self.name,
         )
         if meta.need_lse:
             out_t, lse_t = result
             if meta.lse_mode == "basee":
-                lse_t.mul_(LN2)  # trtllm-gen emits base-2; one fold
+                lse_t.mul_(LN2)  # trtllm-gen / cake emit base-2; one fold
             return out_t, lse_t
         return result, None
 

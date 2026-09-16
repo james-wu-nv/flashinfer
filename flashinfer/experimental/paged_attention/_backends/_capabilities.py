@@ -264,6 +264,32 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         supports_custom_mask=False,
         supports_sinks=True,
     ),
+    # The separately versioned Cake FMHA product behind
+    # trtllm_batch_context_with_kv_cache(backend="cake"): same dialect, same
+    # envelope as trtllm-gen here.  Measured on B200 (2026-09-16) against the
+    # oracle: the four conformance shapes in bf16 and fp16 with and without
+    # LSE, decode shape, non-causal, sliding window 16, sinks with and
+    # without LSE, NHD -- all match (max out err 5e-3, LSE err < 1e-4); the
+    # prototype / fuzzer / cuda-graph / workspace suites run it as a backend.
+    # Exact targets only (sm_100 / sm_103; the product raises on others),
+    # checked by the selection probe.
+    "cake": PagedAttentionCapabilities(
+        name="cake",
+        cc_majors=frozenset({10}),
+        q_dtypes=_F16,
+        head_dims=frozenset({(128, 128)}),
+        page_sizes=frozenset({16, 32, 64}),
+        kv_layouts=frozenset({"HND", "NHD"}),
+        supports_lse=True,
+        supports_noncausal=True,
+        supports_window=True,
+        supports_window_noncausal=False,  # shared front door with trtllm-gen
+        requires_contiguous_q=True,
+        needs_dense=True,
+        supports_logits_soft_cap=False,
+        supports_custom_mask=False,
+        supports_sinks=True,
+    ),
 }
 
 __all__ = [

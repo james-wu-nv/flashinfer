@@ -13,7 +13,7 @@ Layers (see proposal §"Architecture" and the MLA precedent in
     entry       this module (exported from flashinfer.prefill):
                 resolve_paged_attention() + PagedAttention + PagedAttentionMetadata
     controller  experimental.paged_attention._controller  (plan/run lifecycle)
-    backends    experimental.paged_attention._backends    (fa2/fa3, cudnn, trtllm-gen)
+    backends    experimental.paged_attention._backends    (fa2/fa3, cudnn, trtllm-gen, cake)
     kernels     the existing wrapper / standalone functions (untouched)
 
 Design rules enforced (each traces to a documented failure mode):
@@ -51,8 +51,8 @@ Prototype simplifications (documented, not hidden):
 - Heuristic order is a static per-arch placeholder, to be seeded from the
   benchmark suite (proposal §5.2).  Autotune hook (§5.4) is not wired.
 - ``logits_soft_cap`` / ``custom_mask`` / ``use_sinks`` are explicit
-  capability axes (fa2: all three; fa3: soft cap + sinks; trtllm-gen: sinks;
-  cuDNN: none) — a backend lacking a requested feature is excluded, never
+  capability axes (fa2: all three; fa3: soft cap + sinks; trtllm-gen and
+  cake: sinks; cuDNN: none) — a backend lacking a requested feature is excluded, never
   silently bypassed.  Custom masks under CUDA-graph mode are follow-up work.
 
 CUDA-graph lifecycle — three stages (``experimental/paged_attention/_graph.py``):
@@ -210,8 +210,8 @@ def resolve_paged_attention(
 
 
 class PagedAttention:
-    """Paged attention over the existing fa2/fa3, cuDNN and trtllm-gen kernels
-    behind one contract (experimental).
+    """Paged attention over the existing fa2/fa3, cuDNN, trtllm-gen and cake
+    kernels behind one contract (experimental).
 
     Usage (engine-shaped; see ``prototype_demo_paged_attention.py``)::
 

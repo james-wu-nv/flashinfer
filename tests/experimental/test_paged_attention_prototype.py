@@ -23,7 +23,7 @@ from flashinfer.prefill import (
 
 from .paged_attention_reference import reference_paged_prefill
 
-BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen", "auto"]
+BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen", "cake", "auto"]
 
 OUT_TOL = dict(atol=2e-2, rtol=2e-2)
 LSE_TOL = dict(atol=3e-2, rtol=2e-2)
@@ -394,7 +394,7 @@ def test_paged_attention_headdim_192_128(backend, dtype):
     check(p, backend)
 
 
-@pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn", "trtllm-gen"])
+@pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn", "trtllm-gen", "cake"])
 def test_paged_attention_noncausal(backend):
     p = make_problem(
         seed=11,
@@ -702,7 +702,7 @@ def test_paged_attention_csr_dense_equivalence():
     # SAME tensors, different input form (make_problem's randn draws from the
     # global CUDA RNG, so a second call would build a different problem)
     p_csr = dict(p_dense, input_form="page_indices")
-    for backend in ["fa2", "cudnn", "trtllm-gen"]:
+    for backend in ["fa2", "cudnn", "trtllm-gen", "cake"]:
         try:
             _resolve_or_skip(p_dense, backend)
         except Exception:
@@ -713,7 +713,7 @@ def test_paged_attention_csr_dense_equivalence():
         assert torch.equal(lse_a, lse_b), backend
 
 
-@pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn", "trtllm-gen"])
+@pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn", "trtllm-gen", "cake"])
 def test_paged_attention_fp16(backend):
     p = make_problem(
         seed=53,
