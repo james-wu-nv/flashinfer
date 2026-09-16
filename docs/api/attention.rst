@@ -247,8 +247,10 @@ fp32 oracle before it is timed. The routine reports one CSV row per phase:
 ``run`` (a warmed ``run()`` with preallocated outputs; GPU time under a CUDA
 graph by default, eager with ``--no_cuda_graph``) and ``step`` (one plan
 followed by N ``run()`` calls, N from ``--pa_layers``). Use ``--s_qo 1`` for
-decode, ``--kv_input_form csr`` for flat page indices and
-``--random_actual_seq_len`` for variable lengths. Rows for unsupported,
+decode, ``--kv_input_form csr`` for flat page indices,
+``--random_actual_seq_len`` for variable lengths and ``--pa_legacy`` to add
+rows for the same inputs through the legacy public API of the same kernel
+(``api_variant=legacy``). Rows for unsupported,
 failing or incorrect backends are kept with a ``status`` column, and ``auto``
 rows record the resolved backend (``auto`` is a static selection, not
 autotuning). The benchmark generates fp16/bf16 Q and KV; see

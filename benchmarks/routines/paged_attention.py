@@ -24,6 +24,24 @@ it is timed, and every (backend, phase) pair yields one CSV row:
 Rows for unsupported / erroring / incorrect candidates are KEPT with a
 ``status`` column (never dropped, never NaN-only); ``auto`` rows record the
 resolved backend.  ``auto`` is the facade's static selection, not autotuning.
+
+``--pa_legacy`` adds ``api_variant=legacy`` rows: the SAME inputs through the
+legacy public API of the same kernel, with the same phases, so
+``facade overhead = unified / legacy - 1`` can be read per phase:
+
+- fa2/fa3: ``BatchPrefillWithPagedKVCacheWrapper``.  Its ``plan`` is fed the
+  page-unit CSR metadata an engine holds — derived on the device from the
+  canonical tensors for the CSR form (sglang-style; the wrapper then copies
+  indptr/last-page lengths to the host itself, a D2H sync the unified plan
+  with host mirrors does not pay) or on the host from the host block table
+  for the dense form (vLLM-style; pageable H2D instead).
+- cudnn: ``cudnn_batch_prefill_with_kv_cache`` (dense table only).
+- trtllm-gen: ``trtllm_batch_context_with_kv_cache`` (dense table only).
+
+Legacy rows keep each API's NATIVE LSE contract (fa/trtllm-gen: packed
+base-2; cuDNN: padded ``(batch, max_q, heads)`` in the requested base); the
+oracle comparison normalizes outside the timed region, so with an LSE
+requested the unified/legacy ratio includes the facade's normalization.
 """
 
 from collections import defaultdict
@@ -38,9 +56,12 @@ import torch
 
 import flashinfer
 from flashinfer.prefill import (
+    BatchPrefillWithPagedKVCacheWrapper,
     PagedAttention,
     PagedAttentionMetadata,
+    cudnn_batch_prefill_with_kv_cache,
     resolve_paged_attention,
+    trtllm_batch_context_with_kv_cache,
 )
 from flashinfer.testing.utils import (
     attention_tb_per_sec_with_actual_seq_lens,
@@ -57,6 +78,7 @@ from .flashinfer_benchmark_utils import (
 )
 
 PAGED_ATTENTION_BACKENDS = ("fa2", "fa3", "cudnn", "trtllm-gen", "auto")
+LN2 = math.log(2.0)
 # Same tolerances as tests/experimental/test_paged_attention_prototype.py.
 OUT_TOL = dict(rtol=2e-2, atol=2e-2)
 LSE_TOL = dict(rtol=2e-2, atol=3e-2)
@@ -301,10 +323,12 @@ class _PhaseRows:
         print(f"[INFO] {self.label}: {status}")
 
 
-def _time_candidate(
-    args, phases, case, plan_once, run_once, scale, refcheck, use_cuda_graph
-):
-    """Fill the timing of every phase row; a failing phase keeps its own status."""
+def _time_candidate(args, phases, case, plan_once, run_once, recheck, use_cuda_graph):
+    """Fill the timing of every phase row; a failing phase keeps its own status.
+
+    ``recheck`` (optional, zero-arg) re-validates the buffers the timed run
+    wrote against the oracle.
+    """
     q, k_cache, v_cache = case["q"], case["k_cache"], case["v_cache"]
     out, lse = case["out"], case["lse"]
     q_lens, kv_lens = case["q_lens_cpu"], case["kv_seq_lens_cpu"]
@@ -325,12 +349,12 @@ def _time_candidate(
                     cold_l2_cache=True,
                     input_args=(q, k_cache, v_cache, out, lse),
                 )
-                if refcheck is not None:
+                if recheck is not None:
                     # The timed calls wrote into the original buffers (the first
                     # rotation slot); a replay/eager result that drifted from
                     # the oracle marks the row instead of publishing its time.
                     torch.cuda.synchronize()
-                    problem = refcheck(out, lse)
+                    problem = recheck()
                     if problem is not None:
                         row["status"] = f"incorrect (timed run): {problem}"
                         print(f"[ERROR] {phases.label} {phase}: {row['status']}")
@@ -464,14 +488,18 @@ def _bench_unified(args, case, backend, ctx):
             traceback.print_exc()
         return phases, None
 
-    refcheck = None
+    recheck = None
     if ctx["reference"] is not None:
         ref_out, ref_lse = ctx["reference"]
 
-        def refcheck(out_, lse_):
-            return _check_against_oracle(out_, lse_, ref_out, ref_lse, args.lse_mode)
+        def recheck():
+            return _check_against_oracle(
+                case["out"], case["lse"], ref_out, ref_lse, args.lse_mode
+            )
 
-        problem = refcheck(got_out, got_lse)
+        problem = _check_against_oracle(
+            got_out, got_lse, ref_out, ref_lse, args.lse_mode
+        )
         if problem is not None:
             phases.set_all(f"incorrect: {problem}")
             print(f"[ERROR] {phases.label}: output mismatch against the fp32 oracle")
@@ -481,16 +509,290 @@ def _bench_unified(args, case, backend, ctx):
             print(f"[INFO] {phases.label}: matches the fp32 oracle")
 
     _time_candidate(
-        args,
-        phases,
-        case,
-        plan_once,
-        run_once,
-        scale,
-        refcheck,
-        ctx["use_cuda_graph"],
+        args, phases, case, plan_once, run_once, recheck, ctx["use_cuda_graph"]
     )
     return phases, resolved
+
+
+# --------------------------- legacy same-kernel rows ---------------------------
+
+
+class _LegacyFaProvider:
+    """fa2/fa3 through ``BatchPrefillWithPagedKVCacheWrapper``.
+
+    Receives the canonical device tensors an engine holds and derives the
+    wrapper's page-unit CSR dialect the way the engines do: on the device for
+    the CSR form (sglang; the wrapper's plan then copies indptr and last-page
+    lengths to the host itself), on the host for the dense form (vLLM; the
+    wrapper uploads the host arrays).  ``sm_scale`` is plan-time in this API.
+    """
+
+    def __init__(self, name, args, case, ctx):
+        self.name = name
+        self.args, self.case, self.ctx = args, case, ctx
+        device = ctx["device"]
+        batch_size = case["batch_size"]
+        if ctx["use_cuda_graph"]:
+            # the wrapper's own reserved-buffer protocol (what an engine sets
+            # up per graph bucket)
+            i32 = dict(dtype=torch.int32, device=device)
+            self.wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                ctx["workspace"],
+                args.kv_layout,
+                use_cuda_graph=True,
+                qo_indptr_buf=torch.zeros(batch_size + 1, **i32),
+                paged_kv_indptr_buf=torch.zeros(batch_size + 1, **i32),
+                paged_kv_indices_buf=torch.zeros(
+                    batch_size * case["table_width"], **i32
+                ),
+                paged_kv_last_page_len_buf=torch.zeros(batch_size, **i32),
+                backend=name,
+            )
+        else:
+            self.wrapper = BatchPrefillWithPagedKVCacheWrapper(
+                ctx["workspace"], args.kv_layout, backend=name
+            )
+        self.last_lse = None
+
+    def plan(self):
+        args, case = self.args, self.case
+        page_size = case["page_size"]
+        if args.kv_input_form == "csr":
+            kv_seq_lens = case["kv_seq_lens"]
+            pages = (kv_seq_lens + page_size - 1) // page_size
+            zero = torch.zeros(1, dtype=torch.int32, device=kv_seq_lens.device)
+            kv_indptr = torch.cat([zero, torch.cumsum(pages, 0, dtype=torch.int32)])
+            last_page_len = (kv_seq_lens - 1) % page_size + 1
+            qo_indptr, kv_page_indices = case["qo_indptr"], case["kv_page_indices"]
+        else:
+            kv_lens_cpu = case["kv_seq_lens_cpu"]
+            pages = (kv_lens_cpu + page_size - 1) // page_size
+            kv_indptr = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.int32),
+                    torch.cumsum(pages, 0, dtype=torch.int32),
+                ]
+            )
+            last_page_len = (kv_lens_cpu - 1) % page_size + 1
+            live = torch.arange(case["table_width"]).unsqueeze(0) < pages.unsqueeze(1)
+            kv_page_indices = case["block_tables_cpu"][live]
+            qo_indptr = case["qo_indptr_cpu"]
+        self.wrapper.plan(
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            last_page_len,
+            args.num_qo_heads,
+            args.num_kv_heads,
+            args.head_dim_qk,
+            page_size,
+            head_dim_vo=self.ctx["head_dim_vo"],
+            causal=args.causal,
+            sm_scale=self.ctx["scale"],
+            window_left=args.window_left,
+            q_data_type=case["q"].dtype,
+            kv_data_type=case["k_cache"].dtype,
+        )
+
+    def run(self, q, k_cache, v_cache, out, lse):
+        need_lse = self.args.lse_mode != "none"
+        result = self.wrapper.run(
+            q, (k_cache, v_cache), out=out, lse=lse, return_lse=need_lse
+        )
+        if need_lse:
+            out, self.last_lse = result
+            return out, self.last_lse
+        return result, None
+
+
+class _LegacyCudnnProvider:
+    """cuDNN through ``cudnn_batch_prefill_with_kv_cache`` (dense table).
+
+    The API takes per-request lengths as ``(b, 1, 1, 1)`` device tensors and
+    token-unit batch offsets; the LSE is padded ``(b, max_q, h)`` in the
+    requested base.
+    """
+
+    name = "cudnn"
+
+    def __init__(self, args, case, ctx):
+        self.args, self.case, self.ctx = args, case, ctx
+        self.workspace = ctx["workspace"].view(torch.int8)
+        self.native_lse = (
+            torch.empty(
+                case["batch_size"],
+                case["max_q_len"],
+                args.num_qo_heads,
+                dtype=torch.float32,
+                device=ctx["device"],
+            )
+            if args.lse_mode != "none"
+            else None
+        )
+        self.q_lens4 = self.kv_lens4 = None
+        self.last_lse = None
+
+    def plan(self):
+        batch_size = self.case["batch_size"]
+        self.q_lens4 = self.case["qo_indptr"].diff().view(batch_size, 1, 1, 1)
+        self.kv_lens4 = self.case["kv_seq_lens"].view(batch_size, 1, 1, 1)
+
+    def run(self, q, k_cache, v_cache, out, lse):
+        args, case = self.args, self.case
+        if args.kv_layout == "NHD":
+            k_cache = k_cache.permute(0, 2, 1, 3)
+            v_cache = v_cache.permute(0, 2, 1, 3)
+        out, self.last_lse = cudnn_batch_prefill_with_kv_cache(
+            q,
+            k_cache,
+            v_cache,
+            self.ctx["scale"],
+            self.workspace,
+            max_token_per_sequence=case["max_q_len"],
+            max_sequence_kv=case["max_kv_len"],
+            actual_seq_lens_q=self.q_lens4,
+            actual_seq_lens_kv=self.kv_lens4,
+            block_tables=case["block_tables"],
+            causal=args.causal,
+            return_lse=args.lse_mode != "none",
+            lse_base="e" if args.lse_mode == "basee" else "2",
+            batch_offsets_q=case["qo_indptr"],
+            batch_offsets_units="tokens",
+            out=out,
+            lse=self.native_lse,
+        )
+        return out, self.last_lse
+
+
+class _LegacyTrtllmProvider:
+    """trtllm-gen through ``trtllm_batch_context_with_kv_cache`` (dense table).
+
+    The unified metadata is this API's native dialect; the only per-step
+    derivation is the cumulative KV length vector.
+    """
+
+    name = "trtllm-gen"
+
+    def __init__(self, args, case, ctx):
+        self.args, self.case, self.ctx = args, case, ctx
+        self.cum_kv_seq_lens = None
+        self.last_lse = None
+
+    def plan(self):
+        kv_seq_lens = self.case["kv_seq_lens"]
+        zero = torch.zeros(1, dtype=torch.int32, device=kv_seq_lens.device)
+        self.cum_kv_seq_lens = torch.cat(
+            [zero, torch.cumsum(kv_seq_lens, 0, dtype=torch.int32)]
+        )
+
+    def run(self, q, k_cache, v_cache, out, lse):
+        args, case = self.args, self.case
+        need_lse = args.lse_mode != "none"
+        result = trtllm_batch_context_with_kv_cache(
+            q,
+            (k_cache, v_cache),
+            self.ctx["workspace"],
+            case["block_tables"],
+            case["kv_seq_lens"],
+            case["max_q_len"],
+            case["max_kv_len"],
+            self.ctx["scale"],
+            1.0,
+            case["batch_size"],
+            case["qo_indptr"],
+            self.cum_kv_seq_lens,
+            window_left=args.window_left,
+            out=out,
+            kv_layout=args.kv_layout,
+            causal=args.causal,
+            lse=lse,
+            return_lse=need_lse,
+        )
+        if need_lse:
+            out, self.last_lse = result
+            return out, self.last_lse
+        return result, None
+
+
+def _legacy_lse_to_contract(provider, lse_native, case, lse_mode):
+    """Native legacy LSE -> packed (total_q, heads) in the requested base."""
+    if lse_native is None or lse_mode == "none":
+        return lse_native
+    if provider.name == "cudnn":
+        q_lens = case["q_lens_cpu"]
+        return torch.cat(
+            [lse_native[i, : int(q_lens[i])] for i in range(case["batch_size"])]
+        )
+    # fa2/fa3/trtllm-gen emit base-2 natively
+    return lse_native * LN2 if lse_mode == "basee" else lse_native
+
+
+def _bench_legacy(args, case, backend, ctx):
+    """Rows for the same inputs through the legacy public API of ``backend``."""
+    phases = _PhaseRows(
+        args, case, backend, "legacy", ctx["timing_metric"], ctx["head_dim_vo"]
+    )
+    if backend in ("cudnn", "trtllm-gen") and args.kv_input_form != "dense":
+        phases.set_all(
+            f"unsupported: the legacy {backend} API takes a dense block table; "
+            "use --kv_input_form dense for this comparison"
+        )
+        return phases
+    if ctx["reference_error"] is not None:
+        phases.set_all(ctx["reference_error"])
+        return phases
+
+    def run_once(q_, k_, v_, out_, lse_):
+        return provider.run(q_, k_, v_, out_, lse_)
+
+    try:
+        if backend in ("fa2", "fa3"):
+            provider = _LegacyFaProvider(backend, args, case, ctx)
+        elif backend == "cudnn":
+            provider = _LegacyCudnnProvider(args, case, ctx)
+        else:
+            provider = _LegacyTrtllmProvider(args, case, ctx)
+        ctx["workspace"].zero_()
+        provider.plan()
+        got_out, got_lse = run_once(
+            case["q"], case["k_cache"], case["v_cache"], case["out"], case["lse"]
+        )
+        torch.cuda.synchronize()
+    except Exception as exc:  # noqa: BLE001 - every failure becomes a row
+        phases.set_all(_error_status(exc))
+        if args.verbose >= 2:
+            traceback.print_exc()
+        return phases
+
+    recheck = None
+    if ctx["reference"] is not None:
+        ref_out, ref_lse = ctx["reference"]
+
+        def check(out_, lse_native):
+            return _check_against_oracle(
+                out_,
+                _legacy_lse_to_contract(provider, lse_native, case, args.lse_mode),
+                ref_out,
+                ref_lse,
+                args.lse_mode,
+            )
+
+        def recheck():
+            return check(case["out"], provider.last_lse)
+
+        problem = check(got_out, got_lse)
+        if problem is not None:
+            phases.set_all(f"incorrect: {problem}")
+            print(f"[ERROR] {phases.label}: output mismatch against the fp32 oracle")
+            if not args.allow_output_mismatch:
+                return phases
+        elif args.verbose >= 1:
+            print(f"[INFO] {phases.label}: matches the fp32 oracle")
+
+    _time_candidate(
+        args, phases, case, provider.plan, run_once, recheck, ctx["use_cuda_graph"]
+    )
+    return phases
 
 
 def testPagedAttention(args):
@@ -635,7 +937,17 @@ def testPagedAttention(args):
             ctx["reference_error"] = "reference failed: " + _error_status(exc)
             print(f"[ERROR] fp32 oracle failed; no candidate is timed: {exc}")
 
+    legacy_targets = []
     for backend in args.backends:
-        phases, _resolved = _bench_unified(args, case, backend, ctx)
+        phases, resolved = _bench_unified(args, case, backend, ctx)
         res.extend(phases.rows)
+        if resolved is not None and resolved not in legacy_targets:
+            legacy_targets.append(resolved)
+    if args.pa_legacy:
+        # one legacy row set per concrete kernel that ran through the facade
+        # (`auto` contributes the backend it resolved to; duplicates collapse)
+        if not legacy_targets:
+            print("[INFO] --pa_legacy: no unified candidate planned; no legacy rows")
+        for backend in legacy_targets:
+            res.extend(_bench_legacy(args, case, backend, ctx).rows)
     return res
