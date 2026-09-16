@@ -14,6 +14,9 @@ Contract under test (``PagedAttention(use_cuda_graph=True)``):
    staging copy: Python never calls ``__exit__`` when ``__enter__`` raises,
    so ``Transaction.__enter__`` restores the destinations it already wrote.
 5. Re-plan is sync-free when the host mirrors are supplied.
+6. A FIRST plan that fails (backend construction or the backend's own plan)
+   installs nothing: the next plan may fix any shape, including the batch
+   size.
 """
 
 import pytest
@@ -335,5 +338,56 @@ def test_failed_staging_copy_restores_previous_plan(fail_at):
     g.replay()
     torch.cuda.synchronize()
     ref_out, ref_lse = _reference(p1)
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+
+@pytest.mark.parametrize("stage", ["construct", "plan"])
+def test_failed_first_plan_leaves_no_capacity(monkeypatch, stage):
+    """A first graph-mode plan that fails while building the backend or inside
+    the backend's own plan must not install a capacity: the next plan, with a
+    different batch size, must succeed (mla-alignment F3: the capacity of a
+    graph that was never captured locked the instance)."""
+    from flashinfer.experimental.paged_attention import _controller
+    from flashinfer.experimental.paged_attention._backends import fa_backend
+
+    p2 = make_problem(seed=50, **_SHAPE)
+    _resolve_or_skip(p2, "fa2")
+    attn = PagedAttention(torch.device(p2["device"]), use_cuda_graph=True)
+
+    failed = []
+    if stage == "construct":
+        real = _controller.make_backend
+
+        def fail_once(*args, **kwargs):
+            if not failed:
+                failed.append(stage)
+                raise RuntimeError("injected backend construction failure")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(_controller, "make_backend", fail_once)
+    else:
+        real_plan = fa_backend._FaBackend.plan
+
+        def fail_once(self, meta, derived):
+            if not failed:
+                failed.append(stage)
+                raise RuntimeError("injected backend plan failure")
+            return real_plan(self, meta, derived)
+
+        monkeypatch.setattr(fa_backend._FaBackend, "plan", fail_once)
+
+    with pytest.raises(RuntimeError, match="injected"):
+        _plan(attn, p2, "fa2")
+    assert failed == [stage]
+    assert attn.backend is None
+    assert attn._impl._graph is None, "a failed first plan installed a capacity"
+
+    p3 = make_problem(seed=51, **dict(_SHAPE, batch_size=3))
+    _plan(attn, p3, "fa2")  # a different batch size is still free to choose
+    assert attn._impl._graph.capacity.batch_size == 3
+    out, lse = attn.run(p3["q"], (p3["k_cache"], p3["v_cache"]))
+    torch.cuda.synchronize()
+    ref_out, ref_lse = _reference(p3)
     torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
     torch.testing.assert_close(lse, ref_lse, **LSE_TOL)

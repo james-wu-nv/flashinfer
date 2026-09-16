@@ -220,11 +220,13 @@ class PagedAttentionController:
         if self._use_cuda_graph:
             # Graph mode: backends only ever see the reserved storage, so the
             # pointers a captured graph baked in stay valid across re-plans.
+            # The buffers stay a local until publication below: a first plan
+            # that fails in the backend must not leave a capacity behind.
             if self._graph is None:
-                self._graph = GraphBuffers(metadata, self.device)
+                gb = GraphBuffers(metadata, self.device)
             else:
-                self._graph.preflight(metadata)
-            gb = self._graph
+                gb = self._graph
+                gb.preflight(metadata)
             transaction = Transaction(gb.targets(metadata, fresh))
             derived = gb.derived_view(needs_dense=needs_dense)
             qo_indptr, kv_seq_lens = gb.qo_indptr, gb.kv_seq_lens
@@ -234,6 +236,7 @@ class PagedAttentionController:
                 else None
             )
         else:
+            gb = None
             transaction = None
             derived = fresh
             qo_indptr, kv_seq_lens = metadata.qo_indptr, metadata.kv_seq_lens
@@ -274,9 +277,7 @@ class PagedAttentionController:
                 self.device,
                 kv_layout,
                 self._scratch_workspace(),
-                graph_capacity=self._graph.capacity
-                if self._graph is not None
-                else None,
+                graph_capacity=gb.capacity if gb is not None else None,
             )
         if transaction is not None:
             # stage the new batch into reserved storage; any failure below
@@ -288,6 +289,8 @@ class PagedAttentionController:
             candidate.plan(meta, derived)
 
         # publish — nothing above mutated the published state
+        if gb is not None:
+            self._graph = gb
         self._backends[key] = candidate
         self._active = candidate
         self._backend_name = name
