@@ -326,7 +326,9 @@ class PagedAttention:
           kv_dtype / kv_layout``: the static model configuration.
         - ``causal``: also enforces ``q_len_i <= kv_len_i`` per request, except
           for padding rows (``kv_len_i == 0``, see
-          :class:`PagedAttentionMetadata`).
+          :class:`PagedAttentionMetadata`): those are legal, read no KV page,
+          and produce a finite output row whose values and LSE are unspecified
+          by contract (every current backend writes zeros and LSE -inf).
         - ``window_left``: sliding-window size (-1 = unlimited); backends
           without window support are capability-excluded.  Plan-time because
           it selects a compiled kernel variant on the FA backends.
@@ -443,6 +445,9 @@ class PagedAttention:
 
         Returns ``(out, lse)``; ``lse`` is packed ``(total_q_tokens,
         num_qo_heads)`` fp32 in the planned base — identical for every backend.
+        Rows of padding requests (``kv_len == 0``) are finite but unspecified
+        in both ``out`` and ``lse`` (every current backend writes zeros and
+        -inf); exclude them when consuming the LSE.
         """
         return self._impl.run(
             q,

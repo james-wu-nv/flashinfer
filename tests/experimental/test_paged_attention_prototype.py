@@ -571,20 +571,31 @@ def test_envelope_rejections():
         )
 
 
-def _padded_problem(seed, *, input_form, style, page_size=16, device="cuda:0"):
-    """A 5-request batch whose rows 1 and 3 are engine padding rows.
+def _padded_problem(
+    seed,
+    *,
+    input_form,
+    style,
+    page_size=16,
+    device="cuda:0",
+    kv_lens=(37, 0, 64, 0, 9),
+    pool=None,
+):
+    """A 5-request batch (q lens 5,1,7,1,3) whose kv_len-0 rows (by default
+    rows 1 and 3) are engine padding rows.
 
     ``style="vllm"``: kv_len 0, one query token, table row filled with the
     null block id 0 (vLLM's NULL_BLOCK_ID) - and pool page 0 is poisoned with
     NaN so any read of it shows.  For the CSR form the padding row owns zero
     pages.  ``style="sglang"``: the fill value is 1, i.e. an ordinary live row
-    of length 1 on page 0 (kept finite here).  Returns the problem dict plus
-    the boolean mask of live query tokens.
+    of length 1 on page 0 (kept finite here).  ``pool`` fixes the KV pool
+    size (graph tests swap pools of equal size).  Returns the problem dict,
+    the boolean mask of live query tokens and the padding-row mask.
     """
     g = torch.Generator().manual_seed(seed)
     hq, hk, d = 8, 2, 128
     q_lens = torch.tensor([5, 1, 7, 1, 3], dtype=torch.int32)
-    kv_lens = torch.tensor([37, 0, 64, 0, 9], dtype=torch.int32)
+    kv_lens = torch.tensor(list(kv_lens), dtype=torch.int32)
     padding = kv_lens == 0
     if style == "sglang":
         kv_lens = kv_lens.clone()
@@ -595,7 +606,8 @@ def _padded_problem(seed, *, input_form, style, page_size=16, device="cuda:0"):
     )
     pages = (kv_lens + page_size - 1) // page_size
     width = int(pages.max())
-    pool = int(pages.sum()) + 6
+    pool = int(pages.sum()) + 6 if pool is None else pool
+    assert pool > int(pages.sum())
     perm = torch.randperm(pool, generator=g, dtype=torch.int32)
     perm = perm[perm != 0]  # keep page 0 as the null block
     table = torch.zeros(b, width, dtype=torch.int32)
@@ -679,6 +691,94 @@ def test_zero_length_kv_rows_are_padding(backend, input_form, style):
     torch.testing.assert_close(out.float()[live_dev], ref_out[live_dev], **OUT_TOL)
     torch.testing.assert_close(lse[live_dev], ref_lse[live_dev], **LSE_TOL)
     assert int(padding.sum()) == 2
+
+
+def test_padding_row_last_page_len_convention():
+    """A padding row's derived last-page length is page_size (so the legacy
+    wrapper's own get_seq_lens formula also yields 0 for it), its page indptr
+    is flat, and the fa2 planner ignores the value: feeding the wrapper 0,
+    page_size or an arbitrary 7 for that row gives identical live rows and a
+    finite padding row."""
+    from flashinfer.experimental.paged_attention import derived_needs
+    from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
+
+    p, live, padding = _padded_problem(seed=67, input_form="page_indices", style="vllm")
+    _resolve_or_skip(p, "fa2")
+    page = p["page_size"]
+    d = make_metadata(p).derived(needs=derived_needs("fa2"))
+    last = d.kv_last_page_len_host
+    indptr = d.kv_page_indptr_host
+    for i in range(padding.shape[0]):
+        if bool(padding[i]):
+            assert int(last[i]) == page
+            assert int(indptr[i]) == int(indptr[i + 1])
+        else:
+            assert 1 <= int(last[i]) <= page
+    assert torch.equal(
+        (indptr[1:] - indptr[:-1] - 1) * page + last, p["kv_seq_lens_cpu"]
+    )  # get_seq_lens() of the legacy wrapper reproduces the lengths, 0 included
+
+    dev = torch.device(p["device"])
+    ws = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=dev)
+    outs = []
+    for value in (0, page, 7):
+        last_v = last.clone()
+        last_v[padding] = value
+        w = BatchPrefillWithPagedKVCacheWrapper(ws, "HND", backend="fa2")
+        w.plan(
+            d.qo_indptr_host,
+            indptr,
+            d.kv_page_indices,
+            last_v,
+            p["num_qo_heads"],
+            p["num_kv_heads"],
+            p["head_dim_qk"],
+            page,
+            causal=True,
+            q_data_type=p["dtype"],
+            kv_data_type=p["dtype"],
+            seq_lens=p["kv_seq_lens_cpu"],
+        )
+        out = w.run(p["q"], (p["k_cache"], p["v_cache"]))
+        assert torch.isfinite(out.float()).all()
+        outs.append(out)
+    live_dev = live.to(dev)
+    for out in outs[1:]:
+        assert torch.equal(out[live_dev], outs[0][live_dev])
+
+
+def test_derived_dense_width_override():
+    """derived(max_kv_len=...) sizes the dense table derived from flat page
+    ids at the given width (graph mode passes the capture capacity so the
+    table matches the reserved storage); the batch's own value is the floor,
+    and each width is cached separately."""
+    from flashinfer.experimental.paged_attention import derived_needs
+
+    p = make_problem(
+        seed=69,
+        batch_size=3,
+        max_q=8,
+        max_kv=100,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+        input_form="page_indices",
+    )
+    md = make_metadata(p)
+    needs = derived_needs("trtllm-gen")
+    own = md.derived(needs=needs)
+    wide = md.derived(needs=needs, max_kv_len=p["max_kv_len"] + 50)
+    assert own.block_tables.shape[1] == (p["max_kv_len"] + 15) // 16
+    assert wide.block_tables.shape[1] == (p["max_kv_len"] + 50 + 15) // 16
+    assert md.derived(needs=needs, max_kv_len=p["max_kv_len"] + 50) is wide
+    pages = (p["kv_seq_lens_cpu"] + 15) // 16
+    for i in range(3):
+        n = int(pages[i])
+        assert torch.equal(wide.block_tables[i, :n], own.block_tables[i, :n])
+    with pytest.raises(ValueError, match="narrower"):
+        md.derived(needs=needs, max_kv_len=p["max_kv_len"] - 1)
 
 
 def test_derive_is_sync_free():
