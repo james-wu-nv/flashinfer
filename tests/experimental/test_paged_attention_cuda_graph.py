@@ -1233,3 +1233,127 @@ def test_update_waits_for_the_previous_schedule_upload():
         torch.testing.assert_close(lse_a[:total], ref1[1], **LSE_TOL)
         torch.testing.assert_close(out[:total].float(), ref2[0], **OUT_TOL)
         torch.testing.assert_close(lse[:total], ref2[1], **LSE_TOL)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_capture_on_smaller_buffers_binds_the_row_count(backend):
+    """Capture buffers smaller than the capacity are legal, but the graph
+    captured on them must never replay a batch with more rows: the first
+    run() binds the row count and a later update() past it is rejected
+    before anything is staged."""
+    p1 = make_problem(seed=92, **_SHAPE)
+    _resolve_or_skip(p1, backend)
+    dev = torch.device(p1["device"])
+    cap = _graph_capacity_of(p1, extra_rows=16, extra_q=8)
+    attn = PagedAttention(dev, graph_capacity=cap)
+    total = int(p1["qo_indptr_cpu"][-1])
+    g, q, k, v, out, lse = _capture(attn, p1, backend)  # rows == total < capacity
+    assert attn._impl._graph.rows == total
+    p2 = _sibling_batch(p1, seed=93)  # same row count: fine
+    q.copy_(p2["q"])
+    k.copy_(p2["k_cache"])
+    v.copy_(p2["v_cache"])
+    attn.update(make_metadata(p2))
+    g.replay()
+    torch.cuda.synchronize()
+    ref = _reference(p2)
+    torch.testing.assert_close(out.float(), ref[0], **OUT_TOL)
+    # one more query token than the buffers hold, still inside the capacity
+    q_lens = p1["qo_indptr_cpu"].diff().clone()
+    q_lens[0] += 1
+    kv_lens = torch.maximum(p1["kv_seq_lens_cpu"], q_lens)
+    qo = torch.cat(
+        [torch.zeros(1, dtype=torch.int32), torch.cumsum(q_lens, 0, dtype=torch.int32)]
+    )
+    md = make_metadata(p1)
+    bigger = PagedAttentionMetadata.dense(
+        qo.to(dev),
+        kv_lens.to(dev),
+        md.block_tables,
+        page_size=md.page_size,
+        max_q_len=int(q_lens.max()),
+        max_kv_len=int(kv_lens.max()),
+        qo_indptr_cpu=qo,
+        kv_seq_lens_cpu=kv_lens,
+    )
+    assert bigger.total_q_tokens == total + 1 <= cap.total_q_tokens
+    assert bigger.max_q_len <= cap.max_q_len
+    with pytest.raises(ValueError, match="rows"):
+        attn.update(bigger)
+    g.replay()  # the rejected update left p2's plan in place
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), ref[0], **OUT_TOL)
+
+
+def test_replan_on_another_stream_is_rejected():
+    """Re-plans and updates stay on the stream of the first graph-mode plan,
+    the stream the graph is replayed on, so the staging copies precede the
+    replay."""
+    p = make_problem(seed=94, **_SHAPE)
+    _resolve_or_skip(p, "fa2")
+    attn = PagedAttention(torch.device(p["device"]), use_cuda_graph=True)
+    _plan(attn, p, "fa2")
+    other = torch.cuda.Stream()
+    with torch.cuda.stream(other), pytest.raises(ValueError, match="stream"):
+        attn.update(make_metadata(p))
+    attn.update(make_metadata(p))  # back on the planning stream
+
+
+def test_update_reuses_the_pinned_resolution(monkeypatch):
+    """update() re-plans inside the pinned resolution narrowed to the frozen
+    backend: no level-1 resolution per step, and explain() keeps the
+    resolve-time exclusions and marks the other candidates frozen out."""
+    from flashinfer.experimental.paged_attention import _controller
+
+    p = make_problem(seed=95, **_SHAPE)
+    attn = PagedAttention(torch.device(p["device"]), use_cuda_graph=True)
+    _plan(attn, p, "auto")
+    before = attn.explain()
+    frozen = attn._impl._frozen["backend"]
+    candidates = attn._impl._resolution.backends
+
+    def boom(*args, **kwargs):
+        raise AssertionError("level-1 resolution re-run by update()")
+
+    monkeypatch.setattr(_controller, "resolve_paged_attention", boom)
+    attn.update(make_metadata(_sibling_batch(p, seed=96, shrink=True)))
+    after = attn.explain()
+    assert f"chosen: {frozen}" in after
+    for line in before.splitlines():
+        if line.startswith("excluded "):
+            assert line in after
+    assert attn._impl._resolution.backends == (frozen,)
+    if len(candidates) > 1:
+        assert "froze" in after
+
+
+def test_flat_first_batch_with_padding_rows_infers_a_capacity():
+    """A flat first batch whose padding rows (kv_len == 0) own no page has
+    fewer page ids than requests; inferring the capacity from it must hold."""
+    dev = torch.device("cuda:0")
+    qo = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32)
+    kv = torch.tensor([1, 1, 1, 0], dtype=torch.int32)
+    ids = torch.tensor([5, 6, 7], dtype=torch.int32)
+    md = PagedAttentionMetadata.csr(
+        qo.to(dev),
+        kv.to(dev),
+        ids.to(dev),
+        page_size=1,
+        max_q_len=1,
+        max_kv_len=1,
+        qo_indptr_cpu=qo,
+        kv_seq_lens_cpu=kv,
+    )
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn.plan(
+        md,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        q_dtype=torch.bfloat16,
+        causal=True,
+        lse_mode="base2",
+        backend="fa2",
+    )
+    cap = attn._impl._graph.capacity
+    assert (cap.batch_size, cap.flat_capacity) == (4, 3)
