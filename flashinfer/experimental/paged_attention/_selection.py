@@ -15,22 +15,28 @@ import torch
 from ._backends._capabilities import CAPABILITIES
 from ._contracts import (
     Resolution,
+    _expect,
     _expect_page_size,
     _expect_window_left,
     resolve_config_key,
 )
 
 
-def _probe_fa(backend: str) -> Optional[str]:
+def _probe_fa(backend: str, device: Optional[torch.device]) -> Optional[str]:
     if backend == "fa3":
-        from ...utils import is_sm90a_supported
+        from ...utils import is_sm90a_supported, version_at_least
 
-        if not is_sm90a_supported(torch.device("cuda")):
-            return "fa3 requires SM90a (Hopper) and CUDA >= 12.3"
+        if device is not None:
+            if not is_sm90a_supported(device):
+                return "fa3 requires SM90a (Hopper) and CUDA >= 12.3"
+        elif not version_at_least(torch.version.cuda, "12.3"):
+            # explicit-cc_major resolution: the major is already gated by the
+            # capability table; only the toolkit level can be checked here
+            return "fa3 requires CUDA >= 12.3"
     return None
 
 
-def _probe_cudnn() -> Optional[str]:
+def _probe_cudnn(device: Optional[torch.device]) -> Optional[str]:
     from ...cudnn import prefill as cudnn_prefill
 
     if not cudnn_prefill.CUDNN_AVAILABLE:
@@ -38,23 +44,57 @@ def _probe_cudnn() -> Optional[str]:
     return None
 
 
-def _probe_trtllm() -> Optional[str]:
+def _probe_trtllm(device: Optional[torch.device]) -> Optional[str]:
     # Cubin availability is a real capability question (proposal: it should be
     # a library answer, not an engine-side HTTP probe).  The prototype defers
     # to first-run download; a production probe would consult the local cubin
-    # cache / FLASHINFER_NO_DOWNLOAD.
+    # cache / FLASHINFER_NO_DOWNLOAD for ``device``.
     return None
 
 
 # Environment probes: things the static capability table cannot know
 # (installed packages, toolkit level). Run only for capability-admitted
-# backends so explain() stays cheap.
-PROBES: Dict[str, Callable[[], Optional[str]]] = {
-    "fa2": lambda: _probe_fa("fa2"),
-    "fa3": lambda: _probe_fa("fa3"),
+# backends so explain() stays cheap.  Every probe answers for the TARGET
+# device it is given (``None`` = resolved from an explicit cc_major without a
+# device: only device-independent facts can be checked).
+PROBES: Dict[str, Callable[[Optional[torch.device]], Optional[str]]] = {
+    "fa2": lambda device: _probe_fa("fa2", device),
+    "fa3": lambda device: _probe_fa("fa3", device),
     "cudnn": _probe_cudnn,
     "trtllm-gen": _probe_trtllm,
 }
+
+
+def _bind_device(
+    device: Optional[torch.device], cc_major: Optional[int]
+) -> Tuple[Optional[torch.device], int, Optional[int], Optional[int]]:
+    """Resolve the device binding ``(device, cc_major, cc_minor, device_index)``.
+
+    - ``device`` given: read its compute capability (an explicit ``cc_major``
+      must agree with it) and pin the Resolution to that device.
+    - only ``cc_major`` given: pin the compute-capability major alone; the
+      Resolution is NOT bound to a device (``cc_minor``/``device_index`` are
+      ``None``) and device-dependent probes are skipped.
+    - neither given: the current CUDA device.
+    """
+    if device is None and cc_major is not None:
+        return None, cc_major, None, None
+    dev = torch.device(device) if device is not None else torch.device("cuda")
+    _expect(
+        dev.type == "cuda",
+        f"resolve_paged_attention(device=...) must be a CUDA device, got {dev}",
+    )
+    if dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
+    props = torch.cuda.get_device_properties(dev)
+    if cc_major is not None:
+        _expect(
+            cc_major == props.major,
+            f"cc_major={cc_major} contradicts device {dev} (sm_{props.major}"
+            f"{props.minor}); pass one or the other",
+        )
+    return dev, int(props.major), int(props.minor), int(dev.index)
+
 
 # Static heuristic placeholder (proposal §5.2: to be seeded from the benchmark
 # suite; it only has to beat consumer tables that rot).  Order = preference.
@@ -87,14 +127,15 @@ def resolve_paged_attention(
     """Static backend resolution — no plan state, no tensors.
 
     Raises ``ValueError`` when nothing can run, with per-backend reasons.
+    The result is pinned to ``device`` (or to the current CUDA device when
+    neither ``device`` nor ``cc_major`` is given); with only ``cc_major`` it
+    is pinned to that compute-capability major and to no device.
     """
     if head_dim_vo is None:
         head_dim_vo = head_dim_qk
     if kv_dtype is None:
         kv_dtype = q_dtype
-    if cc_major is None:
-        dev = device if device is not None else torch.device("cuda")
-        cc_major = torch.cuda.get_device_properties(dev).major
+    dev, cc_major, cc_minor, device_index = _bind_device(device, cc_major)
     if num_qo_heads <= 0 or num_kv_heads <= 0:
         raise ValueError(
             f"num_qo_heads ({num_qo_heads}) and num_kv_heads ({num_kv_heads}) "
@@ -142,7 +183,7 @@ def resolve_paged_attention(
             kv_input_form=kv_input_form,
         )
         if reason is None:
-            reason = PROBES[name]()
+            reason = PROBES[name](dev)
         if reason is None:
             candidates.append(name)
         else:
@@ -168,6 +209,9 @@ def resolve_paged_attention(
             need_lse,
             window_left,
             kv_input_form,
+            cc_major,
+            cc_minor,
+            device_index,
         ),
     )
 
