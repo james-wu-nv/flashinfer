@@ -297,6 +297,29 @@ class PagedAttention:
         return self
 
     @flashinfer_experimental_api(feature=_FEATURE)
+    def update(self, metadata: "PagedAttentionMetadata") -> "PagedAttention":
+        """Re-plan a captured graph's next batch (CUDA-graph mode only).
+
+        Takes only the per-step metadata: the backend and every semantic
+        ``plan()`` argument were frozen by the first successful graph-mode
+        ``plan()`` and are reused here.  The new batch must fit the
+        :class:`GraphCapacity` (same batch size, paging form and page size;
+        at most the capacity's total query tokens, host maxes and flat page-id
+        length); it is staged into the reserved storage and rolled back on
+        failure, so a failed ``update()`` leaves the previous batch
+        replayable.  Call it outside capture, on the stream the graph is
+        replayed on; then ``graph.replay()``.
+
+        Raises ``RuntimeError`` when the instance is not in graph mode, when
+        no ``plan()`` has succeeded yet, or when the current stream is
+        capturing.  A ``plan()`` with the same frozen arguments is equivalent;
+        ``update()`` is the engine-facing spelling (sglang's
+        ``fast_prefill_plan`` role).
+        """
+        self._impl.update(metadata)
+        return self
+
+    @flashinfer_experimental_api(feature=_FEATURE)
     def run(
         self,
         q: torch.Tensor,
