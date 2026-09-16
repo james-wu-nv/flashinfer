@@ -543,6 +543,44 @@ def test_trace_before_plan_raises():
 
 
 @cuda_only
+@pytest.mark.parametrize("backend", ["cudnn", "trtllm-gen"])
+def test_csr_trace_with_a_dense_table_backend(backend):
+    """A flat-form plan whose backend reads a derived dense table still traces
+    the caller's flat page ids, and to the same definition fa2 gives."""
+    p = _problem(53, form="csr")
+    if not _runnable(p, backend, causal=True, window_left=-1, lse_mode="base2"):
+        pytest.skip(f"{backend} does not resolve here")
+    attn = _plan(p, backend)
+    assert attn.backend == backend
+    ctx = attn._trace_context()
+    live = int(((p["kv_seq_lens_cpu"] + 15) // 16).sum())
+    assert ctx["block_tables"] is None
+    assert torch.equal(ctx["kv_page_indices"], p["kv_page_indices"][:live])
+    assert _trace(attn, p) == _trace(_plan(p, "fa2"), p)
+
+
+@cuda_only
+def test_plan_features_outside_the_definition_refuse_to_trace():
+    p = _problem(54)
+    attn = PagedAttention(torch.device(p["device"]))
+    attn.plan(
+        make_metadata(p),
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim_qk"],
+        q_dtype=p["dtype"],
+        kv_layout=p["kv_layout"],
+        causal=True,
+        lse_mode="base2",
+        logits_soft_cap=30.0,
+        backend="fa2",
+    )
+    assert attn._trace_context()["logits_soft_cap"] == 30.0
+    with pytest.raises(ValueError, match="logits_soft_cap"):
+        fi_trace(attn.run, q=p["q"], kv_cache=(p["k_cache"], p["v_cache"]))
+
+
+@cuda_only
 def test_unbound_trace_raises_instead_of_guessing():
     p = _problem(37)
     with pytest.raises(ValueError, match=r"flashinfer\.fi_trace\(attn\.run"):

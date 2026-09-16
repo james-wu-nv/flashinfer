@@ -303,6 +303,26 @@ def _bound_trace_context(wrapper: Any) -> Dict[str, Any]:
 
 
 def _identity_from_context(ctx: Dict[str, Any]) -> Dict[str, int]:
+    # A definition without these knobs would be silently wrong for a plan
+    # that uses them; refuse until they are Const axes / inputs with reference
+    # support (soft cap: cap * tanh(s / cap); sinks: extra per-head logit;
+    # custom mask: a packed bit-mask input).
+    active = [
+        knob
+        for knob, on in (
+            ("logits_soft_cap", ctx.get("logits_soft_cap") is not None),
+            ("custom_mask", bool(ctx.get("has_custom_mask"))),
+            ("use_sinks", bool(ctx.get("use_sinks"))),
+        )
+        if on
+    ]
+    if active:
+        raise ValueError(
+            "Tracing PagedAttention.run: the plan uses "
+            + ", ".join(active)
+            + ", which the paged_attention trace definition does not encode yet; "
+            "trace a plan without these features"
+        )
     return dict(
         csr=int(ctx["kv_input_form"] == "page_indices"),
         kv_layout=_LAYOUTS.index(ctx["kv_layout"]),
