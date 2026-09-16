@@ -411,6 +411,7 @@ class PagedAttention:
         sm_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run the planned batch.
 
@@ -432,6 +433,11 @@ class PagedAttention:
         - ``k_scale`` / ``v_scale``: per-tensor dequantization scales for an
           fp8 KV cache (``dequant = fp8_value * scale``), host floats so the
           call stays sync-free; only valid when the plan's ``kv_dtype`` is fp8.
+        - ``sinks``: per-head attention sinks, a contiguous fp32
+          ``(num_qo_heads,)`` device tensor: head ``h`` gets one extra logit
+          ``sinks[h]`` in its softmax denominator with no value contribution
+          (the returned LSE includes it).  Required iff the plan declared
+          ``use_sinks=True``; a per-layer value like ``sm_scale``.
 
         Returns ``(out, lse)``; ``lse`` is packed ``(total_q_tokens,
         num_qo_heads)`` fp32 in the planned base — identical for every backend.
@@ -444,6 +450,7 @@ class PagedAttention:
             sm_scale=sm_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            sinks=sinks,
         )
 
     def explain(self) -> str:

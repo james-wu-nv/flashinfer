@@ -503,6 +503,7 @@ class PagedAttentionController:
         sm_scale: Optional[float] = None,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
+        sinks: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         _expect(self._planned, "run() called before plan() — call plan() first")
         m = self._meta
@@ -654,6 +655,32 @@ class PagedAttentionController:
                 f"{nm} must be a positive finite host float (dequant = fp8 * scale), "
                 f"got {sc!r}",
             )
+        if m.use_sinks:
+            _expect(
+                sinks is not None,
+                "the plan declared use_sinks=True but run() got no sinks= tensor "
+                "(the sink-aware kernel variant needs one per call)",
+            )
+            _expect(
+                isinstance(sinks, torch.Tensor)
+                and tuple(sinks.shape) == (m.num_qo_heads,)
+                and sinks.dtype == torch.float32
+                and sinks.device == q.device
+                and sinks.is_contiguous(),
+                f"sinks must be a contiguous fp32 ({m.num_qo_heads},) tensor on "
+                f"{q.device} (one extra softmax logit per query head), got "
+                + (
+                    f"shape {tuple(sinks.shape)}, {sinks.dtype}, {sinks.device}"
+                    if isinstance(sinks, torch.Tensor)
+                    else type(sinks).__name__
+                ),
+            )
+        else:
+            _expect(
+                sinks is None,
+                "sinks= passed but the plan did not declare use_sinks=True — "
+                "plan(use_sinks=True) selects the sink-aware kernel variant",
+            )
         return self._active.run(
             q,
             k_cache,
@@ -663,6 +690,7 @@ class PagedAttentionController:
             sm_scale=sm_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            sinks=sinks,
         )
 
     @property

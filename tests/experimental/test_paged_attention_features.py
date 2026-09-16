@@ -327,3 +327,129 @@ def test_custom_mask_contract():
     with pytest.raises(ValueError, match="follow-up"):
         g.plan(md, backend="fa2", **_plan_kw(p, custom_mask=good))
     assert g.backend is None
+
+
+# --------------------------------------------------------------------------
+# attention sinks
+# --------------------------------------------------------------------------
+
+
+def _sinks(p, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return (torch.rand(p["num_qo_heads"], generator=g) * 5).to(
+        device=p["device"], dtype=torch.float32
+    )
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3", "trtllm-gen"])
+@pytest.mark.parametrize("causal,window_left", [(True, -1), (True, 16), (False, -1)])
+@pytest.mark.parametrize("lse_mode", ["base2", "basee"])
+def test_attention_sinks(backend, causal, window_left, lse_mode):
+    p = make_problem(seed=107 + window_left + 3 * causal, **_SHAPE)
+    _skip_unless_runnable(
+        p, backend, causal=causal, window_left=window_left, sinks=True
+    )
+    sinks = _sinks(p)
+    _, out, lse = _run(
+        p,
+        backend,
+        causal=causal,
+        window_left=window_left,
+        lse_mode=lse_mode,
+        use_sinks=True,
+        sinks=sinks,
+    )
+    ref_out, ref_lse = _reference(
+        p,
+        causal=causal,
+        window_left=window_left,
+        sinks=sinks,
+        lse_base="e" if lse_mode == "basee" else "2",
+    )
+    _assert_matches(out, lse, ref_out, ref_lse)  # LSE includes the sink
+    plain_out, plain_lse = _reference(
+        p,
+        causal=causal,
+        window_left=window_left,
+        lse_base="e" if lse_mode == "basee" else "2",
+    )
+    assert not torch.allclose(ref_out, plain_out, **OUT_TOL)
+    assert not torch.allclose(ref_lse, plain_lse, **LSE_TOL)
+
+
+@pytest.mark.parametrize("backend", ["fa2", "trtllm-gen"])
+def test_attention_sinks_are_a_per_run_value(backend):
+    """One plan, two run() calls with different sinks (per-layer values)."""
+    p = make_problem(seed=113, **_SHAPE)
+    _skip_unless_runnable(p, backend, sinks=True)
+    attn = PagedAttention(torch.device(p["device"]))
+    attn.plan(make_metadata(p), backend=backend, **_plan_kw(p, use_sinks=True))
+    for seed in (1, 2):
+        sinks = _sinks(p, seed)
+        out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]), sinks=sinks)
+        _assert_matches(out, lse, *_reference(p, sinks=sinks))
+
+
+def test_sinks_contract():
+    p = make_problem(seed=127, **_SHAPE)
+    _skip_unless_runnable(p, "fa2", sinks=True)
+    dev = torch.device(p["device"])
+    sinks = _sinks(p)
+    kv = (p["k_cache"], p["v_cache"])
+    # cuDNN is excluded at resolve, with the reason
+    with pytest.raises(ValueError, match="attention sinks not supported"):
+        resolve_paged_attention(backend="cudnn", **_resolve_kw(p, sinks=True))
+    res = resolve_paged_attention(backend="auto", **_resolve_kw(p, sinks=True))
+    assert "cudnn" not in res.backends
+    assert res.excluded["cudnn"] == "attention sinks not supported"
+    attn = PagedAttention(dev)
+    md = make_metadata(p)
+    # sinks without the plan flag: loud (the default kernels would drop them)
+    attn.plan(md, backend="fa2", **_plan_kw(p))
+    with pytest.raises(ValueError, match="use_sinks=True"):
+        attn.run(p["q"], kv, sinks=sinks)
+    # the plan flag without sinks: loud
+    attn.plan(md, backend="fa2", **_plan_kw(p, use_sinks=True))
+    with pytest.raises(ValueError, match="no sinks= tensor"):
+        attn.run(p["q"], kv)
+    for bad in (
+        sinks.to(torch.bfloat16),
+        sinks[:-1],
+        sinks.cpu(),
+        sinks.view(1, -1),
+        torch.zeros(2 * p["num_qo_heads"], device=dev)[::2],
+    ):
+        with pytest.raises(ValueError, match="sinks must be a contiguous fp32"):
+            attn.run(p["q"], kv, sinks=bad)
+    # a Resolution resolved without sinks cannot be used with them (pinning)
+    plain = resolve_paged_attention(backend="auto", **_resolve_kw(p))
+    with pytest.raises(ValueError, match="pinned Resolution"):
+        attn.plan(md, backend=plain, **_plan_kw(p, use_sinks=True))
+
+
+def test_sinks_with_soft_cap_is_a_typed_rejection_on_fa():
+    """The AttentionSink variant has no soft-cap hook: fa declines the batch
+    with the typed signal, `auto` reports every reason, an explicit backend
+    raises."""
+    p = make_problem(seed=131, **_SHAPE)
+    _skip_unless_runnable(p, "fa2", sinks=True)
+    attn = PagedAttention(torch.device(p["device"]))
+    md = make_metadata(p)
+    kw = _plan_kw(p, use_sinks=True, logits_soft_cap=30.0)
+    with pytest.raises(ValueError, match="no pinned candidate.*no logits soft cap"):
+        attn.plan(md, backend="auto", **kw)
+    with pytest.raises(
+        ValueError, match="'fa2' cannot plan this batch.*no logits soft cap"
+    ):
+        attn.plan(md, backend="fa2", **kw)
+    assert attn.backend is None
+    # sinks + custom mask: not verified -> also typed
+    numel = int(
+        (
+            p["qo_indptr_cpu"].diff().to(torch.int64)
+            * p["kv_seq_lens_cpu"].to(torch.int64)
+        ).sum()
+    )
+    ones = torch.ones(numel, dtype=torch.bool, device=p["device"])
+    with pytest.raises(ValueError, match="not verified"):
+        attn.plan(md, backend="fa2", **_plan_kw(p, use_sinks=True, custom_mask=ones))
