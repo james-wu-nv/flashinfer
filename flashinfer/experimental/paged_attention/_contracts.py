@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 import torch
 
@@ -264,7 +264,13 @@ class PagedAttentionMetadata:
     kv_page_indices: Optional[torch.Tensor] = None  # flat CSR page ids
     qo_indptr_cpu: Optional[torch.Tensor] = None
     kv_seq_lens_cpu: Optional[torch.Tensor] = None
-    _derived: Dict[Any, Any] = field(default_factory=dict, repr=False)
+    # the validated host arrays (``_planning.HostArrays``): one pinned staging
+    # tensor computed at construction, uploaded once on the first plan that
+    # needs a device form; lifetime = this object
+    _host: Any = field(default=None, repr=False)
+    _derived: Dict[Tuple[FrozenSet[str], int], Any] = field(
+        default_factory=dict, repr=False
+    )
 
     # ---- constructors ----
     @classmethod
@@ -358,7 +364,9 @@ class PagedAttentionMetadata:
             object.__setattr__(self, "qo_indptr_cpu", self.qo_indptr.cpu())
         elif self.kv_seq_lens_cpu is None:
             object.__setattr__(self, "kv_seq_lens_cpu", self.kv_seq_lens.cpu())
-        validate_values(
+        # the causal envelope depends on plan(causal=...): see
+        # validate_causal_envelope()
+        host = validate_values(
             self.qo_indptr,
             self.kv_seq_lens,
             self.block_tables,
@@ -368,8 +376,8 @@ class PagedAttentionMetadata:
             self.max_kv_len,
             self.qo_indptr_cpu,
             self.kv_seq_lens_cpu,
-            causal=False,  # the causal envelope depends on plan(causal=...)
         )
+        object.__setattr__(self, "_host", host)
 
     # ---- derived facts ----
     @property
@@ -386,8 +394,13 @@ class PagedAttentionMetadata:
 
     @property
     def total_q_tokens(self) -> int:
-        assert self.qo_indptr_cpu is not None
-        return int(self.qo_indptr_cpu[-1])
+        return int(self._host.numpy("qo_indptr")[-1])
+
+    def validate_causal_envelope(self) -> None:
+        """``q_len_i <= kv_len_i`` for every request (host arrays, zero sync)."""
+        from ._planning import validate_causal_envelope
+
+        validate_causal_envelope(self._host)
 
     def derived(self, *, needs, max_kv_len: Optional[int] = None):
         """The derived forms in ``needs`` (``_planning.DERIVED_FORMS`` names),
@@ -412,15 +425,12 @@ class PagedAttentionMetadata:
         d = self._derived.get(key)
         if d is None:
             d = derive(
-                self.qo_indptr,
-                self.kv_seq_lens,
                 self.block_tables,
                 self.kv_page_indices,
-                self.page_size,
                 width_max,
                 needs=key[0],
-                qo_indptr_cpu=self.qo_indptr_cpu,
-                kv_seq_lens_cpu=self.kv_seq_lens_cpu,
+                host=self._host,
+                device=self.device,
             )
             self._derived[key] = d
         return d
