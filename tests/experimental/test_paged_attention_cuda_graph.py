@@ -27,6 +27,9 @@ Contract under test (``PagedAttention(use_cuda_graph=True)``):
    reserved storage at construction; in the flat ``kv_page_indices`` form the
    dense block table is reserved only for a backend that reads it (never at
    ``page_size < 8``, where it would be ``(batch, max_context)``).
+9. ``update(metadata)`` is the graph-mode re-plan with the frozen semantic
+   kwargs: same staging path as ``plan()``, rejected before a plan, in eager
+   mode, and during capture (as is a graph-mode ``plan()``).
 """
 
 import dataclasses
@@ -943,3 +946,96 @@ def test_explicit_capacity_headroom_replay(backend):
     g.replay()  # the rejected plan left the p2 plan in place
     torch.cuda.synchronize()
     torch.testing.assert_close(out[:total2].float(), ref_out2, **OUT_TOL)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_update_sibling_replay(backend):
+    """capture -> update(sibling) -> replay matches the oracle, for a
+    same-shape sibling and for a smaller one; update() takes no semantic
+    kwargs and reuses the frozen ones."""
+    p1 = make_problem(seed=62, **_SHAPE)
+    _resolve_or_skip(p1, backend)
+    dev = torch.device(p1["device"])
+    total1 = int(p1["qo_indptr_cpu"][-1])
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    q, k, v = p1["q"].clone(), p1["k_cache"].clone(), p1["v_cache"].clone()
+    out = torch.empty(
+        total1, p1["num_qo_heads"], p1["head_dim_vo"], dtype=q.dtype, device=dev
+    )
+    lse = torch.empty(total1, p1["num_qo_heads"], dtype=torch.float32, device=dev)
+    _plan(attn, p1, backend)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            attn.run(q, (k, v), out=out, lse=lse)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        attn.run(q, (k, v), out=out, lse=lse)
+
+    for seed, shrink in ((63, False), (64, True)):
+        p2 = _sibling_batch(p1, seed=seed, shrink=shrink)
+        total2 = int(p2["qo_indptr_cpu"][-1])
+        q[:total2].copy_(p2["q"])
+        k.copy_(p2["k_cache"])
+        v.copy_(p2["v_cache"])
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            assert attn.update(make_metadata(p2)) is attn
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        g.replay()
+        torch.cuda.synchronize()
+        ref_out, ref_lse = _reference(p2)
+        torch.testing.assert_close(out[:total2].float(), ref_out, **OUT_TOL)
+        torch.testing.assert_close(lse[:total2], ref_lse, **LSE_TOL)
+    assert attn.backend == attn._impl._frozen["backend"]
+
+
+def test_update_before_plan_and_outside_graph_mode_raise():
+    p = make_problem(seed=65, **_SHAPE)
+    _resolve_or_skip(p, "fa2")
+    dev = torch.device(p["device"])
+    md = make_metadata(p)
+    with pytest.raises(RuntimeError, match="before a successful plan"):
+        PagedAttention(dev, use_cuda_graph=True).update(md)
+    with pytest.raises(RuntimeError, match="before a successful plan"):
+        PagedAttention(dev, graph_capacity=_graph_capacity_of(p)).update(md)
+    eager = PagedAttention(dev)
+    _plan(eager, p, "fa2")
+    with pytest.raises(RuntimeError, match="CUDA-graph re-plan"):
+        eager.update(md)
+
+
+def test_plan_and_update_during_capture_raise():
+    """Neither plan() nor update() may run while the current stream is
+    capturing: their metadata copies and backend planning would be recorded
+    into the graph instead of executed."""
+    p = make_problem(seed=66, **_SHAPE)
+    _resolve_or_skip(p, "fa2")
+    dev = torch.device(p["device"])
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    q, k, v = p["q"], p["k_cache"], p["v_cache"]
+    out = torch.empty(
+        q.shape[0], p["num_qo_heads"], p["head_dim_vo"], dtype=q.dtype, device=dev
+    )
+    lse = torch.empty(q.shape[0], p["num_qo_heads"], dtype=torch.float32, device=dev)
+    _plan(attn, p, "fa2")
+    attn.run(q, (k, v), out=out, lse=lse)
+    torch.cuda.synchronize()
+    md = make_metadata(_sibling_batch(p, seed=67))
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        attn.run(q, (k, v), out=out, lse=lse)
+        with pytest.raises(RuntimeError, match="during CUDA graph capture"):
+            attn.update(md)
+        with pytest.raises(RuntimeError, match="during CUDA graph capture"):
+            _plan(attn, p, "fa2")
+    # the capture itself is intact and computes the planned batch
+    g.replay()
+    torch.cuda.synchronize()
+    ref_out, ref_lse = _reference(p)
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)

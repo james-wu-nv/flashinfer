@@ -18,6 +18,7 @@ its generated backends.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import math
 import threading
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
@@ -173,8 +174,10 @@ class PagedAttentionController:
         self._graph: Optional[GraphBuffers] = (
             GraphBuffers(graph_capacity, dev) if graph_capacity is not None else None
         )
-        # what the first successful graph-mode plan froze (_frozen_contract)
+        # what the first successful graph-mode plan froze (_frozen_contract),
+        # and the plan() kwargs update() re-issues from it
         self._frozen: Optional[Dict[str, Any]] = None
+        self._frozen_plan_kwargs: Optional[Dict[str, Any]] = None
         # published plan state (swapped together, only on success)
         self._planned = False
         self._backend_name: Optional[str] = None
@@ -286,6 +289,7 @@ class PagedAttentionController:
         needs_dense = CAPABILITIES[name].needs_dense
 
         if self._use_cuda_graph:
+            _expect_not_capturing("plan()")
             # Graph mode: backends only ever see the reserved storage, so the
             # pointers a captured graph baked in stay valid across re-plans.
             # The buffers stay a local until publication below: a first plan
@@ -379,6 +383,10 @@ class PagedAttentionController:
         if gb is not None:
             self._graph = gb
             self._frozen = contract
+            self._frozen_plan_kwargs = {
+                k: v for k, v in contract.items() if k in _PLAN_PARAMS
+            }
+            self._frozen_plan_kwargs["backend"] = name
         self._backends[key] = candidate
         self._active = candidate
         self._backend_name = name
@@ -386,6 +394,30 @@ class PagedAttentionController:
         self._meta = meta
         self._derived = derived
         self._planned = True
+
+    # ----------------------------- update -----------------------------
+
+    def update(self, metadata: PagedAttentionMetadata) -> None:
+        """Graph-mode re-plan with the frozen semantic kwargs.
+
+        Routes through :meth:`plan` with the kwargs the first graph-mode plan
+        froze (backend included), so it stages into the reserved storage,
+        preflights against the capacity and rolls back on failure exactly as
+        a re-plan does; there is no second staging path.
+        """
+        _expect_not_capturing("update()")
+        if not self._use_cuda_graph:
+            raise RuntimeError(
+                "update() is the CUDA-graph re-plan: construct "
+                "PagedAttention(graph_capacity=...) or PagedAttention("
+                "use_cuda_graph=True); eager instances re-plan with plan()"
+            )
+        if self._frozen_plan_kwargs is None:
+            raise RuntimeError(
+                "update() called before a successful plan(): the first plan() "
+                "freezes the backend and the semantic kwargs update() reuses"
+            )
+        self.plan(metadata, **self._frozen_plan_kwargs)
 
     # ------------------------------ run -------------------------------
 
@@ -538,6 +570,22 @@ class PagedAttentionController:
         _expect(self._planned, "explain() called before plan() — call plan() first")
         assert self._resolution is not None
         return f"chosen: {self._backend_name}\n{self._resolution.explain()}"
+
+
+# plan() keyword arguments update() re-issues from the frozen contract; the
+# remaining frozen keys (kv_input_form, page_size, dense_table) come from the
+# metadata and the chosen backend and are checked, not passed
+_PLAN_PARAMS = frozenset(
+    inspect.signature(PagedAttentionController.plan).parameters
+) - {"self", "metadata"}
+
+
+def _expect_not_capturing(what: str) -> None:
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"{what} cannot run during CUDA graph capture: plan or update before "
+            "capture, replay inside it"
+        )
 
 
 __all__ = ["PagedAttentionController"]
