@@ -317,11 +317,17 @@ class GraphBuffers:
                 pairs.append((self.block_tables, fresh.block_tables))
         return [(dst, src) for dst, src in pairs if src is not None]
 
-    def derived_view(self, *, needs) -> Derived:
-        """The reserved storage of the requested forms (None elsewhere)."""
+    def derived_view(self, *, needs, fresh: Derived) -> Derived:
+        """The reserved storage of the requested device forms (None
+        elsewhere); the pinned host arrays are not graph state and come
+        straight from ``fresh``."""
         needs = normalize_needs(needs)
         return Derived(
             needs=needs,
+            qo_indptr_host=fresh.qo_indptr_host,
+            kv_seq_lens_host=fresh.kv_seq_lens_host,
+            kv_page_indptr_host=fresh.kv_page_indptr_host,
+            kv_last_page_len_host=fresh.kv_last_page_len_host,
             q_seq_lens=self.q_seq_lens if FORM_Q_SEQ_LENS in needs else None,
             cum_kv_seq_lens=(
                 self.cum_kv_seq_lens if FORM_CUM_KV_SEQ_LENS in needs else None

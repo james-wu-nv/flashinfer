@@ -356,14 +356,20 @@ class PagedAttentionController:
         trace: List[Tuple[str, str, str]] = []
         chosen = None
         for name in resolution.backends:
-            # derive exactly the forms this candidate declared it reads
+            # derive exactly the forms this candidate declared it reads (cached
+            # on the metadata per need set and width; in graph mode the dense
+            # table derived from flat page ids is sized to the reserved one)
             needs = derived_needs(name)
+            fresh = metadata.derived(
+                needs=needs,
+                max_kv_len=gb.capacity.max_kv_len if gb is not None else None,
+            )
             if gb is not None:
                 if FORM_BLOCK_TABLES in needs:
                     # flat form: only a backend that reads the dense table pays
                     # for it, and only once (no-op in the dense form)
                     gb.reserve_dense_table()
-                derived = gb.derived_view(needs=needs)
+                derived = gb.derived_view(needs=needs, fresh=fresh)
                 qo_indptr, kv_seq_lens = gb.qo_indptr, gb.kv_seq_lens
                 block_tables = (
                     gb.block_tables
@@ -371,7 +377,7 @@ class PagedAttentionController:
                     else None
                 )
             else:
-                derived = metadata.derived(needs=needs)
+                derived = fresh
                 qo_indptr, kv_seq_lens = metadata.qo_indptr, metadata.kv_seq_lens
                 # dense table given by the caller or derived (None where truly absent)
                 block_tables = (
@@ -432,7 +438,7 @@ class PagedAttentionController:
                     ) from exc
                 continue
             trace.append((name, "preflight", "accepted"))
-            chosen = (name, candidate, meta, derived, needs)
+            chosen = (name, candidate, meta, derived, fresh)
             break
         if chosen is None:
             detail = "; ".join(f"{n}: {r}" for n, _, r in trace)
@@ -440,7 +446,7 @@ class PagedAttentionController:
                 "no pinned candidate can plan this batch "
                 f"(candidates {list(resolution.backends)}: {detail})"
             )
-        name, candidate, meta, derived, needs = chosen
+        name, candidate, meta, derived, fresh = chosen
         key = (name, kv_layout)
 
         # graph mode: the frozen contract is checked before any reserved
@@ -452,7 +458,6 @@ class PagedAttentionController:
         if gb is not None:
             # stage the new batch into reserved storage; any failure below
             # (including inside the backend's own plan) restores every buffer
-            fresh = metadata.derived(needs=needs, max_kv_len=gb.capacity.max_kv_len)
             transaction = Transaction(gb.targets(metadata, fresh))
             with transaction:
                 candidate.plan(meta, derived)
