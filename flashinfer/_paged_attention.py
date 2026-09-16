@@ -237,7 +237,12 @@ class PagedAttention:
 
         cap = GraphCapacity(batch_size=256, total_q_tokens=1024, max_q_len=4,
                             max_kv_len=8192 * 16, page_size=16, table_width=8192)
-        attn = PagedAttention(device, graph_capacity=cap)
+        nbytes = PagedAttention.workspace_requirements(
+            cap, device=device, num_qo_heads=8, num_kv_heads=2, head_dim_qk=128,
+            q_dtype=torch.bfloat16)          # scratch every plan in cap fits
+        attn = PagedAttention(device, graph_capacity=cap,
+                              workspace_buffer=torch.empty(nbytes, dtype=torch.uint8,
+                                                           device=device))
         attn.plan(md0, num_qo_heads=8, num_kv_heads=2, head_dim_qk=128,
                   q_dtype=torch.bfloat16, causal=True, lse_mode="base2",
                   backend=res)                           # freezes backend + semantics
@@ -300,6 +305,102 @@ class PagedAttention:
     def backend(self) -> Optional[str]:
         """Name of the backend chosen by the last successful ``plan()``."""
         return self._impl.backend
+
+    @staticmethod
+    @flashinfer_experimental_api(feature=_FEATURE)
+    def workspace_requirements(
+        capacity: "GraphCapacity",
+        *,
+        device: Optional[torch.device] = None,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim_qk: int,
+        head_dim_vo: Optional[int] = None,
+        q_dtype: torch.dtype,
+        kv_dtype: Optional[torch.dtype] = None,
+        kv_layout: str = "HND",
+        causal: bool = True,
+        need_lse: bool = True,
+        window_left: int = -1,
+        logits_soft_cap: Optional[float] = None,
+        custom_mask: bool = False,
+        use_sinks: bool = False,
+        use_cuda_graph: bool = True,
+        backend: Union[str, "Resolution"] = "auto",
+    ) -> int:
+        """Scratch-workspace bytes that cover every plan within ``capacity``.
+
+        A conservative upper bound on what the planners of the backends that
+        can run this configuration carve out of ``workspace_buffer``, for an
+        engine to size a caller-owned buffer (or deduct from its KV-pool
+        budget) at init, before any capture.  Tensor-free and sync-free.
+
+        - ``capacity``: the batch geometry as a :class:`GraphCapacity` (batch
+          size, total query tokens, ``max_q_len`` / ``max_kv_len``, page size,
+          paging form) — the bucket an instance will be built with, or the
+          largest batch an eager instance will plan.
+        - ``device``: the target device; its SM count bounds the split-KV
+          work items (default: the current CUDA device).
+        - model configuration and feature flags as for :meth:`plan`
+          (``need_lse`` defaults to ``True`` so the bound covers plans with
+          and without an LSE output).
+        - ``use_cuda_graph``: ``True`` (default) bounds a graph-mode instance
+          planned with ``capacity``, which also covers any eager plan that
+          fits it; ``False`` gives the tighter eager-only bound, which does
+          not depend on the token counts.
+        - ``backend``: ``"auto"`` takes the maximum over every backend that
+          resolves for the configuration; a name or a ``Resolution`` asks
+          about that candidate set.
+
+        Formulas (per backend; ``H`` query heads, ``H_kv`` KV heads, ``G =
+        H / H_kv``, ``D`` = ``head_dim_vo``, ``SM`` = SM count, ``B`` =
+        batch size, ``N`` = total query tokens, ``T`` = the fa2 query tile,
+        a power of two in 16..128 chosen from the packed query length):
+
+        - **fa2** (dominates): the split-KV planner allocates
+          ``4 * H * P * T * (D + 1)`` bytes with ``P`` work items.  Graph
+          mode: ``P = max(2 * SM // H_kv, ceil(N * G / T) + B - 1)`` — exact
+          for the capacity.  Eager mode: ``P <= 2 * SM // H_kv`` and ``T`` is
+          bounded by its ceiling (128 below ``D = 256``, else 64), so the
+          bound is independent of ``N`` and loose by the tile and work-item
+          ratios.  Example (B200, 148 SMs, 32/8 heads, ``D = 128``): one
+          request of 2048 tokens in graph mode needs 129 MiB; eager prefill
+          of any batch needs at most 75 MiB.
+        - **trtllm-gen / cake**: with an LSE output, softmax stats of
+          ``8 * H * B * round_up(max_q_len, 256)`` bytes plus a 1 MiB guard;
+          nothing otherwise.
+        - **cuDNN**: sizes its own graph workspace; measured 0-8960 bytes
+          across shapes, carried as a 1 MiB allowance (not derived).
+        - **fa3**: nothing from this buffer (its planner uses the wrapper's
+          own int workspace).
+
+        The reserved metadata storage, the generated-FA wrapper's 8 MiB int
+        workspace and its pinned mirror are per-instance costs outside this
+        buffer and not included.
+        """
+        from .experimental.paged_attention import (
+            workspace_requirements as _workspace_requirements,
+        )
+
+        return _workspace_requirements(
+            capacity,
+            device=device,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            kv_layout=kv_layout,
+            causal=causal,
+            need_lse=need_lse,
+            window_left=window_left,
+            logits_soft_cap=logits_soft_cap,
+            custom_mask=custom_mask,
+            use_sinks=use_sinks,
+            use_cuda_graph=use_cuda_graph,
+            backend=backend,
+        )
 
     @flashinfer_experimental_api(feature=_FEATURE)
     def plan(
