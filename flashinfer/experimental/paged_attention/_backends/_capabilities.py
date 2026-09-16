@@ -35,6 +35,18 @@ class _BackendPlanUnsupportedError(RuntimeError):
     """
 
 
+def _workspace_too_small(backend: str, need: int, available: int) -> str:
+    """Message for a plan-time rejection of a scratch workspace the backend's
+    planner would overflow (raised as ``ValueError`` from ``preflight()``, so
+    it surfaces before the kernel-side allocator error)."""
+    return (
+        f"backend {backend!r} needs {need} bytes of scratch workspace for this "
+        f"batch but the workspace buffer holds {available} bytes; size a "
+        "caller-owned buffer with PagedAttention.workspace_requirements(...) "
+        "and pass it as PagedAttention(workspace_buffer=...)"
+    )
+
+
 # Below this page size a dense (b, max_pages) block table degenerates toward
 # (b, max_context): the dense INPUT form requires page_size >= this floor, and
 # dense DERIVATION from the flat-indices form is refused below it (backends
@@ -301,4 +313,5 @@ __all__ = [
     "MIN_DENSE_PAGE_SIZE",
     "PagedAttentionCapabilities",
     "_BackendPlanUnsupportedError",
+    "_workspace_too_small",
 ]

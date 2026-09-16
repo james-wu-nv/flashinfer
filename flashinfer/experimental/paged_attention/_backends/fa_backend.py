@@ -22,11 +22,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
+import numpy as np
 import torch
 
 from .._contracts import LN2, PlanMetadata
 from .._planning import FORM_HOST_ARRAYS, FORM_KV_PAGE_INDICES, Derived
-from ._capabilities import _BackendPlanUnsupportedError
+from ._capabilities import _BackendPlanUnsupportedError, _workspace_too_small
 
 
 def _envelope_mask(custom_mask: torch.Tensor, meta: PlanMetadata) -> torch.Tensor:
@@ -62,6 +63,90 @@ def _envelope_mask(custom_mask: torch.Tensor, meta: PlanMetadata) -> torch.Tenso
     return allowed
 
 
+# ---------------------------------------------------------------------------
+# Scratch workspace the fa2 planner carves out of the shared buffer
+# (include/flashinfer/attention/scheduler.cuh: PrefillPlanImpl and
+# PrefillSplitQOKVIndptr).  Only the split-KV path touches the float
+# workspace, with two 16-byte-aligned allocations (both sizes are multiples
+# of 64, so alignment adds nothing):
+#
+#     tmp_v = num_qo_heads * padded_batch_size * cta_tile_q * head_dim_vo * 4
+#     tmp_s = num_qo_heads * padded_batch_size * cta_tile_q * 4
+#
+# padded_batch_size counts (request, q-tile, kv-chunk) work items:
+#   eager: new_batch_size, which the kv-chunk binary search keeps at or under
+#          max_grid_size / num_kv_heads whenever split_kv is on (max_grid_size
+#          = 2 * SM count; split_kv is off, and no float scratch is used, when
+#          even one chunk per request does not fit that grid);
+#   graph: max(max_grid_size / num_kv_heads,
+#              ceil(total_rows * gqa_group / cta_tile_q) + batch_size - 1),
+#          total_rows being the wrapper's row budget (the graph capacity), and
+#          split_kv is always on.
+# cta_tile_q is FA2DetermineCtaTileQ (include/flashinfer/utils.cuh) of the
+# average (eager) or maximum (graph) packed query length -- a power of two in
+# {16, 32, 64, 128}, so the byte count is monotone in it.  The SM90 (fa3)
+# planner allocates from the wrapper-owned int workspace only.
+# ---------------------------------------------------------------------------
+_FA2_BLOCKS_PER_SM = 2  # num_blocks_per_sm in PrefillPlanImpl
+
+
+def _align16(n: int) -> int:
+    return (n + 15) // 16 * 16
+
+
+def _dtype_bytes(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _fa2_cta_tile_q(
+    packed_qo_len: int,
+    head_dim_vo: int,
+    head_dim_qk: int,
+    kv_dtype_bytes: int,
+    smem_optin: Optional[int],
+) -> Tuple[int, ...]:
+    """FA2DetermineCtaTileQ on the host: the tiles it can return for this
+    input.  One entry, except that the short-query branch consults the
+    device's opt-in shared memory; when that is unknown both outcomes are
+    returned (the caller takes the max for a bound, the min for a check).
+    The pre-Ampere branch is not modelled (fa2 is declared for sm_80+)."""
+    if head_dim_vo >= 512:
+        return (16,) if packed_qo_len <= 32 else (32,)
+    if head_dim_qk >= 512:
+        return (16,)
+    if packed_qo_len > 64 and head_dim_vo < 256:
+        return (128,)
+    if packed_qo_len > 16:
+        return (64,)
+    if smem_optin is None:
+        return (16, 64)
+    q_tile_smem = 16 * head_dim_qk * 2
+    kv_step_smem = (head_dim_qk + head_dim_vo) * 16 * 4 * kv_dtype_bytes
+    return (64,) if q_tile_smem + kv_step_smem > smem_optin else (16,)
+
+
+def _fa2_tile_ceiling(head_dim_vo: int, head_dim_qk: int) -> int:
+    """Largest cta_tile_q FA2DetermineCtaTileQ can return for these head dims."""
+    if head_dim_vo >= 512:
+        return 32
+    if head_dim_qk >= 512:
+        return 16
+    return 128 if head_dim_vo < 256 else 64
+
+
+def _fa2_split_bytes(
+    num_qo_heads: int, padded_batch_size: int, cta_tile_q: int, head_dim_vo: int
+) -> int:
+    rows = num_qo_heads * padded_batch_size * cta_tile_q
+    return _align16(rows * head_dim_vo * 4) + _align16(rows * 4)
+
+
+def _fa2_graph_tiles(
+    total_rows: int, batch_size: int, gqa: int, cta_tile_q: int
+) -> int:
+    return -(-total_rows * gqa // cta_tile_q) + batch_size - 1
+
+
 class _FaBackend:
     # CSR page ids on device; the indptr / last-page lengths / KV lengths
     # travel as pinned host arrays (the wrapper uploads them itself)
@@ -75,6 +160,11 @@ class _FaBackend:
         self._kv_layout = kv_layout
         self._workspace = workspace
         self._graph_capacity = graph_capacity
+        props = torch.cuda.get_device_properties(device)
+        self._sm_count = int(props.multi_processor_count)
+        self._smem_optin: Optional[int] = getattr(
+            props, "shared_memory_per_block_optin", None
+        )
         # The default-variant wrapper is the stable storage for plain plans;
         # attention sinks need the AttentionSink JIT variant, whose module is
         # specialized per (dtypes, head dims, sliding window), so those
@@ -159,6 +249,8 @@ class _FaBackend:
                 raise _BackendPlanUnsupportedError(
                     f"fa3 needs SM90a and CUDA >= 12.3; {self._device} does not qualify"
                 )
+        else:
+            self._check_workspace(meta)
         if meta.use_sinks:
             # The AttentionSink variant owns the softmax update: it has no
             # soft-cap hook, and its combination with MaskMode.CUSTOM and
@@ -184,6 +276,149 @@ class _FaBackend:
                 "fa backends (reserved packed-mask storage is not part of the "
                 "graph capacity yet); plan the masked batch on an eager instance"
             )
+
+    # ------------------------- scratch workspace -------------------------
+
+    @staticmethod
+    def workspace_bound(
+        name: str,
+        *,
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim_qk: int,
+        head_dim_vo: int,
+        kv_dtype: torch.dtype,
+        batch_size: int,
+        total_q_tokens: int,
+        use_cuda_graph: bool,
+        sm_count: int,
+        smem_optin: Optional[int],
+        **_unused: Any,
+    ) -> int:
+        """Upper bound on the float-workspace bytes the fa2 planner allocates
+        for any batch within the geometry (see the module formulas); 0 for fa3.
+
+        Graph mode is exact given the capacity (the planner pads to the same
+        maximum); eager mode bounds the work items by the grid and the tile
+        by its ceiling, so it is loose by the ratio of the chosen tile to the
+        ceiling and of the actual work items to the grid.
+        """
+        if name != "fa2":
+            return 0
+        gqa = num_qo_heads // num_kv_heads
+        grid = _FA2_BLOCKS_PER_SM * sm_count // num_kv_heads
+        if not use_cuda_graph:
+            tile = _fa2_tile_ceiling(head_dim_vo, head_dim_qk)
+            return _fa2_split_bytes(num_qo_heads, grid, tile, head_dim_vo)
+        tiles = _fa2_cta_tile_q(
+            (total_q_tokens - batch_size + 1) * gqa,
+            head_dim_vo,
+            head_dim_qk,
+            _dtype_bytes(kv_dtype),
+            smem_optin,
+        )
+        return max(
+            _fa2_split_bytes(
+                num_qo_heads,
+                max(grid, _fa2_graph_tiles(total_q_tokens, batch_size, gqa, t)),
+                t,
+                head_dim_vo,
+            )
+            for t in tiles
+        )
+
+    def workspace_need(self, meta: PlanMetadata) -> int:
+        """Float-workspace bytes the fa2 planner allocates for THIS batch: the
+        planner's own arithmetic (PrefillSplitQOKVIndptr) replayed on the host
+        mirrors, no device access.  0 for fa3.  Where the tile is ambiguous
+        (unknown shared-memory limit) the smaller outcome is taken, so a
+        check built on this never rejects a batch the planner would accept.
+        """
+        if self.name != "fa2":
+            return 0
+        gqa = meta.num_qo_heads // meta.num_kv_heads
+        page = meta.page_size
+        grid = _FA2_BLOCKS_PER_SM * self._sm_count // meta.num_kv_heads
+        qo = meta.qo_indptr_cpu.numpy().astype(np.int64)
+        packed = (qo[1:] - qo[:-1]) * gqa
+        kv = meta.kv_seq_lens_cpu.numpy().astype(np.int64)
+        pages = (kv + page - 1) // page
+        batch = meta.batch_size
+        cap = self._graph_capacity
+        kv_bytes = _dtype_bytes(meta.kv_dtype)
+        if cap is not None:
+            rows = cap.total_q_tokens
+            tiles = _fa2_cta_tile_q(
+                (rows - batch + 1) * gqa,
+                meta.head_dim_vo,
+                meta.head_dim_qk,
+                kv_bytes,
+                self._smem_optin,
+            )
+        else:
+            tiles = _fa2_cta_tile_q(
+                int(packed.sum()) // batch,
+                meta.head_dim_vo,
+                meta.head_dim_qk,
+                kv_bytes,
+                self._smem_optin,
+            )
+        min_chunk = max(128 // page, 1)
+        need = None
+        for tile in tiles:
+            q_tiles = -(-packed // tile)
+            if meta.window_left >= 0:
+                eff = np.minimum(-(-(meta.window_left + tile) // page), pages)
+            else:
+                eff = pages
+            eff = np.maximum(eff, 1)
+            max_pages = int(eff.max())
+            low, high = min_chunk, max_pages
+            while low < high:
+                mid = (low + high) // 2
+                if int((q_tiles * (-(-eff // mid))).sum()) > grid:
+                    low = mid + 1
+                else:
+                    high = mid
+            if cap is None:
+                if not low < max_pages:
+                    return 0  # no split: the planner touches no float scratch
+                padded = int((q_tiles * (-(-eff // low))).sum())
+            else:
+                padded = max(
+                    grid, _fa2_graph_tiles(cap.total_q_tokens, batch, gqa, tile)
+                )
+            size = _fa2_split_bytes(meta.num_qo_heads, padded, tile, meta.head_dim_vo)
+            need = size if need is None else min(need, size)
+        return need
+
+    def _check_workspace(self, meta: PlanMetadata) -> None:
+        """Reject a batch whose planner allocation cannot fit the workspace
+        before the planner itself overflows (kernel-side RuntimeError).  The
+        O(1) bound settles almost every plan; the per-batch replay runs only
+        when the bound exceeds the buffer."""
+        avail = self._workspace.numel()
+        cap = self._graph_capacity
+        bound = self.workspace_bound(
+            self.name,
+            num_qo_heads=meta.num_qo_heads,
+            num_kv_heads=meta.num_kv_heads,
+            head_dim_qk=meta.head_dim_qk,
+            head_dim_vo=meta.head_dim_vo,
+            kv_dtype=meta.kv_dtype,
+            batch_size=meta.batch_size,
+            total_q_tokens=cap.total_q_tokens
+            if cap is not None
+            else meta.total_q_tokens,
+            use_cuda_graph=cap is not None,
+            sm_count=self._sm_count,
+            smem_optin=self._smem_optin,
+        )
+        if bound <= avail:
+            return
+        need = self.workspace_need(meta)
+        if need > avail:
+            raise ValueError(_workspace_too_small(self.name, need, avail))
 
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
         # The kernel walks kv_page_indices as a raw int32 pointer bounded by

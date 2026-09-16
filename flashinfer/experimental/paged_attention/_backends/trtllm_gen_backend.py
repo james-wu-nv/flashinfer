@@ -21,17 +21,31 @@ allocate on every ``run()``.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
 from .._contracts import LN2, PlanMetadata
 from .._planning import FORM_BLOCK_TABLES, FORM_CUM_KV_SEQ_LENS, Derived
-from ._capabilities import _BackendPlanUnsupportedError
+from ._capabilities import _BackendPlanUnsupportedError, _workspace_too_small
 
 # Page sizes the trtllm-gen paged context kernel is shipped for (the
 # capability table admits a verified subset of these).
 _KERNEL_PAGE_SIZES = frozenset({16, 32, 64, 128, 256, 512, 1024})
+
+# Scratch the context launcher carves out of the shared workspace
+# (csrc/trtllm_fmha_kernel_launcher.cu, trtllm_paged_attention_launcher):
+# only with an LSE output, the softmax-stats buffer of
+# float2[num_qo_heads, batch_size, round_up(max_q_len, 256)] plus a 1 MiB
+# guard (kTrtllmGenSoftmaxStatsGuardBytes), 16-byte aligned.  The Context
+# mode takes no multi-CTA scratch; its counters live in the backend's own
+# buffer.  In graph mode batch_size and max_q_len are the capacity values.
+_SOFTMAX_STATS_GUARD_BYTES = 1 << 20
+
+
+def _softmax_stats_bytes(num_qo_heads: int, batch_size: int, max_q_len: int) -> int:
+    slots = num_qo_heads * batch_size * (-(-max_q_len // 256) * 256)
+    return (8 * slots + _SOFTMAX_STATS_GUARD_BYTES + 15) // 16 * 16
 
 
 class _TrtllmGenBackend:
@@ -77,6 +91,34 @@ class _TrtllmGenBackend:
                 "pass block_tables[:, :width].contiguous() (or the full-width "
                 "table; extra columns past max_kv_len are fine)"
             )
+
+        need = self.workspace_need(meta)
+        if need > self._workspace.numel():
+            raise ValueError(
+                _workspace_too_small(self.name, need, self._workspace.numel())
+            )
+
+    @staticmethod
+    def workspace_bound(
+        name: str,
+        *,
+        num_qo_heads: int,
+        batch_size: int,
+        max_q_len: int,
+        need_lse: bool,
+        **_unused: Any,
+    ) -> int:
+        """Scratch bytes the context launcher allocates (exact: the softmax
+        stats depend on heads, batch size and max_q_len only); 0 without LSE."""
+        return (
+            _softmax_stats_bytes(num_qo_heads, batch_size, max_q_len) if need_lse else 0
+        )
+
+    def workspace_need(self, meta: PlanMetadata) -> int:
+        """Scratch bytes ``run()`` will carve out for this plan."""
+        if not meta.need_lse:
+            return 0
+        return _softmax_stats_bytes(meta.num_qo_heads, meta.batch_size, meta.max_q_len)
 
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
         from ....utils import (

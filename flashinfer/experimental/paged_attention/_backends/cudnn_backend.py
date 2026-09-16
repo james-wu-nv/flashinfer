@@ -15,7 +15,7 @@ the packed one (a view, still no gather).
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -25,6 +25,14 @@ from ._capabilities import _BackendPlanUnsupportedError
 
 # device -> can this cuDNN write ragged (packed) softmax stats on the paged path?
 _PACKED_LSE_SUPPORTED: Dict[torch.device, bool] = {}
+
+# cuDNN sizes its own workspace when the SDPA graph is built
+# (graph.get_workspace_size()) and the number is not derivable from the
+# library.  Measured on cuDNN 9.25 / frontend 1.29 / B200 for prefill,
+# decode, ragged and (192, 128) shapes up to 8192 query tokens: 0 or 8960
+# bytes.  This allowance stands in for that measurement in the bound; it is
+# not a proof.
+_CUDNN_WORKSPACE_ALLOWANCE = 1 << 20
 
 
 def _packed_lse_supported(device: torch.device, workspace: torch.Tensor) -> bool:
@@ -144,6 +152,15 @@ class _CudnnBackend:
             raise _BackendPlanUnsupportedError(
                 "cudnn-frontend python package not importable"
             )
+
+    @staticmethod
+    def workspace_bound(name: str, **_unused: Any) -> int:
+        """Allowance for cuDNN's graph workspace (measured, see module note)."""
+        return _CUDNN_WORKSPACE_ALLOWANCE
+
+    def workspace_need(self, meta: PlanMetadata) -> int:
+        """Unknown before the graph is built; cuDNN checks its workspace itself."""
+        return 0
 
     @property
     def lse_written_packed(self) -> bool:

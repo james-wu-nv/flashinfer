@@ -46,6 +46,16 @@ def derived_needs(name: str) -> FrozenSet[str]:
     return _CLASSES[name].DERIVED_NEEDS
 
 
+def workspace_bound(name: str, **geometry) -> int:
+    """Conservative scratch-workspace bytes backend ``name`` may carve out of
+    the shared buffer for any plan within ``geometry`` (the keyword set of
+    ``_controller.workspace_requirements``: heads, head dims, kv dtype, batch
+    size, total query tokens, max_q_len, need_lse, graph mode, SM count,
+    opt-in shared memory).  Each backend documents its own formula; like
+    ``derived_needs`` this is an adapter detail, not a capability."""
+    return _CLASSES[name].workspace_bound(name, **geometry)
+
+
 def make_backend(
     name: str,
     device: torch.device,
@@ -70,4 +80,5 @@ __all__ = [
     "_BackendPlanUnsupportedError",
     "derived_needs",
     "make_backend",
+    "workspace_bound",
 ]
