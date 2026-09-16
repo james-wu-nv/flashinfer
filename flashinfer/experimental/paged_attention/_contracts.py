@@ -251,6 +251,16 @@ class PagedAttentionMetadata:
     plans over the same batch (windowed / full layers, causal / non-causal)
     derive once and only the forms the chosen backend reads are computed.
 
+    Padding rows: ``kv_seq_lens[i] == 0`` is legal and marks a padding row
+    (vLLM's CUDA-graph padding fills ``seq_lens`` with 0 and the table row
+    with its null block; sglang's fill value 1 is an ordinary live row).  The
+    query length of a padding row must still be >= 1.  The library guarantees
+    no page of that row is read, a finite output row, and unchanged results
+    for every other row; the row's output values and LSE are unspecified.
+    Every backend handles it natively (measured on B200: trtllm-gen
+    ``seq_lens=0``, cuDNN ``actual_seq_lens_kv=0``, the FA kernels a CSR row
+    with zero pages all give a zero output row and LSE -inf).
+
     Identity semantics: two objects compare by identity, not by tensor
     contents (they are meant to be built once per step and reused).
     """

@@ -540,9 +540,10 @@ def test_resolution_pinning():
 
 
 def test_envelope_rejections():
-    """Zero-length KV rows and causal q_len>kv_len are outside the v1
-    envelope and must be rejected loudly (backends disagree on the LSE of
-    fully-masked rows: fa2 finite sentinel vs cudnn -inf)."""
+    """Negative KV lengths and causal q_len>kv_len on a live row are outside
+    the v1 envelope and must be rejected loudly (backends disagree on the LSE
+    of fully-masked rows: fa2 finite sentinel vs cudnn -inf).  kv_len 0 is a
+    padding row, covered by test_zero_length_kv_rows_are_padding."""
     p = make_problem(
         seed=29,
         batch_size=3,
@@ -554,11 +555,11 @@ def test_envelope_rejections():
         page_size=16,
         dtype=torch.bfloat16,
     )
-    kv0 = p["kv_seq_lens_cpu"].clone()
-    kv0[1] = 0
-    with pytest.raises(ValueError, match="outside the v1 envelope"):
+    kvn = p["kv_seq_lens_cpu"].clone()
+    kvn[1] = -1
+    with pytest.raises(ValueError, match="kv_seq_lens must be >= 0"):
         run_unified(
-            {**p, "kv_seq_lens_cpu": kv0, "kv_seq_lens": kv0.to(p["device"])}, "fa2"
+            {**p, "kv_seq_lens_cpu": kvn, "kv_seq_lens": kvn.to(p["device"])}, "fa2"
         )
     # causal q>kv: force q_len 8 > kv_len 4 on request 0
     kvq = p["kv_seq_lens_cpu"].clone()
@@ -568,6 +569,116 @@ def test_envelope_rejections():
         run_unified(
             {**p, "kv_seq_lens_cpu": kvq, "kv_seq_lens": kvq.to(p["device"])}, "fa2"
         )
+
+
+def _padded_problem(seed, *, input_form, style, page_size=16, device="cuda:0"):
+    """A 5-request batch whose rows 1 and 3 are engine padding rows.
+
+    ``style="vllm"``: kv_len 0, one query token, table row filled with the
+    null block id 0 (vLLM's NULL_BLOCK_ID) - and pool page 0 is poisoned with
+    NaN so any read of it shows.  For the CSR form the padding row owns zero
+    pages.  ``style="sglang"``: the fill value is 1, i.e. an ordinary live row
+    of length 1 on page 0 (kept finite here).  Returns the problem dict plus
+    the boolean mask of live query tokens.
+    """
+    g = torch.Generator().manual_seed(seed)
+    hq, hk, d = 8, 2, 128
+    q_lens = torch.tensor([5, 1, 7, 1, 3], dtype=torch.int32)
+    kv_lens = torch.tensor([37, 0, 64, 0, 9], dtype=torch.int32)
+    padding = kv_lens == 0
+    if style == "sglang":
+        kv_lens = kv_lens.clone()
+        kv_lens[padding] = 1
+    b = q_lens.shape[0]
+    qo_indptr_cpu = torch.cat(
+        [torch.zeros(1, dtype=torch.int32), torch.cumsum(q_lens, 0, dtype=torch.int32)]
+    )
+    pages = (kv_lens + page_size - 1) // page_size
+    width = int(pages.max())
+    pool = int(pages.sum()) + 6
+    perm = torch.randperm(pool, generator=g, dtype=torch.int32)
+    perm = perm[perm != 0]  # keep page 0 as the null block
+    table = torch.zeros(b, width, dtype=torch.int32)
+    flat = []
+    off = 0
+    for i in range(b):
+        n = int(pages[i])
+        if style == "sglang" and bool(padding[i]):
+            table[i, :1] = 0
+            flat.append(torch.zeros(1, dtype=torch.int32))
+            continue
+        table[i, :n] = perm[off : off + n]
+        flat.append(perm[off : off + n])
+        off += n
+    kv_page_indices_cpu = torch.cat(flat) if flat else torch.zeros(0, dtype=torch.int32)
+    total = int(qo_indptr_cpu[-1])
+    q = torch.randn(total, hq, d, dtype=torch.bfloat16, device=device)
+    k = torch.randn(pool, hk, page_size, d, dtype=torch.bfloat16, device=device)
+    v = torch.randn_like(k)
+    if style == "vllm":
+        k[0] = float("nan")
+        v[0] = float("nan")
+    live_tokens = torch.ones(total, dtype=torch.bool)
+    for i in range(b):
+        if bool(padding[i]):
+            live_tokens[int(qo_indptr_cpu[i]) : int(qo_indptr_cpu[i + 1])] = False
+    p = dict(
+        q=q,
+        k_cache=k,
+        v_cache=v,
+        k_ref=k,
+        v_ref=v,
+        kv_dtype=torch.bfloat16,
+        qo_indptr=qo_indptr_cpu.to(device),
+        qo_indptr_cpu=qo_indptr_cpu,
+        kv_seq_lens=kv_lens.to(device),
+        kv_seq_lens_cpu=kv_lens,
+        block_tables=table.to(device),
+        kv_page_indices=kv_page_indices_cpu.to(device),
+        input_form=input_form,
+        page_size=page_size,
+        max_q_len=int(q_lens.max()),
+        max_kv_len=int(kv_lens.max()),
+        num_qo_heads=hq,
+        num_kv_heads=hk,
+        head_dim_qk=d,
+        head_dim_vo=d,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    return p, live_tokens, padding
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn", "trtllm-gen"])
+@pytest.mark.parametrize("input_form", ["block_tables", "page_indices"])
+@pytest.mark.parametrize("style", ["vllm", "sglang"])
+def test_zero_length_kv_rows_are_padding(backend, input_form, style):
+    """kv_len 0 rows are legal padding rows (ledger M11): the call succeeds,
+    reads no page of those rows (page 0 is NaN-poisoned in the vLLM style),
+    their output is finite, and every live row matches the oracle.  Their
+    LSE is unspecified and not compared.  The sglang style (fill 1) is an
+    ordinary batch and must match the oracle on every row."""
+    p, live, padding = _padded_problem(seed=61, input_form=input_form, style=style)
+    _resolve_or_skip(p, backend)
+    _, out, lse = run_unified(p, backend)
+    assert torch.isfinite(out.float()).all()
+    ref_out, ref_lse = reference_paged_prefill(
+        p["q"],
+        p["k_ref"],
+        p["v_ref"],
+        p["qo_indptr_cpu"],
+        p["kv_seq_lens_cpu"],
+        p["block_tables"] if input_form == "block_tables" else None,
+        p["page_size"],
+        True,
+        kv_page_indices=p["kv_page_indices"],
+    )
+    if style == "sglang":
+        live = torch.ones_like(live)
+    live_dev = live.to(out.device)
+    torch.testing.assert_close(out.float()[live_dev], ref_out[live_dev], **OUT_TOL)
+    torch.testing.assert_close(lse[live_dev], ref_lse[live_dev], **LSE_TOL)
+    assert int(padding.sum()) == 2
 
 
 def test_derive_is_sync_free():

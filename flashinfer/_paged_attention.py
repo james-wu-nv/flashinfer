@@ -324,7 +324,9 @@ class PagedAttention:
           several plans over the same batch derive their metadata once.
         - ``num_qo_heads / num_kv_heads / head_dim_qk / head_dim_vo / q_dtype /
           kv_dtype / kv_layout``: the static model configuration.
-        - ``causal``: also enforces ``q_len_i <= kv_len_i`` per request.
+        - ``causal``: also enforces ``q_len_i <= kv_len_i`` per request, except
+          for padding rows (``kv_len_i == 0``, see
+          :class:`PagedAttentionMetadata`).
         - ``window_left``: sliding-window size (-1 = unlimited); backends
           without window support are capability-excluded.  Plan-time because
           it selects a compiled kernel variant on the FA backends.

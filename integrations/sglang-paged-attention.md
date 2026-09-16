@@ -6,10 +6,11 @@ Scope: the **full-sequence paged prefill paths** (no radix-cache hit /
 multimodal / deterministic mode).  Explicitly OUT of the v1 diff:
 - the radix-extend cascade — BOTH halves.  The paged (prefix) half runs
   `causal=False` over `kv = prefix_lens` (`:1390`), and no-prefix requests
-  have prefix_len == 0, i.e. zero-length KV rows — outside the v1 envelope
-  (kv_len >= 1) and with backend-divergent fully-masked-LSE semantics.
-  Migrating it needs either envelope support for zero rows or engine-side
-  filtering; it waits for the ragged follow-up anyway.
+  have prefix_len == 0, i.e. zero-length KV rows.  Those are accepted as
+  padding rows now (finite output, LSE unspecified), but the cascade merge
+  consumes the prefix half's LSE, which the contract does not define for
+  them; it waits for the ragged follow-up anyway.  The CUDA-graph fill
+  value 1 (`get_cuda_graph_seq_len_fill_value`) is an ordinary live row.
 - custom-mask paths (target-verify / multi-item) — capability axis absent
   from the POC; they pin fa2 exactly as today.
 

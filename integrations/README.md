@@ -41,6 +41,7 @@ Engine-side, to carry in the real PRs:
   plan site today — the diff adds that plumbing (host is the origin, so it
   is a copy-forward, not a sync).  The radix-extend cascade's paged half is
   OUT of the v1 envelope (it runs `causal=False` with `kv = prefix_lens`,
-  which contains ZERO rows for no-prefix requests — the envelope requires
-  kv_len >= 1).  `fast_prefill_plan` is CUDA-graph replay machinery and
+  which contains ZERO rows for no-prefix requests — accepted as padding
+  rows, but their LSE is unspecified and the merge needs it).
+  `fast_prefill_plan` is CUDA-graph replay machinery and
   stays until unified's capture mode lands.
