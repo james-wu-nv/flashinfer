@@ -230,6 +230,30 @@ bucket. Calling any of these is the opt-in (an
 `#5007 <https://github.com/flashinfer-ai/flashinfer/issues/5007>`_ for the
 graduation plan.
 
+Benchmarking the unified API
+----------------------------
+
+The shared benchmark CLI provides a ``PagedAttention`` routine::
+
+    python benchmarks/flashinfer_benchmark.py --routine PagedAttention \
+        --backends fa2 cudnn trtllm-gen auto --batch_size 4 --s_qo 128 \
+        --s_kv 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim_qk 128 \
+        --page_size 16 --causal --kv_layout HND --lse_mode basee --refcheck
+
+Every requested backend sees the same inputs (packed Q, a paged K/V pool with
+a shuffled page mapping, exact per-request lengths) and is checked against the
+fp32 oracle before it is timed. The routine reports one CSV row per phase:
+``plan`` (metadata construction plus ``plan()``, synchronized host wall time),
+``run`` (a warmed ``run()`` with preallocated outputs; GPU time under a CUDA
+graph by default, eager with ``--no_cuda_graph``) and ``step`` (one plan
+followed by N ``run()`` calls, N from ``--pa_layers``). Use ``--s_qo 1`` for
+decode, ``--kv_input_form csr`` for flat page indices and
+``--random_actual_seq_len`` for variable lengths. Rows for unsupported,
+failing or incorrect backends are kept with a ``status`` column, and ``auto``
+rows record the resolved backend (``auto`` is a static selection, not
+autotuning). The benchmark generates fp16/bf16 Q and KV; see
+``benchmarks/README.md`` for the columns.
+
 .. currentmodule:: flashinfer.prefill
 
 .. autosummary::
