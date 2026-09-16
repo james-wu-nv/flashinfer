@@ -295,6 +295,10 @@ def run_attention_test(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
+    if args.routine == "PagedAttention":
+        from .paged_attention import testPagedAttention
+
+        return testPagedAttention(args)
     if args.routine == "BatchDecodeWithPagedKVCacheWrapper":
         return testBatchDecodeWithPagedKVCacheWrapper(args)
     elif args.routine == "BatchPrefillWithPagedKVCacheWrapper":
@@ -529,7 +533,52 @@ def parse_attention_args(line, parser):
         "--kv_layout",
         choices=["HND", "NHD"],
         default="HND",
-        help="DSV4 sparse MLA only: layout of both KV-cache pools.",
+        help="KV layout for PagedAttention and DSV4 sparse MLA.",
+    )
+
+    parser.add_argument(
+        "--lse_mode",
+        choices=["none", "base2", "basee"],
+        default="none",
+        help="PagedAttention only: base of the returned LSE ('none' skips the LSE output).",
+    )
+    parser.add_argument(
+        "--kv_input_form",
+        choices=["dense", "csr"],
+        default="dense",
+        help=(
+            "PagedAttention only: 'dense' builds PagedAttentionMetadata.dense "
+            "(vLLM-style block table, page_size >= 8); 'csr' builds .csr "
+            "(sglang-style flat page ids, any page_size)."
+        ),
+    )
+    parser.add_argument(
+        "--window_left",
+        type=int,
+        default=-1,
+        help="PagedAttention only: sliding-window size; -1 disables the window.",
+    )
+    parser.add_argument(
+        "--pa_layers",
+        type=int,
+        nargs="+",
+        default=[1, 32],
+        help=(
+            "PagedAttention only: layer counts N for the step phase (one plan "
+            "followed by N run calls); one CSV row per value."
+        ),
+    )
+    parser.add_argument(
+        "--pa_legacy",
+        action="store_true",
+        default=False,
+        help=(
+            "PagedAttention only: also time the same inputs through the legacy "
+            "public API of each resolved backend (fa2/fa3: "
+            "BatchPrefillWithPagedKVCacheWrapper, cudnn: "
+            "cudnn_batch_prefill_with_kv_cache, trtllm-gen: "
+            "trtllm_batch_context_with_kv_cache) as api_variant=legacy rows."
+        ),
     )
 
     args = parser.parse_args(line)
