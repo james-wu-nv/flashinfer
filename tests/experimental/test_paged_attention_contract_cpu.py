@@ -746,6 +746,8 @@ def _buffers(cap):
     gb.capacity = cap
     gb._device = torch.device("cpu")
     gb.block_tables = None  # reserved on demand by reserve_dense_table()
+    gb.rows = None  # bound by the first run()
+    gb.stream = None  # bound by the first graph-mode plan()
     return gb
 
 
