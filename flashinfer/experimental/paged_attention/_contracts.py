@@ -452,9 +452,11 @@ class PlanMetadata:
 
     Built by the controller after validation; backends receive it together
     with the derived forms (``_planning.Derived``) and must not reach past it
-    into caller state. ``block_tables`` is the dense table — given by the
-    caller or derived — and is ``None`` only when the chosen backend does not
-    need it.
+    into caller state. ``block_tables`` is the dense table — the caller's own
+    (or its copy in reserved graph storage) in the dense input form, derived
+    in the flat form — and is ``None`` only in the flat form when the chosen
+    backend does not read a dense table. In CUDA-graph mode ``max_q_len`` /
+    ``max_kv_len`` are the capacity's values, not the batch's own.
     """
 
     qo_indptr: torch.Tensor

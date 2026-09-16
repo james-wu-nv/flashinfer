@@ -1,4 +1,4 @@
-"""cuDNN backend: cudnn_batch_prefill_with_kv_cache (post-#3921 tokens mode).
+"""cuDNN backend: cudnn_batch_prefill_with_kv_cache (the tokens mode of PR 3921).
 
 Dialect: token-unit indptr as batch offsets (units="tokens"), per-request
 lens as (b,1,1,1).  LSE: cuDNN's native stats are natural-log; with
