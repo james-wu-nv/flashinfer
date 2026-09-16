@@ -10,13 +10,16 @@ Contract under test (``PagedAttention(use_cuda_graph=True)``):
    written.
 4. A plan that fails midway (here: the causal envelope) leaves the previously
    published plan runnable and the reserved buffers untouched — replay still
-   produces the previous batch's answer.
+   produces the previous batch's answer.  This holds for a failure at ANY
+   staging copy: Python never calls ``__exit__`` when ``__enter__`` raises,
+   so ``Transaction.__enter__`` restores the destinations it already wrote.
 5. Re-plan is sync-free when the host mirrors are supplied.
 """
 
 import pytest
 import torch
 
+from flashinfer.experimental.paged_attention._graph import Transaction
 from flashinfer.prefill import PagedAttention
 
 from .paged_attention_reference import reference_paged_prefill
@@ -229,6 +232,106 @@ def test_failed_replan_restores_previous_plan(backend):
     finally:
         active.plan = real_plan
 
+    g.replay()
+    torch.cuda.synchronize()
+    ref_out, ref_lse = _reference(p1)
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+
+class _FakeBuffer:
+    """CPU stand-in for a reserved tensor: records writes, fails on demand."""
+
+    def __init__(self, value, fail=False):
+        self.value, self.fail = value, fail
+
+    def clone(self):
+        return _FakeBuffer(self.value)
+
+    def copy_(self, other, **kwargs):
+        if self.fail:
+            raise RuntimeError("injected copy failure")
+        self.value = other.value
+
+
+@pytest.mark.parametrize("fail_at", [0, 1, 2])
+def test_transaction_enter_restores_earlier_copies(fail_at):
+    """A copy that fails inside ``Transaction.__enter__`` must restore every
+    destination written before it: Python does not call ``__exit__`` when
+    ``__enter__`` raises, so the rollback has to happen right there."""
+    dsts = [_FakeBuffer(i, fail=(i == fail_at)) for i in range(3)]
+    srcs = [_FakeBuffer(10 + i) for i in range(3)]
+    with (
+        pytest.raises(RuntimeError, match="injected"),
+        Transaction(list(zip(dsts, srcs, strict=True))),
+    ):
+        pass
+    assert [d.value for d in dsts] == [0, 1, 2]
+
+
+# dense form: qo_indptr, kv_seq_lens, q_seq_lens, cum_kv_seq_lens,
+# kv_page_indptr, block_tables, kv_page_indices
+_DENSE_STAGING_POSITIONS = 7
+
+
+@pytest.mark.parametrize("fail_at", range(_DENSE_STAGING_POSITIONS))
+def test_failed_staging_copy_restores_previous_plan(fail_at):
+    """Inject a synchronous copy failure (a source of the wrong shape) at each
+    staging position of a graph re-plan: every reserved buffer must hold the
+    previous plan's contents afterwards, the published plan must be the
+    previous one, and the captured graph must still compute the previous
+    batch."""
+    p1 = make_problem(seed=48, **_SHAPE)
+    _resolve_or_skip(p1, "fa2")
+    dev = torch.device(p1["device"])
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    q, k, v = p1["q"].clone(), p1["k_cache"].clone(), p1["v_cache"].clone()
+    out = torch.empty(
+        q.shape[0], p1["num_qo_heads"], p1["head_dim_vo"], dtype=q.dtype, device=dev
+    )
+    lse = torch.empty(q.shape[0], p1["num_qo_heads"], dtype=torch.float32, device=dev)
+    _plan(attn, p1, "fa2")
+    attn.run(q, (k, v), out=out, lse=lse)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        attn.run(q, (k, v), out=out, lse=lse)
+    torch.cuda.synchronize()
+
+    gb = attn._impl._graph
+    meta_before = attn._impl._meta
+    reserved = {
+        name: getattr(gb, name).clone()
+        for name in (
+            "qo_indptr",
+            "kv_seq_lens",
+            "q_seq_lens",
+            "cum_kv_seq_lens",
+            "kv_page_indptr",
+            "block_tables",
+            "kv_page_indices",
+        )
+    }
+    real_targets = gb.targets
+
+    def bad_targets(metadata, fresh):
+        pairs = real_targets(metadata, fresh)
+        assert len(pairs) == _DENSE_STAGING_POSITIONS
+        dst, _ = pairs[fail_at]
+        wrong = torch.zeros(dst.numel() + 1, dtype=dst.dtype, device=dst.device)
+        pairs[fail_at] = (dst, wrong)  # copy_ raises synchronously (no broadcast)
+        return pairs
+
+    gb.targets = bad_targets
+    try:
+        with pytest.raises(RuntimeError):
+            _plan(attn, _sibling_batch(p1, seed=49), "fa2")
+    finally:
+        del gb.targets
+    torch.cuda.synchronize()
+
+    for name, snap in reserved.items():
+        assert torch.equal(getattr(gb, name), snap), f"{name} not restored"
+    assert attn._impl._meta is meta_before
     g.replay()
     torch.cuda.synchronize()
     ref_out, ref_lse = _reference(p1)
