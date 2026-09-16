@@ -1166,3 +1166,70 @@ def test_replan_toggles_padding_rows(backend, input_form):
     plan(a)
     g.replay()
     check(a, live_a)
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups: schedule-upload ordering, capture-row binding, stream
+# binding, the frozen resolution on update(), padding rows in a flat first batch
+# ---------------------------------------------------------------------------
+
+
+def _capture(attn, p, backend, *, rows=None):
+    """plan + warm-up + capture on ``rows``-sized buffers (default: the batch)."""
+    dev = torch.device(p["device"])
+    total = int(p["qo_indptr_cpu"][-1])
+    rows = total if rows is None else rows
+    q = torch.zeros(
+        rows, p["num_qo_heads"], p["head_dim_qk"], dtype=p["dtype"], device=dev
+    )
+    q[:total] = p["q"]
+    k, v = p["k_cache"].clone(), p["v_cache"].clone()
+    out = torch.empty(
+        rows, p["num_qo_heads"], p["head_dim_vo"], dtype=q.dtype, device=dev
+    )
+    lse = torch.empty(rows, p["num_qo_heads"], dtype=torch.float32, device=dev)
+    _plan(attn, p, backend)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            attn.run(q, (k, v), out=out, lse=lse)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        attn.run(q, (k, v), out=out, lse=lse)
+    return g, q, k, v, out, lse
+
+
+def test_update_waits_for_the_previous_schedule_upload():
+    """The fa wrapper uploads every plan's kernel schedule from ONE pinned
+    host buffer with an asynchronous copy.  With the device lagging, the
+    sequence update(A); replay; update(B); replay must not let B's plan
+    rewrite the host buffer before A's upload executed — or replay A runs
+    with B's schedule (request/tile indices, merge offsets) and is wrong."""
+    p1 = make_problem(seed=90, **_SHAPE)
+    _resolve_or_skip(p1, "fa2")
+    attn = PagedAttention(torch.device(p1["device"]), use_cuda_graph=True)
+    g, q, k, v, out, lse = _capture(attn, p1, "fa2")
+    p2 = _sibling_batch(p1, seed=91)
+    total = int(p1["qo_indptr_cpu"][-1])
+    ref1, ref2 = _reference(p1), _reference(p2)
+    for _ in range(3):
+        q.copy_(p1["q"])
+        k.copy_(p1["k_cache"])
+        v.copy_(p1["v_cache"])
+        torch.cuda.synchronize()
+        torch.cuda._sleep(200_000_000)  # the device falls behind the host
+        attn.update(make_metadata(p1))
+        g.replay()
+        out_a, lse_a = out.clone(), lse.clone()  # stream-ordered snapshot of A
+        q.copy_(p2["q"])
+        k.copy_(p2["k_cache"])
+        v.copy_(p2["v_cache"])
+        attn.update(make_metadata(p2))  # must wait for A's upload
+        g.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out_a[:total].float(), ref1[0], **OUT_TOL)
+        torch.testing.assert_close(lse_a[:total], ref1[1], **LSE_TOL)
+        torch.testing.assert_close(out[:total].float(), ref2[0], **OUT_TOL)
+        torch.testing.assert_close(lse[:total], ref2[1], **LSE_TOL)
