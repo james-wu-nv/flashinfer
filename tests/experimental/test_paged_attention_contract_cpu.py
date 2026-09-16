@@ -34,6 +34,7 @@ from flashinfer.experimental.paged_attention import (
     GraphCapacity,
     PagedAttentionMetadata,
     _selection,
+    heuristic_order,
     resolve_paged_attention,
 )
 from flashinfer.experimental.paged_attention._contracts import (
@@ -102,6 +103,7 @@ KEY_KW = dict(
     logits_soft_cap=None,
     custom_mask=False,
     sinks=False,
+    max_q_len=None,
     cc_major=9,
     cc_minor=None,
     device_index=None,
@@ -122,6 +124,7 @@ KEY_DRIFT = dict(
     logits_soft_cap=30.0,
     custom_mask=True,
     sinks=True,
+    max_q_len=4,
     cc_major=10,
     cc_minor=0,
     device_index=1,
@@ -147,6 +150,7 @@ def test_resolve_config_key_layout_is_pinned():
         None,  # logits_soft_cap
         False,  # custom mask
         False,  # sinks
+        None,  # max_q_len hint (None = no hint: default order)
         (9, None, None),  # device binding: (cc_major, cc_minor, device_index)
     )
 
@@ -203,15 +207,18 @@ def test_resolution_is_frozen_and_config_matches_key(no_probes):
         None,
         False,
         False,
+        None,  # max_q_len hint
         9,
         None,
         None,
     )
+    assert res.max_q_len is None
     assert res.chosen == res.backends[0]
     with pytest.raises(dataclasses.FrozenInstanceError):
         res.backends = ()
     text = res.explain()
     assert "candidates" in text
+    assert "max_q_len hint: none" in text
     assert all(name in text for name in res.excluded)
 
 
@@ -370,8 +377,9 @@ def test_capability_rejection_reason_matrix(backend, label, over, expected):
 @pytest.mark.parametrize("cc_major", sorted(HEURISTIC_ORDER))
 def test_auto_orders_by_heuristic_and_explains_every_backend(no_probes, cc_major):
     res = _resolve(cc_major)
+    # no hint: the default bucket of the table (today's order)
     expected = tuple(
-        n for n in HEURISTIC_ORDER[cc_major] if _reason(n, cc_major=cc_major) is None
+        n for n in heuristic_order(cc_major) if _reason(n, cc_major=cc_major) is None
     )
     assert res.backends == expected
     assert set(res.backends) | set(res.excluded) == set(CAPABILITIES)
@@ -451,13 +459,107 @@ def test_heuristic_order_covers_declared_cc_majors():
     assert declared <= set(HEURISTIC_ORDER), (
         f"cc majors without a preference order: {sorted(declared - set(HEURISTIC_ORDER))}"
     )
-    for cc, order in HEURISTIC_ORDER.items():
-        assert len(set(order)) == len(order), (cc, order)
+    for cc, buckets in HEURISTIC_ORDER.items():
         declared_here = {n for n, cap in CAPABILITIES.items() if cc in cap.cc_majors}
-        assert set(order) == declared_here, (
-            f"sm_{cc}x order {order} != backends declaring sm_{cc}x "
-            f"{sorted(declared_here)}"
+        bounds = [bound for bound, _ in buckets]
+        # ascending max_q_len bounds, the default (None) last and only last
+        assert bounds[-1] is None and None not in bounds[:-1], (cc, bounds)
+        assert all(isinstance(b, int) and b >= 1 for b in bounds[:-1]), (cc, bounds)
+        assert bounds[:-1] == sorted(bounds[:-1]) and len(set(bounds)) == len(bounds), (
+            cc,
+            bounds,
         )
+        for bound, order in buckets:
+            assert len(set(order)) == len(order), (cc, bound, order)
+            # every bucket ranks the SAME backends: the hint changes the
+            # order, never the candidate set
+            assert set(order) == declared_here, (
+                f"sm_{cc}x order {order} (max_q_len <= {bound}) != backends "
+                f"declaring sm_{cc}x {sorted(declared_here)}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# the max_q_len hint: bucketed order, pinned in the key, shown by explain()
+# ---------------------------------------------------------------------------
+
+
+def _bucketed_ccs():
+    return sorted(cc for cc, buckets in HEURISTIC_ORDER.items() if len(buckets) > 1)
+
+
+def test_heuristic_order_lookup_walks_the_buckets():
+    for cc, buckets in HEURISTIC_ORDER.items():
+        default = buckets[-1][1]
+        assert heuristic_order(cc) == default
+        assert heuristic_order(cc, None) == default
+        for i, (bound, order) in enumerate(buckets[:-1]):
+            prev = buckets[i - 1][0] if i else 0
+            assert heuristic_order(cc, prev + 1) == order, (cc, prev + 1)
+            assert heuristic_order(cc, bound) == order, (cc, bound)
+            assert heuristic_order(cc, bound + 1) != order or (
+                buckets[i + 1][1] == order
+            ), (cc, bound + 1)
+        top = buckets[-2][0] if len(buckets) > 1 else 0
+        assert heuristic_order(cc, top + 1) == default
+        assert heuristic_order(cc, 1 << 20) == default
+    assert heuristic_order(7) == ()
+    assert heuristic_order(7, 1) == ()
+
+
+@pytest.mark.parametrize("cc_major", _bucketed_ccs())
+def test_max_q_len_hint_selects_the_bucket_order(no_probes, cc_major):
+    """sm_100 (B200) measured: fa2 beats the trtllm-gen / cake context
+    kernels at decode and speculative query lengths (5x at q=1), so a hint
+    at or below the bucket bound puts fa2 first; above it, and with no hint,
+    the order is today's."""
+    bound = HEURISTIC_ORDER[cc_major][0][0]
+    plain = _resolve(cc_major)
+    small = _resolve(cc_major, max_q_len=1)
+    edge = _resolve(cc_major, max_q_len=bound)
+    above = _resolve(cc_major, max_q_len=bound + 1)
+
+    def runnable(order):
+        return tuple(n for n in order if _reason(n, cc_major=cc_major) is None)
+
+    assert small.backends == runnable(heuristic_order(cc_major, 1))
+    assert edge.backends == small.backends
+    assert above.backends == plain.backends == runnable(heuristic_order(cc_major))
+    assert small.backends != plain.backends
+    # the hint changes the order only: same candidate set, same exclusions
+    assert set(small.backends) == set(plain.backends)
+    assert small.excluded == plain.excluded
+    # pinned: distinct keys per hint, everything but the hint slot identical
+    assert small.max_q_len == 1 and edge.max_q_len == bound and plain.max_q_len is None
+    assert small.config != plain.config and small.config != edge.config
+    assert small.config[:-2] == plain.config[:-2]
+    assert small.config[-1] == plain.config[-1]
+    assert small.config[-2] == 1
+    # explain() shows the hint
+    assert (
+        "max_q_len hint: 1 (order for batches with at most 1 query" in small.explain()
+    )
+    assert "max_q_len hint: none (default order)" in plain.explain()
+
+
+def test_sm100_small_q_bucket_puts_fa2_first(no_probes):
+    """The measured decode regret (PLAN §4 last row; WP-G / WP-K): B=32, q=1,
+    kv=4096 on B200 ran 455 us on trtllm-gen against 91 us on fa2."""
+    assert _resolve(10, max_q_len=1).chosen == "fa2"
+    assert _resolve(10).chosen == "trtllm-gen"
+    assert _resolve(10, max_q_len=1 << 12).chosen == "trtllm-gen"
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, True, "1"])
+def test_max_q_len_hint_is_validated(no_probes, bad):
+    with pytest.raises(ValueError, match="max_q_len must be None"):
+        _resolve(10, max_q_len=bad)
+
+
+def test_max_q_len_hint_with_an_explicit_backend_is_pinned_only(no_probes):
+    res = _resolve(10, backend="cudnn", max_q_len=2)
+    assert res.backends == ("cudnn",)
+    assert res.max_q_len == 2 and res.config[-2] == 2
 
 
 # ---------------------------------------------------------------------------

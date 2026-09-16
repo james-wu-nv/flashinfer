@@ -11,7 +11,12 @@ import types
 import pytest
 import torch
 
-from flashinfer.experimental.paged_attention import GraphCapacity, Resolution
+from flashinfer.experimental.paged_attention import (
+    HEURISTIC_ORDER,
+    GraphCapacity,
+    Resolution,
+    heuristic_order,
+)
 from flashinfer.experimental.paged_attention._backends import (
     cudnn_backend,
     fa_backend,
@@ -286,18 +291,18 @@ def test_features_exclude_backends_with_reasons():
     assert res.excluded["cudnn"] == "logits soft cap not supported"
     assert res.excluded["trtllm-gen"] == "logits soft cap not supported"
     assert "fa2" in res.backends
-    assert res.config[-4:-1] == (30.0, False, False)
+    assert res.config[-5:-2] == (30.0, False, False)
 
     res = resolve_paged_attention(cc_major=9, custom_mask=True, **_CFG)
     assert res.excluded["fa3"] == "custom attention mask not supported"
     assert res.excluded["cudnn"] == "custom attention mask not supported"
     assert res.backends == ("fa2",)
-    assert res.config[-4:-1] == (None, True, False)
+    assert res.config[-5:-2] == (None, True, False)
 
     res = resolve_paged_attention(cc_major=10, sinks=True, **_CFG)
     assert res.excluded["cudnn"] == "attention sinks not supported"
     assert set(res.backends) == {"trtllm-gen", "cake", "fa2"}
-    assert res.config[-4:-1] == (None, False, True)
+    assert res.config[-5:-2] == (None, False, True)
 
     # a configuration only cuDNN could run + a feature cuDNN lacks: loud
     with pytest.raises(ValueError, match="cudnn: logits soft cap not supported"):
@@ -333,3 +338,146 @@ def test_trtllm_gen_noncausal_is_declared_but_not_with_a_window():
     )
     assert "cudnn" in res.excluded  # no window at all
     assert res.backends == ("fa2",)
+
+
+# --------------------------------------------------------------------------
+# the max_q_len hint: order bucket on this device, pinned, checked by plan()
+# --------------------------------------------------------------------------
+
+
+def _hint_bound_or_skip(cc_major):
+    buckets = HEURISTIC_ORDER.get(cc_major, ())
+    if len(buckets) < 2:
+        pytest.skip(f"sm_{cc_major}x has a single preference order (no q_len bucket)")
+    return buckets[0][0]
+
+
+def _runnable(res, order):
+    return tuple(n for n in order if n in res.backends)
+
+
+@needs_cuda
+def test_max_q_len_hint_changes_the_order_on_this_device():
+    """Below the bucket bound the hinted Resolution ranks fa2 first; above it,
+    and without a hint, the order is today's.  The hint is pinned in the key
+    and shown by explain(); the candidate set and exclusions do not move."""
+    dev = torch.device("cuda", 0)
+    cc_major = torch.cuda.get_device_properties(dev).major
+    bound = _hint_bound_or_skip(cc_major)
+    plain = resolve_paged_attention(device=dev, **_CFG)
+    small = resolve_paged_attention(device=dev, max_q_len=1, **_CFG)
+    edge = resolve_paged_attention(device=dev, max_q_len=bound, **_CFG)
+    above = resolve_paged_attention(device=dev, max_q_len=bound + 1, **_CFG)
+    if len(plain.backends) < 2:
+        pytest.skip("needs two runnable candidates to observe an order")
+
+    assert plain.backends == _runnable(plain, heuristic_order(cc_major))
+    assert small.backends == _runnable(small, heuristic_order(cc_major, 1))
+    assert edge.backends == small.backends
+    assert above.backends == plain.backends
+    assert set(small.backends) == set(plain.backends)
+    assert small.excluded == plain.excluded
+    if "fa2" in plain.backends:
+        assert small.chosen == "fa2"
+        assert small.backends != plain.backends
+    assert small.max_q_len == 1 and plain.max_q_len is None
+    assert small.config != plain.config and small.config[:-2] == plain.config[:-2]
+    assert small.device_binding == plain.device_binding
+    assert (
+        "max_q_len hint: 1 (order for batches with at most 1 query" in small.explain()
+    )
+    assert "max_q_len hint: none (default order)" in plain.explain()
+
+
+@needs_cuda
+def test_no_hint_keeps_the_default_order_and_plan_honours_the_hint():
+    p = make_problem(seed=89, uniform_q1=True, **dict(_SHAPE, max_q=1))
+    res_plain = _resolve_or_skip(p, "auto")
+    dev = torch.device(p["device"])
+    cc_major = torch.cuda.get_device_properties(dev).major
+    assert res_plain.backends == _runnable(res_plain, heuristic_order(cc_major))
+    _hint_bound_or_skip(cc_major)
+    res_hint = resolve_paged_attention(
+        device=dev,
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim_qk"],
+        q_dtype=p["dtype"],
+        page_size=p["page_size"],
+        causal=True,
+        need_lse=True,
+        max_q_len=1,
+    )
+    attn = PagedAttention(dev)
+    attn.plan(make_metadata(p), backend=res_hint, **_plan_kw(p))
+    # plan() walks the hinted order: the first candidate that accepts the batch
+    assert attn.backend == res_hint.backends[0]
+    assert "max_q_len hint: 1" in attn.explain()
+    # the same batch under the plain Resolution follows today's order
+    attn.plan(make_metadata(p), backend=res_plain, **_plan_kw(p))
+    assert attn.backend == res_plain.backends[0]
+    assert "max_q_len hint: none" in attn.explain()
+    out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]))
+    assert torch.isfinite(out.float()).all() and torch.isfinite(lse).all()
+
+
+@needs_cuda
+def test_plan_rejects_a_batch_above_the_hint():
+    """The hint is a promise about the batches: a batch (eager) or a graph
+    capacity whose max_q_len exceeds it is refused before any state moves;
+    a batch within the hint plans normally."""
+    p = make_problem(seed=97, **_SHAPE)  # max_q 16
+    _resolve_or_skip(p, "auto")
+    dev = torch.device(p["device"])
+    _hint_bound_or_skip(torch.cuda.get_device_properties(dev).major)
+
+    def resolve(hint):
+        return resolve_paged_attention(
+            device=dev,
+            num_qo_heads=p["num_qo_heads"],
+            num_kv_heads=p["num_kv_heads"],
+            head_dim_qk=p["head_dim_qk"],
+            q_dtype=p["dtype"],
+            page_size=p["page_size"],
+            causal=True,
+            need_lse=True,
+            max_q_len=hint,
+        )
+
+    md = make_metadata(p)
+    attn = PagedAttention(dev)
+    with pytest.raises(ValueError, match=r"max_q_len \d+ of this batch exceeds"):
+        attn.plan(md, backend=resolve(1), **_plan_kw(p))
+    assert attn.backend is None
+    attn.plan(md, backend=resolve(p["max_q_len"]), **_plan_kw(p))
+    assert attn.backend is not None
+    # graph mode: the CAPACITY is what the kernels are planned with, so it is
+    # what the hint is checked against, and nothing is reserved on rejection
+    cap = GraphCapacity.from_metadata(md)
+    g = PagedAttention(dev, graph_capacity=cap)
+    with pytest.raises(ValueError, match="of this graph capacity exceeds"):
+        g.plan(md, backend=resolve(1), **_plan_kw(p))
+    assert g.backend is None
+    gb = g._impl._graph
+    for buf in (gb.qo_indptr, gb.kv_seq_lens, gb.block_tables, gb.kv_page_indices):
+        assert buf is None or not buf.any(), (
+            "reserved storage written before the hint check"
+        )
+    g.plan(md, backend=resolve(cap.max_q_len), **_plan_kw(p))
+    assert g.backend is not None
+
+
+def test_max_q_len_hint_is_keyed_and_validated_without_a_gpu():
+    """CPU variant (explicit cc_major): the hint slot sits right before the
+    device binding, distinct hints give distinct keys, and the value is
+    validated like the other host scalars."""
+    plain = resolve_paged_attention(cc_major=10, **_CFG)
+    one = resolve_paged_attention(cc_major=10, max_q_len=1, **_CFG)
+    big = resolve_paged_attention(cc_major=10, max_q_len=4096, **_CFG)
+    assert plain.config[-2] is None and one.config[-2] == 1 and big.config[-2] == 4096
+    assert len({plain.config, one.config, big.config}) == 3
+    assert one.backends[0] == "fa2" and plain.chosen == big.chosen == "trtllm-gen"
+    assert set(one.backends) == set(plain.backends) == set(big.backends)
+    for bad in (0, -3, 2.0, False, "8"):
+        with pytest.raises(ValueError, match="max_q_len must be None"):
+            resolve_paged_attention(cc_major=10, max_q_len=bad, **_CFG)
