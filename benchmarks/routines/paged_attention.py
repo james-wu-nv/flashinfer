@@ -484,6 +484,7 @@ def _bench_unified(args, case, backend, ctx):
             window_left=args.window_left,
             need_lse=args.lse_mode != "none",
             kv_input_form=ctx["kv_input_form_api"],
+            max_q_len=args.pa_max_q_len_hint,
             backend=backend,
             **ctx["static_kwargs"],
         )
