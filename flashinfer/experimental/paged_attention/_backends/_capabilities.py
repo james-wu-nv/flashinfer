@@ -292,7 +292,10 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         supports_noncausal=True,
         supports_window=True,
         supports_window_noncausal=False,  # shared front door with trtllm-gen
-        requires_contiguous_q=True,
+        # measured on B200 (2026-09-16): fused-QKV head slice, head-stride gap
+        # and storage offset all match the oracle (the binding forwards the
+        # token and head strides, like trtllm-gen)
+        requires_contiguous_q=False,
         needs_dense=True,
         supports_logits_soft_cap=False,
         supports_custom_mask=False,

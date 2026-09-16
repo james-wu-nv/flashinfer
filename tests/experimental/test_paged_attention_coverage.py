@@ -49,8 +49,8 @@ from .test_paged_attention_prototype import (
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 DEVICE = "cuda:0"
-BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen", "auto"]
-EXPLICIT_BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen"]
+BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen", "cake", "auto"]
+EXPLICIT_BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen", "cake"]
 FP8 = torch.float8_e4m3fn
 CANARY = -7.0  # exactly representable in bf16 / fp16 / fp32
 
@@ -829,6 +829,7 @@ _WIDE_TABLE_BACKENDS = [
     "fa2",
     "fa3",
     "cudnn",
+    "cake",
     "trtllm-gen",
     "auto",
 ]
