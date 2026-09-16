@@ -701,6 +701,57 @@ def test_host_derivation_matches_device_reference(input_form):
         assert torch.equal(d.block_tables[i, :n], p["block_tables"][i, :n])
 
 
+def _gpu_activity(fn):
+    """Names of the GPU-side events one call enqueues (kernels + memcpys)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    return [
+        e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
+    ]
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn", "trtllm-gen"])
+@pytest.mark.parametrize("input_form", ["block_tables", "page_indices"])
+def test_warm_plan_uploads_from_pinned_memory_only(backend, input_form):
+    """A warm plan() must never upload from pageable host memory: such a
+    non_blocking copy is a blocking staging copy on the host (ledger M6).
+    Every host array the generated-FA wrapper uploads is a pinned view of the
+    derivation staging, and the dense backends' one upload is that staging."""
+    p = make_problem(
+        seed=37,
+        batch_size=4,
+        max_q=16,
+        max_kv=200,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+        input_form=input_form,
+    )
+    res = _resolve_or_skip(p, backend)
+    attn = PagedAttention(torch.device(p["device"]))
+    spec = dict(
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim_qk"],
+        q_dtype=p["dtype"],
+        causal=True,
+        lse_mode="base2",
+        backend=res,
+    )
+    for _ in range(2):  # warm: JIT load, first-plan allocations
+        attn.plan(make_metadata(p), **spec)
+    events = _gpu_activity(lambda: attn.plan(make_metadata(p), **spec))
+    pageable = [e for e in events if "Pageable" in e]
+    assert not pageable, f"pageable memcpy in a warm plan: {pageable}"
+    assert not any("DtoH" in e for e in events), events  # zero-sync plan
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 @pytest.mark.parametrize("window_left", [0, 16, 127])
 def test_paged_attention_sliding_window(backend, window_left):
