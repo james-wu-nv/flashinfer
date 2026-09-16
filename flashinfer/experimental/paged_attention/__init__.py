@@ -10,7 +10,8 @@ Layout (mirrors ``flashinfer/mla/_batch_mla/``):
     _contracts.py    PlanMetadata, Resolution, loud-error helpers
     _planning.py     structural/value validation, canonical -> derived forms
     _selection.py    tensor-free resolve_paged_attention() (level-1 selection)
-    _controller.py   plan()/run() lifecycle, transactional publication
+    _controller.py   plan()/update()/run() lifecycle, transactional publication
+    _graph.py        GraphCapacity, reserved storage and staging for CUDA graphs
     _backends/       one module per backend + declarative capabilities
 
 Reject-or-correct is the property the whole package is built around: any
