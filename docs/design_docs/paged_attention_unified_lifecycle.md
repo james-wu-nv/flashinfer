@@ -482,7 +482,7 @@ backend: `cc_majors`, `q_dtypes`, `kv_dtypes`, `head_dims` (pairs),
 `page_sizes` (`None` = any at or above the global floor), `kv_layouts`,
 `supports_lse`, `supports_noncausal`, `supports_window`,
 `supports_window_noncausal`, `requires_contiguous_q`, `needs_dense`,
-`lse_native`, `supports_logits_soft_cap`, `supports_custom_mask`,
+`supports_logits_soft_cap`, `supports_custom_mask`,
 `supports_sinks`. The rule is capability honesty: an admitted configuration
 is one the conformance matrix and fuzzer exercise on hardware.
 

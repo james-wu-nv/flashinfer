@@ -87,13 +87,6 @@ class PagedAttentionCapabilities:
     # True if the backend consumes the dense block table (derivation from the
     # flat-indices input form is forbidden below page_size 8 — table blowup)
     needs_dense: bool = False
-    # native LSE format (descriptive; the backend normalizes to the contract):
-    #   "base2_tokens_h"   — packed (tokens, h) in base 2: the contract already
-    #   "base2_padded_bsh" — padded (b, max_q, h) native stats in the base the
-    #                        backend requests; the backend writes them packed
-    #                        where the library supports ragged stats offsets
-    #                        and gathers otherwise (cudnn_backend.py)
-    lse_native: str = "base2_tokens_h"
     # Explicit-False feature axes: a backend that cannot apply a requested
     # feature is EXCLUDED here so `auto` never drops the feature silently.
     #   logits soft cap:  cap * tanh(score / cap) on the scaled scores
@@ -242,7 +235,6 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         # is silently wrong (native probe, B200); a storage offset is fine.
         requires_contiguous_q=True,
         needs_dense=True,
-        lse_native="base2_padded_bsh",
         # the cuDNN SDPA graph path exposes none of the three
         supports_logits_soft_cap=False,
         supports_custom_mask=False,
