@@ -151,8 +151,13 @@ class HostArrays:
         np.floor_divide(kv + (page_size - 1), page_size, out=pages)
         st[o_pi] = 0
         np.cumsum(pages, out=st[o_pi + 1 : o_pg])
-        # last page occupancy; a kv_len of 0 (no pages) yields page_size,
-        # which the FA kernels never read (get_length() returns 0 first)
+        # last page occupancy.  PADDING ROWS (kv_len 0, no pages) get
+        # page_size by this formula, and that is the convention: the FA
+        # kernels never read it (page.cuh get_length() returns 0 when
+        # indptr[i] == indptr[i+1]) and the legacy wrapper's own
+        # get_seq_lens(), (pages - 1) * page_size + last, then also yields 0
+        # for the row (vLLM's 0 would give -page_size there).  Pinned by
+        # test_padding_row_last_page_len_convention.
         np.subtract(kv, (pages - 1) * page_size, out=st[o_ll:o_kv])
         st[o_kv:total] = kv
         self._device: Optional[torch.Tensor] = None
@@ -303,6 +308,8 @@ def validate_values(
             f"kv_seq_lens must be >= 0 (request {bad} has {int(kv[bad])}); "
             "0 marks a padding row"
         )
+    # padding rows (kv 0) need no exemption below: 0 is within every max and
+    # every capacity, and they contribute 0 pages to the CSR total
     kv_max = int(kv.max())
     _expect(
         kv_max <= max_kv_len,
@@ -360,6 +367,10 @@ def derive(
     device: torch.device,
 ) -> Derived:
     """Canonical -> the derived forms in ``needs`` (see ``DERIVED_FORMS``).
+
+    ``max_kv_len`` sizes the dense table derived from flat page ids
+    (``ceil(max_kv_len / page_size)`` columns); graph mode passes the
+    capture capacity so the derived table matches the reserved storage.
 
     Zero sync; nothing outside ``needs`` is computed (ledger M7: the dense
     input used to pay the CSR compaction for every backend).  The length

@@ -51,6 +51,7 @@ from .test_paged_attention_prototype import (
     BACKENDS,
     LSE_TOL,
     OUT_TOL,
+    _padded_problem,
     _resolve_or_skip,
     make_metadata,
     make_problem,
@@ -1064,3 +1065,97 @@ def test_targets_skip_derived_forms_not_produced():
     assert len(partial) == len(full) - 1
     assert all(src is not None for _, src in partial)
     assert not any(dst is gb.q_seq_lens for dst, _ in partial)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("input_form", ["block_tables", "page_indices"])
+def test_replan_toggles_padding_rows(backend, input_form):
+    """Graph mode: the capture batch stays fixed (batch size, total query
+    tokens, maxes, table width) while a row toggles between live and padding
+    (kv_len 0) across re-plans - what an engine's graph bucket sees as
+    requests come and go.  Each replay computes the live rows of the batch
+    it was re-planned for; padding rows stay finite."""
+    pool = 24
+    a, live_a, pad_a = _padded_problem(
+        seed=71,
+        input_form=input_form,
+        style="vllm",
+        kv_lens=(37, 20, 64, 0, 9),
+        pool=pool,
+    )
+    b, live_b, pad_b = _padded_problem(
+        seed=73,
+        input_form=input_form,
+        style="vllm",
+        kv_lens=(37, 0, 64, 12, 9),
+        pool=pool,
+    )
+    assert int(pad_a[3]) and int(pad_b[1]) and a["max_kv_len"] == b["max_kv_len"]
+    _resolve_or_skip(a, backend)
+    dev = torch.device(a["device"])
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    q, k, v = a["q"].clone(), a["k_cache"].clone(), a["v_cache"].clone()
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[0], a["num_qo_heads"], dtype=torch.float32, device=dev)
+
+    def plan(p):
+        attn.plan(
+            make_metadata(p),
+            num_qo_heads=p["num_qo_heads"],
+            num_kv_heads=p["num_kv_heads"],
+            head_dim_qk=p["head_dim_qk"],
+            q_dtype=p["dtype"],
+            causal=True,
+            lse_mode="base2",
+            backend=backend,
+        )
+
+    def reference(p):
+        return reference_paged_prefill(
+            p["q"],
+            p["k_ref"],
+            p["v_ref"],
+            p["qo_indptr_cpu"],
+            p["kv_seq_lens_cpu"],
+            p["block_tables"] if input_form == "block_tables" else None,
+            p["page_size"],
+            True,
+            kv_page_indices=p["kv_page_indices"],
+        )
+
+    def check(p, live):
+        torch.cuda.synchronize()
+        assert torch.isfinite(out.float()).all()
+        ref_out, ref_lse = reference(p)
+        m = live.to(dev)
+        torch.testing.assert_close(out.float()[m], ref_out[m], **OUT_TOL)
+        torch.testing.assert_close(lse[m], ref_lse[m], **LSE_TOL)
+
+    plan(a)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            attn.run(q, (k, v), out=out, lse=lse)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        attn.run(q, (k, v), out=out, lse=lse)
+    g.replay()
+    check(a, live_a)
+
+    # row 1 live -> padding, row 3 padding -> live; same capture shapes
+    q.copy_(b["q"])
+    k.copy_(b["k_cache"])
+    v.copy_(b["v_cache"])
+    plan(b)
+    g.replay()
+    check(b, live_b)
+
+    # and back
+    q.copy_(a["q"])
+    k.copy_(a["k_cache"])
+    v.copy_(a["v_cache"])
+    plan(a)
+    g.replay()
+    check(a, live_a)
