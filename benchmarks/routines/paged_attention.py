@@ -77,7 +77,7 @@ from .flashinfer_benchmark_utils import (
     print_perf_metrics,
 )
 
-PAGED_ATTENTION_BACKENDS = ("fa2", "fa3", "cudnn", "trtllm-gen", "auto")
+PAGED_ATTENTION_BACKENDS = ("fa2", "fa3", "cudnn", "trtllm-gen", "cake", "auto")
 LN2 = math.log(2.0)
 # Same tolerances as tests/experimental/test_paged_attention_prototype.py.
 OUT_TOL = dict(rtol=2e-2, atol=2e-2)
@@ -223,7 +223,27 @@ def _make_metadata(case, kv_input_form):
 
 def _error_status(exc):
     first_line = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+    if _is_typed_unsupported(exc):
+        return f"unsupported: {first_line[:240]}"
     return f"error: {type(exc).__name__}: {first_line[:240]}"
+
+
+def _is_typed_unsupported(exc):
+    """True for the facade's typed plan-time rejection (a candidate's
+    ``preflight()`` declined the batch): raised as-is by an explicit backend
+    plan, chained under the ``ValueError`` the candidate walk raises when
+    every pinned candidate declined.  Anything else stays an error row."""
+    from flashinfer.experimental.paged_attention._backends import (
+        _BackendPlanUnsupportedError,
+    )
+
+    if isinstance(exc, _BackendPlanUnsupportedError):
+        return True
+    if isinstance(exc, ValueError):
+        if isinstance(exc.__cause__, _BackendPlanUnsupportedError):
+            return True
+        return str(exc).startswith("no pinned candidate can plan this batch")
+    return False
 
 
 def _check_against_oracle(out, lse, ref_out, ref_lse, lse_mode):
@@ -678,9 +698,11 @@ class _LegacyTrtllmProvider:
     derivation is the cumulative KV length vector.
     """
 
-    name = "trtllm-gen"
-
-    def __init__(self, args, case, ctx):
+    def __init__(self, args, case, ctx, product="trtllm-gen"):
+        # ``product`` selects the kernel family behind the shared front door:
+        # "trtllm-gen" or "cake" (SM100/103), the same choice the unified
+        # backend of that name makes.
+        self.name = product
         self.args, self.case, self.ctx = args, case, ctx
         self.cum_kv_seq_lens = None
         self.last_lse = None
@@ -714,6 +736,7 @@ class _LegacyTrtllmProvider:
             causal=args.causal,
             lse=lse,
             return_lse=need_lse,
+            backend=self.name,  # trtllm-gen or cake
         )
         if need_lse:
             out, self.last_lse = result
@@ -739,7 +762,7 @@ def _bench_legacy(args, case, backend, ctx):
     phases = _PhaseRows(
         args, case, backend, "legacy", ctx["timing_metric"], ctx["head_dim_vo"]
     )
-    if backend in ("cudnn", "trtllm-gen") and args.kv_input_form != "dense":
+    if backend in ("cudnn", "trtllm-gen", "cake") and args.kv_input_form != "dense":
         phases.set_all(
             f"unsupported: the legacy {backend} API takes a dense block table; "
             "use --kv_input_form dense for this comparison"
@@ -757,8 +780,8 @@ def _bench_legacy(args, case, backend, ctx):
             provider = _LegacyFaProvider(backend, args, case, ctx)
         elif backend == "cudnn":
             provider = _LegacyCudnnProvider(args, case, ctx)
-        else:
-            provider = _LegacyTrtllmProvider(args, case, ctx)
+        else:  # trtllm-gen or cake: one front door, the product selects the kernels
+            provider = _LegacyTrtllmProvider(args, case, ctx, product=backend)
         ctx["workspace"].zero_()
         provider.plan()
         got_out, got_lse = run_once(

@@ -340,6 +340,7 @@ def parse_attention_args(line, parser):
             "cudnn-native",
             "cutlass",
             "trtllm-gen",
+            "cake",  # PagedAttention candidate on SM100/103 (trtllm-gen dialect)
             "trtllm-native",
             "trtllm-fmha-v2",
             "trtllm-gen-native",  # Deprecated, will be removed in future
