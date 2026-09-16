@@ -139,7 +139,15 @@ class GraphBuffers:
 class Transaction:
     """Snapshot/restore for a set of (destination, source) copies plus any
     follow-on work; ``commit()`` drops the snapshots, leaving the context
-    without committing restores every destination."""
+    without committing restores every destination.
+
+    The staging copies run inside ``__enter__``.  Python does not call
+    ``__exit__`` when ``__enter__`` itself raises, so a copy that fails midway
+    (a source of the wrong shape or dtype is the synchronous case) is rolled
+    back right there: every destination written so far is restored from its
+    snapshot before the error propagates.  Asynchronous CUDA execution
+    failures are outside this guarantee, as for every sync-free protocol.
+    """
 
     def __init__(self, pairs: List[Tuple[torch.Tensor, torch.Tensor]]):
         self._pairs = pairs
@@ -147,9 +155,21 @@ class Transaction:
         self._committed = False
 
     def __enter__(self) -> "Transaction":
-        self._snapshots = [dst.clone() for dst, _ in self._pairs]
-        for dst, src in self._pairs:
-            dst.copy_(src, non_blocking=True)
+        snapshots = [dst.clone() for dst, _ in self._pairs]
+        written = 0
+        try:
+            for dst, src in self._pairs:
+                dst.copy_(src, non_blocking=True)
+                written += 1
+        except Exception:
+            # restore every destination touched, including the one whose copy
+            # raised (a synchronous failure leaves it unwritten; restoring it
+            # from its own snapshot is harmless either way)
+            touched = self._pairs[: written + 1]
+            for (dst, _), snap in zip(touched, snapshots[: len(touched)], strict=True):
+                dst.copy_(snap)
+            raise
+        self._snapshots = snapshots
         return self
 
     def commit(self) -> None:
