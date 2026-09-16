@@ -574,8 +574,6 @@ def test_derive_is_sync_free():
     """The derivation layer must not synchronize (proposal P1 acceptance:
     with mirrors, plan() is zero-D2H).  Guards against masked-select /
     repeat_interleave style data-dependent-size ops sneaking back in."""
-    from flashinfer.experimental.paged_attention import derive as _derive
-
     p = make_problem(
         seed=31,
         batch_size=6,
@@ -587,32 +585,16 @@ def test_derive_is_sync_free():
         page_size=16,
         dtype=torch.bfloat16,
     )
+    md_dense = make_metadata(p)
+    md_csr = make_metadata(dict(p, input_form="page_indices"))
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        d = _derive(
-            p["qo_indptr"],
-            p["kv_seq_lens"],
-            p["block_tables"],
-            None,
-            p["page_size"],
-            p["max_kv_len"],
-            needs={"kv_page_indices", "kv_page_indptr", "cum_kv_seq_lens"},
-            qo_indptr_cpu=p["qo_indptr_cpu"],
-            kv_seq_lens_cpu=p["kv_seq_lens_cpu"],
+        d = md_dense.derived(
+            needs={"kv_page_indices", "kv_page_indptr", "cum_kv_seq_lens"}
         )
         # reverse direction: flat indices -> dense, also zero-sync
-        d2 = _derive(
-            p["qo_indptr"],
-            p["kv_seq_lens"],
-            None,
-            p["kv_page_indices"],
-            p["page_size"],
-            p["max_kv_len"],
-            needs={"block_tables", "q_seq_lens"},
-            qo_indptr_cpu=p["qo_indptr_cpu"],
-            kv_seq_lens_cpu=p["kv_seq_lens_cpu"],
-        )
+        d2 = md_csr.derived(needs={"block_tables", "q_seq_lens"})
     finally:
         torch.cuda.set_sync_debug_mode("default")
     # correctness of the scatter-compaction vs a host-side reference

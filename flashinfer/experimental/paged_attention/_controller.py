@@ -46,7 +46,7 @@ from ._contracts import (
     resolve_config_key,
 )
 from ._graph import GraphBuffers, GraphCapacity, Transaction
-from ._planning import FORM_BLOCK_TABLES, Derived, validate_causal_envelope
+from ._planning import FORM_BLOCK_TABLES, Derived
 from ._selection import resolve_paged_attention
 
 # ---------------------------------------------------------------------------
@@ -262,7 +262,7 @@ class PagedAttentionController:
         _expect_lse_mode(lse_mode)
         need_lse = lse_mode != "none"
         if causal:
-            validate_causal_envelope(metadata.qo_indptr_cpu, metadata.kv_seq_lens_cpu)
+            metadata.validate_causal_envelope()
         logits_soft_cap = _normalize_logits_soft_cap(logits_soft_cap)
         if custom_mask is not None:
             q_lens = metadata.qo_indptr_cpu.diff().to(torch.int64)

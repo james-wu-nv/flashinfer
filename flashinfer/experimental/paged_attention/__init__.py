@@ -29,7 +29,7 @@ from ._backends import (
 from ._contracts import PagedAttentionMetadata, PlanMetadata, Resolution
 from ._controller import PagedAttentionController
 from ._graph import GraphBuffers, GraphCapacity
-from ._planning import DERIVED_FORMS, Derived, derive
+from ._planning import DERIVED_FORMS, Derived, HostArrays, derive
 from ._selection import HEURISTIC_ORDER, resolve_paged_attention
 
 __all__ = [
@@ -39,6 +39,7 @@ __all__ = [
     "GraphBuffers",
     "GraphCapacity",
     "HEURISTIC_ORDER",
+    "HostArrays",
     "MIN_DENSE_PAGE_SIZE",
     "PagedAttentionCapabilities",
     "PagedAttentionController",
