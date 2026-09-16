@@ -47,6 +47,7 @@ from flashinfer.prefill import (
 )
 
 from .paged_attention_reference import reference_paged_prefill
+from .test_paged_attention_coverage import build_problem
 from .test_paged_attention_prototype import (
     BACKENDS,
     LSE_TOL,
@@ -1357,3 +1358,119 @@ def test_flat_first_batch_with_padding_rows_infers_a_capacity():
     )
     cap = attn._impl._graph.capacity
     assert (cap.batch_size, cap.flat_capacity) == (4, 3)
+
+
+# ---------------------------------------------------------------------------
+# Ledger M17: q_len == 0 rows across graph re-plans
+# ---------------------------------------------------------------------------
+
+_HEADS = dict(num_qo_heads=8, num_kv_heads=2, head_dim_qk=128, dtype=torch.bfloat16)
+
+
+def _lengths_problem(seed, q_lens, kv_lens, *, page_size=16, pool=24):
+    """build_problem() with explicit lengths and a fixed KV pool size (graph
+    tests swap pools of equal size); q_len 0 rows are legal."""
+    pages = sum((kv + page_size - 1) // page_size for kv in kv_lens)
+    assert pages < pool
+    return build_problem(
+        list(q_lens),
+        list(kv_lens),
+        page_size=page_size,
+        seed=seed,
+        pool_slack=pool - pages,
+        **_HEADS,
+    )
+
+
+def _capture_run(attn, q, k, v, out, lse):
+    """warm-up on a side stream, then capture one run()."""
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            attn.run(q, (k, v), out=out, lse=lse)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        attn.run(q, (k, v), out=out, lse=lse)
+    return g
+
+
+def _check_rows(p, out, lse, rows):
+    torch.cuda.synchronize()
+    ref_out, ref_lse = _reference(p)
+    torch.testing.assert_close(out[:rows].float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse[:rows], ref_lse, **LSE_TOL)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_replan_toggles_zero_q_rows(backend):
+    """Graph mode: a request toggles between live and q_len 0 across re-plans
+    while the capture shapes stay fixed (batch size, total query tokens, table
+    width, maxes).  Rows with q_len 0 own no output row, so every output row
+    of each batch is live and compared."""
+    a = _lengths_problem(81, (5, 1, 7, 1, 3), (37, 20, 64, 12, 9))
+    b = _lengths_problem(83, (5, 0, 7, 2, 3), (37, 20, 64, 12, 9))
+    c = _lengths_problem(85, (5, 2, 7, 0, 3), (37, 20, 64, 12, 9))
+    assert a["qo_indptr_cpu"][-1] == b["qo_indptr_cpu"][-1] == c["qo_indptr_cpu"][-1]
+    assert b["block_tables"].shape == a["block_tables"].shape
+    _resolve_or_skip(a, backend)
+    dev = torch.device(a["device"])
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    q, k, v = a["q"].clone(), a["k_cache"].clone(), a["v_cache"].clone()
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[0], a["num_qo_heads"], dtype=torch.float32, device=dev)
+    rows = q.shape[0]
+
+    _plan(attn, a, backend)
+    g = _capture_run(attn, q, k, v, out, lse)
+    g.replay()
+    _check_rows(a, out, lse, rows)
+    for p in (b, c, a):
+        q.copy_(p["q"])
+        k.copy_(p["k_cache"])
+        v.copy_(p["v_cache"])
+        _plan(attn, p, backend)
+        g.replay()
+        _check_rows(p, out, lse, rows)
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("style", ["q_zero", "vllm"])
+def test_decode_bucket_replan_with_zero_q_tail_rows(backend, style):
+    """A decode graph bucket (max_q_len 1, one token per request) captured
+    full, then re-planned with its last two requests padded out: q_len 0
+    (``style="q_zero"``: KV kept; ``"vllm"``: KV 0 as well, vLLM's padded
+    tail).  The batch now has fewer tokens than the capture buffers hold; the
+    live prefix must match.  Pins the cuDNN LSE layout at max_q_len 1: the
+    padded (b, 1, h) stats are request-indexed, the packed rows token-indexed,
+    and they differ once a q_len 0 row precedes a live one - so the graph-mode
+    plan must not take the ``view`` path."""
+    kv = (20, 40, 9, 33)
+    full = _lengths_problem(91, (1, 1, 1, 1), kv)
+    padded = _lengths_problem(
+        93, (1, 1, 0, 0), kv if style == "q_zero" else (20, 40, 0, 0)
+    )
+    mixed = _lengths_problem(95, (1, 0, 1, 0), kv)  # a q_len 0 row before a live one
+    if backend == "cake" and style == "vllm":
+        pytest.skip("cake declines kv_len == 0 rows (ledger M19)")
+    _resolve_or_skip(full, backend)
+    dev = torch.device(full["device"])
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    q, k, v = full["q"].clone(), full["k_cache"].clone(), full["v_cache"].clone()
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[0], full["num_qo_heads"], dtype=torch.float32, device=dev)
+
+    _plan(attn, full, backend)
+    g = _capture_run(attn, q, k, v, out, lse)
+    g.replay()
+    _check_rows(full, out, lse, 4)
+    for p in (padded, mixed, full):
+        n = int(p["qo_indptr_cpu"][-1])
+        q[:n].copy_(p["q"])
+        k.copy_(p["k_cache"])
+        v.copy_(p["v_cache"])
+        _plan(attn, p, backend)
+        g.replay()
+        _check_rows(p, out, lse, n)
+
