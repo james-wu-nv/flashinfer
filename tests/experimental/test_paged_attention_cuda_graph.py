@@ -336,9 +336,10 @@ def test_transaction_enter_restores_earlier_copies(fail_at):
     assert [d.value for d in dsts] == [0, 1, 2]
 
 
-# dense form: qo_indptr, kv_seq_lens, q_seq_lens, cum_kv_seq_lens,
-# kv_page_indptr, block_tables, kv_page_indices
-_DENSE_STAGING_POSITIONS = 7
+# dense form, fa2: qo_indptr, kv_seq_lens, block_tables, kv_page_indices (the
+# forms fa2 does not read - q_seq_lens, cum_kv_seq_lens, kv_page_indptr - are
+# not derived and not staged)
+_DENSE_STAGING_POSITIONS = 4
 
 
 @pytest.mark.parametrize("fail_at", range(_DENSE_STAGING_POSITIONS))
@@ -1048,7 +1049,16 @@ def test_targets_skip_derived_forms_not_produced():
     p = make_problem(seed=68, **_SHAPE)
     md = make_metadata(p)
     gb = GraphBuffers(GraphCapacity.from_metadata(md), torch.device(p["device"]))
-    fresh = md.derived(needs_dense=True, max_kv_len=gb.capacity.max_kv_len)
+    fresh = md.derived(
+        needs={
+            "q_seq_lens",
+            "cum_kv_seq_lens",
+            "kv_page_indptr",
+            "kv_page_indices",
+            "block_tables",
+        },
+        max_kv_len=gb.capacity.max_kv_len,
+    )
     full = gb.targets(md, fresh)
     partial = gb.targets(md, dataclasses.replace(fresh, q_seq_lens=None))
     assert len(partial) == len(full) - 1

@@ -245,8 +245,9 @@ class PagedAttentionMetadata:
     D2H here, and every later ``plan()`` on this object is sync-free.
 
     The object also owns the backend-neutral derived forms (CSR page indptr,
-    cumulative KV lengths, dense table) lazily, so several plans over the same
-    batch (windowed / full layers, causal / non-causal) derive once.
+    cumulative KV lengths, dense table) lazily and per need set, so several
+    plans over the same batch (windowed / full layers, causal / non-causal)
+    derive once and only the forms the chosen backend reads are computed.
 
     Identity semantics: two objects compare by identity, not by tensor
     contents (they are meant to be built once per step and reused).
@@ -380,20 +381,26 @@ class PagedAttentionMetadata:
         assert self.qo_indptr_cpu is not None
         return int(self.qo_indptr_cpu[-1])
 
-    def derived(self, *, needs_dense: bool, max_kv_len: Optional[int] = None):
-        """Backend-neutral derived forms, computed once per (object, needs_dense,
-        max_kv_len).
+    def derived(self, *, needs, max_kv_len: Optional[int] = None):
+        """The derived forms in ``needs`` (``_planning.DERIVED_FORMS`` names),
+        computed once per (object, need set, width) and cached: several plans
+        over the same batch that pick the same backend derive once, and a
+        backend never pays for a form it does not read.
 
         ``max_kv_len`` widens a dense table derived from flat page ids to
         ``ceil(max_kv_len / page_size)`` columns (CUDA-graph mode derives at
         the capacity so the table fits its reserved storage); ``None`` uses
-        the batch's own max.
+        the batch's own max, and a value below it is rejected.
         """
-        from ._planning import derive
+        from ._planning import derive, normalize_needs
 
-        dense = bool(needs_dense) or self.block_tables is not None
         width_max = self.max_kv_len if max_kv_len is None else max_kv_len
-        key = (dense, width_max)
+        _expect(
+            width_max >= self.max_kv_len,
+            f"derived(max_kv_len={max_kv_len}) is narrower than the batch's "
+            f"max_kv_len {self.max_kv_len}",
+        )
+        key = (normalize_needs(needs), width_max)
         d = self._derived.get(key)
         if d is None:
             d = derive(
@@ -403,7 +410,7 @@ class PagedAttentionMetadata:
                 self.kv_page_indices,
                 self.page_size,
                 width_max,
-                needs_dense=dense,
+                needs=key[0],
             )
             self._derived[key] = d
         return d

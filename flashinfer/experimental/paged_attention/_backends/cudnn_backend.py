@@ -12,12 +12,14 @@ from typing import Optional
 import torch
 
 from .._contracts import PlanMetadata
-from .._planning import Derived
+from .._planning import FORM_BLOCK_TABLES, FORM_Q_SEQ_LENS, Derived
 from ._capabilities import _BackendPlanUnsupportedError
 
 
 class _CudnnBackend:
     name = "cudnn"
+    # per-request query lengths for the padding mask + the dense page table
+    DERIVED_NEEDS = frozenset({FORM_Q_SEQ_LENS, FORM_BLOCK_TABLES})
 
     def __init__(self, device, kv_layout, workspace, graph_capacity=None):
         # The cuDNN graph is built from k/v_cache.stride(), so NHD storage is
@@ -150,7 +152,7 @@ class _CudnnBackend:
             self._workspace,
             max_token_per_sequence=meta.max_q_len,
             max_sequence_kv=meta.max_kv_len,
-            actual_seq_lens_q=derived.q_seq_lens.view(b, 1, 1, 1),
+            actual_seq_lens_q=derived.require(FORM_Q_SEQ_LENS).view(b, 1, 1, 1),
             actual_seq_lens_kv=meta.kv_seq_lens.view(b, 1, 1, 1),
             block_tables=self._block_tables,  # width == ceil(max_kv / page)
             causal=meta.causal,

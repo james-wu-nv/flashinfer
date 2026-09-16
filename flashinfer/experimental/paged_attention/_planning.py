@@ -2,29 +2,78 @@
 
 Mirrors ``flashinfer/mla/_batch_mla/_planning.py``: everything here is
 backend-neutral. Structural checks are host-only; value checks read the host
-mirrors the contract guarantees; derivation is pure device ops with no sync.
+mirrors the contract guarantees; derivation computes only the forms the chosen
+backend declared it needs, as pure device ops with no sync.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import FrozenSet, Iterable, Optional
 
 import torch
 
 from ._contracts import _expect, _expect_page_size
 
+# Names of the derived forms a backend may request (``Derived.needs``).  Each
+# backend declares the set it reads (``DERIVED_NEEDS`` on its class) and the
+# controller derives exactly that set: trtllm-gen consumes the canonical form
+# plus cumulative KV lengths, cuDNN per-request query lengths, the generated
+# FA kernels CSR page metadata.  A form the caller already supplied
+# (``block_tables`` for the dense input, ``kv_page_indices`` for CSR) is
+# returned as-is; the cross-form conversions are the only device work.
+FORM_Q_SEQ_LENS = "q_seq_lens"
+FORM_CUM_KV_SEQ_LENS = "cum_kv_seq_lens"
+FORM_KV_PAGE_INDPTR = "kv_page_indptr"
+FORM_KV_PAGE_INDICES = "kv_page_indices"
+FORM_BLOCK_TABLES = "block_tables"
+DERIVED_FORMS: FrozenSet[str] = frozenset(
+    {
+        FORM_Q_SEQ_LENS,
+        FORM_CUM_KV_SEQ_LENS,
+        FORM_KV_PAGE_INDPTR,
+        FORM_KV_PAGE_INDICES,
+        FORM_BLOCK_TABLES,
+    }
+)
+
+
+def normalize_needs(needs: Iterable[str]) -> FrozenSet[str]:
+    needs = frozenset(needs)
+    unknown = needs - DERIVED_FORMS
+    if unknown:
+        raise ValueError(
+            f"unknown derived form(s) {sorted(unknown)}; known: {sorted(DERIVED_FORMS)}"
+        )
+    return needs
+
 
 @dataclass
 class Derived:
-    q_seq_lens: torch.Tensor  # (b,)  device — diff(qo_indptr)
-    cum_kv_seq_lens: torch.Tensor  # (b+1,) device — for trtllm / cuDNN cu_seq_len_kv
-    kv_page_indptr: torch.Tensor  # (b+1,) device CSR page-unit indptr
-    kv_page_indices: torch.Tensor  # flat page ids (CSR-compacted prefix up to
-    # kv_page_indptr[-1]; any tail is untouched scratch never read by kernels,
-    # which bound reads by the indptr)
-    block_tables: Optional[torch.Tensor]  # (b, width) dense — given or derived;
-    # None only when no candidate backend needs the dense form
+    """The derived forms one plan requested (``needs``); everything else is
+    ``None``.  Backends read fields through :meth:`require` so an unrequested
+    form fails loudly at the use site instead of surfacing as an attribute
+    error deep inside a kernel wrapper."""
+
+    needs: FrozenSet[str]
+    q_seq_lens: Optional[torch.Tensor] = None  # (b,)  device - diff(qo_indptr)
+    cum_kv_seq_lens: Optional[torch.Tensor] = (
+        None  # (b+1,) device - trtllm cu_seq_len_kv
+    )
+    kv_page_indptr: Optional[torch.Tensor] = None  # (b+1,) device CSR page-unit indptr
+    kv_page_indices: Optional[torch.Tensor] = None  # flat page ids (CSR-compacted
+    # prefix up to kv_page_indptr[-1]; any tail is untouched scratch never read
+    # by kernels, which bound reads by the indptr)
+    block_tables: Optional[torch.Tensor] = None  # (b, width) dense - given or derived
+
+    def require(self, name: str) -> torch.Tensor:
+        value = getattr(self, name)
+        if value is None:
+            raise AssertionError(
+                f"derived form {name!r} was not requested for this plan "
+                f"(needs={sorted(self.needs)}); add it to the backend's DERIVED_NEEDS"
+            )
+        return value
 
 
 def validate_structure(
@@ -193,17 +242,17 @@ def derive(
     page_size,
     max_kv_len,
     *,
-    needs_dense: bool,
+    needs: Iterable[str],
 ) -> Derived:
-    """Canonical → derived forms.  Pure device ops, zero sync.
+    """Canonical -> the derived forms in ``needs`` (see ``DERIVED_FORMS``).
 
-    In production this is one fused kernel (proposal §3.2); torch ops keep the
-    prototype readable.  All output shapes are static functions of the input
-    shapes and host ints:
+    Pure device ops, zero sync; nothing outside ``needs`` is computed (ledger
+    M7: the dense input used to pay the CSR compaction for every backend).  All
+    output shapes are static functions of the input shapes and host ints:
 
-    - dense given → flat indices by capacity scatter (a boolean masked-select
+    - dense given -> flat indices by capacity scatter (a boolean masked-select
       would sync to size its result; scatter does not);
-    - flat indices given → dense (when a candidate needs it) by a gather of
+    - flat indices given -> dense (when a candidate needs it) by a gather of
       width ceil(max_kv_len / page_size), with each row's tail CLAMPED TO THE
       REQUEST'S OWN LAST PAGE.  The per-row clamp is load-bearing: cuDNN
       gathers K/V pages by table width before masking, so a tail that
@@ -212,54 +261,80 @@ def derive(
       empirically by the NaN-page probe; see the fuzzer's
       csr_overallocated_nan_tail mutation).
     """
+    needs = normalize_needs(needs)
     dev = kv_seq_lens.device
-    zero = torch.zeros(1, dtype=torch.int32, device=dev)
-    q_seq_lens = qo_indptr.diff()
-    cum_kv = torch.cat([zero, torch.cumsum(kv_seq_lens, 0, dtype=torch.int32)])
-    pages = (kv_seq_lens + page_size - 1) // page_size  # (b,)
-    kv_page_indptr = torch.cat([zero, torch.cumsum(pages, 0, dtype=torch.int32)])
     b = kv_seq_lens.shape[0]
+    out = Derived(needs=needs)
 
-    if block_tables is not None:
-        width = block_tables.shape[1]
-        capacity = b * width
-        col = torch.arange(width, device=dev, dtype=torch.int32)
-        valid = col.unsqueeze(0) < pages.unsqueeze(1)  # (b, width)
-        # compact destination of each (row, col) lane; invalid lanes all
-        # target a dummy tail slot (duplicate writes there are benign)
-        dst = kv_page_indptr[:-1].unsqueeze(1).to(torch.int64) + col.unsqueeze(0).to(
-            torch.int64
-        )
-        dst = torch.where(valid, dst, torch.full_like(dst, capacity))
-        buf = torch.empty(capacity + 1, dtype=torch.int32, device=dev)
-        buf.scatter_(0, dst.reshape(-1), block_tables.reshape(-1))
-        return Derived(q_seq_lens, cum_kv, kv_page_indptr, buf[:capacity], block_tables)
+    def zero_prefixed_cumsum(values):
+        zero = torch.zeros(1, dtype=torch.int32, device=dev)
+        return torch.cat([zero, torch.cumsum(values, 0, dtype=torch.int32)])
 
-    dense = None
-    if needs_dense:
-        width = (max_kv_len + page_size - 1) // page_size  # host int, no sync
-        col = torch.arange(width, device=dev, dtype=torch.int64)
-        src = kv_page_indptr[:-1].to(torch.int64).unsqueeze(1) + col.unsqueeze(0)
-        # clamp each row's tail to the request's OWN last live page (kv_len
-        # >= 1 is validated, so every row owns at least one).  Load-bearing:
-        # cuDNN gathers K/V pages by table width before masking, so a tail
-        # pointing into a neighbouring request or the over-allocated
-        # (possibly uninitialized) region of kv_page_indices produced NaN
-        # outputs / out-of-pool reads (fuzzer: csr_overallocated_nan_tail).
-        row_last = kv_page_indptr[1:].to(torch.int64).unsqueeze(1) - 1
-        src = torch.minimum(src, row_last)
-        dense = (
-            kv_page_indices.to(torch.int64)
-            .gather(0, src.reshape(-1))
-            .reshape(b, width)
-            .to(torch.int32)
-        )
-    return Derived(q_seq_lens, cum_kv, kv_page_indptr, kv_page_indices, dense)
+    if FORM_Q_SEQ_LENS in needs:
+        out.q_seq_lens = qo_indptr.diff()
+    if FORM_CUM_KV_SEQ_LENS in needs:
+        out.cum_kv_seq_lens = zero_prefixed_cumsum(kv_seq_lens)
+
+    # the page-unit indptr feeds both cross-form conversions
+    compact_flat = FORM_KV_PAGE_INDICES in needs and block_tables is not None
+    gather_dense = FORM_BLOCK_TABLES in needs and block_tables is None
+    pages = kv_page_indptr = None
+    if FORM_KV_PAGE_INDPTR in needs or compact_flat or gather_dense:
+        pages = (kv_seq_lens + page_size - 1) // page_size  # (b,)
+        kv_page_indptr = zero_prefixed_cumsum(pages)
+    if FORM_KV_PAGE_INDPTR in needs:
+        out.kv_page_indptr = kv_page_indptr
+
+    if FORM_KV_PAGE_INDICES in needs:
+        if block_tables is None:
+            out.kv_page_indices = kv_page_indices
+        else:
+            width = block_tables.shape[1]
+            capacity = b * width
+            col = torch.arange(width, device=dev, dtype=torch.int64)
+            valid = col.unsqueeze(0) < pages.unsqueeze(1)  # (b, width)
+            # compact destination of each (row, col) lane; invalid lanes all
+            # target a dummy tail slot (duplicate writes there are benign)
+            dst = kv_page_indptr[:-1].to(torch.int64).unsqueeze(1) + col.unsqueeze(0)
+            dst = torch.where(valid, dst, capacity)
+            buf = torch.empty(capacity + 1, dtype=torch.int32, device=dev)
+            buf.scatter_(0, dst.reshape(-1), block_tables.reshape(-1))
+            out.kv_page_indices = buf[:capacity]
+
+    if FORM_BLOCK_TABLES in needs:
+        if block_tables is not None:
+            out.block_tables = block_tables
+        else:
+            width = (max_kv_len + page_size - 1) // page_size  # host int, no sync
+            col = torch.arange(width, device=dev, dtype=torch.int64)
+            src = kv_page_indptr[:-1].to(torch.int64).unsqueeze(1) + col.unsqueeze(0)
+            # clamp each row's tail to the request's OWN last live page (kv_len
+            # >= 1 is validated, so every row owns at least one).  Load-bearing:
+            # cuDNN gathers K/V pages by table width before masking, so a tail
+            # pointing into a neighbouring request or the over-allocated
+            # (possibly uninitialized) region of kv_page_indices produced NaN
+            # outputs / out-of-pool reads (fuzzer: csr_overallocated_nan_tail).
+            row_last = kv_page_indptr[1:].to(torch.int64).unsqueeze(1) - 1
+            src = torch.minimum(src, row_last)
+            out.block_tables = (
+                kv_page_indices.to(torch.int64)
+                .gather(0, src.reshape(-1))
+                .reshape(b, width)
+                .to(torch.int32)
+            )
+    return out
 
 
 __all__ = [
+    "DERIVED_FORMS",
+    "FORM_BLOCK_TABLES",
+    "FORM_CUM_KV_SEQ_LENS",
+    "FORM_KV_PAGE_INDICES",
+    "FORM_KV_PAGE_INDPTR",
+    "FORM_Q_SEQ_LENS",
     "Derived",
     "derive",
+    "normalize_needs",
     "validate_causal_envelope",
     "validate_structure",
     "validate_values",

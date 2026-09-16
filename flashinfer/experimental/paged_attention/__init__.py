@@ -20,15 +20,21 @@ independent reference. ``tests/experimental/test_paged_attention_fuzzer.py``
 enforces it with randomized valid and corrupted inputs.
 """
 
-from ._backends import CAPABILITIES, MIN_DENSE_PAGE_SIZE, PagedAttentionCapabilities
+from ._backends import (
+    CAPABILITIES,
+    MIN_DENSE_PAGE_SIZE,
+    PagedAttentionCapabilities,
+    derived_needs,
+)
 from ._contracts import PagedAttentionMetadata, PlanMetadata, Resolution
 from ._controller import PagedAttentionController
 from ._graph import GraphBuffers, GraphCapacity
-from ._planning import Derived, derive
+from ._planning import DERIVED_FORMS, Derived, derive
 from ._selection import HEURISTIC_ORDER, resolve_paged_attention
 
 __all__ = [
     "CAPABILITIES",
+    "DERIVED_FORMS",
     "Derived",
     "GraphBuffers",
     "GraphCapacity",
@@ -40,5 +46,6 @@ __all__ = [
     "PlanMetadata",
     "Resolution",
     "derive",
+    "derived_needs",
     "resolve_paged_attention",
 ]

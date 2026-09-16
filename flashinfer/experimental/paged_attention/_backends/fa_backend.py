@@ -22,7 +22,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 
 from .._contracts import LN2, PlanMetadata
-from .._planning import Derived
+from .._planning import FORM_KV_PAGE_INDICES, Derived
 from ._capabilities import _BackendPlanUnsupportedError
 
 
@@ -60,6 +60,10 @@ def _envelope_mask(custom_mask: torch.Tensor, meta: PlanMetadata) -> torch.Tenso
 
 
 class _FaBackend:
+    # CSR page ids on device; the page indptr / last-page lengths travel as
+    # host arrays (the wrapper uploads them itself)
+    DERIVED_NEEDS = frozenset({FORM_KV_PAGE_INDICES})
+
     def __init__(
         self, device, kv_layout, workspace, backend: str = "fa2", graph_capacity=None
     ):
@@ -183,7 +187,7 @@ class _FaBackend:
         # the page indptr; a strided view would be silently misread.  In graph
         # mode this is the reserved (contiguous) buffer, so only the eager CSR
         # form can fail here — reject before the wrapper's plan moves state.
-        idx = derived.kv_page_indices
+        idx = derived.require(FORM_KV_PAGE_INDICES)
         if not idx.is_contiguous():
             raise ValueError(
                 f"{self.name} requires a contiguous kv_page_indices, got strides "
@@ -217,7 +221,7 @@ class _FaBackend:
         wrapper.plan(
             qo_host,
             kv_indptr_host,
-            derived.kv_page_indices,
+            idx,
             last_len_host,
             meta.num_qo_heads,
             meta.num_kv_heads,
