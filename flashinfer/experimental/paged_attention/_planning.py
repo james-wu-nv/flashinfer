@@ -139,7 +139,12 @@ class HostArrays:
             kv_last_page_len=slice(o_ll, o_kv),
             kv_seq_lens=slice(o_kv, total),
         )
-        self.host = torch.empty(total, dtype=torch.int32, pin_memory=True)
+        # Pinned so the wrappers' non_blocking uploads are real asynchronous
+        # copies; host-only validation (no CUDA device, e.g. the CPU contract
+        # tests) falls back to pageable memory, which only costs upload speed.
+        self.host = torch.empty(
+            total, dtype=torch.int32, pin_memory=torch.cuda.is_available()
+        )
         st = self._np = self.host.numpy()
         qo = qo_indptr_cpu.numpy()
         kv = kv_seq_lens_cpu.numpy()
