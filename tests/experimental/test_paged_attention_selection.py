@@ -11,7 +11,7 @@ import types
 import pytest
 import torch
 
-from flashinfer.experimental.paged_attention import Resolution
+from flashinfer.experimental.paged_attention import GraphCapacity, Resolution
 from flashinfer.experimental.paged_attention._backends import (
     cudnn_backend,
     fa_backend,
@@ -259,9 +259,15 @@ def test_preflight_runs_before_any_reserved_buffer_write(monkeypatch):
     res = _resolve_or_skip(p, "auto")
     for name in res.backends:
         _inject_preflight(monkeypatch, name, _BackendPlanUnsupportedError("declined"))
-    attn = PagedAttention(torch.device(p["device"]), use_cuda_graph=True)
+    # An explicit capacity allocates the reserved storage at construction;
+    # with the inferred form a failed first plan publishes no capacity at all
+    # (the graph-lifecycle rule), which is checked in the cuda_graph suite.
+    md = make_metadata(p)
+    attn = PagedAttention(
+        torch.device(p["device"]), graph_capacity=GraphCapacity.from_metadata(md)
+    )
     with pytest.raises(ValueError, match="no pinned candidate"):
-        attn.plan(make_metadata(p), backend=res, **_plan_kw(p))
+        attn.plan(md, backend=res, **_plan_kw(p))
     gb = attn._impl._graph
     assert gb is not None
     for buf in (gb.qo_indptr, gb.kv_seq_lens, gb.block_tables, gb.kv_page_indices):
