@@ -2541,9 +2541,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
         else:
             self._max_q_len = max(qo_indptr_host[1:] - qo_indptr_host[:-1]).item()
 
+        # The host KV arrays feed the C++ planner (fa2/fa3 and the prims
+        # backend) as well as the kv_lens upload, so they are bound whether or
+        # not the caller supplied max_sequence_kv; that argument only skips
+        # the O(batch) host max (a Python max() over a tensor materialises a
+        # 0-d tensor per element, about 3 us each).  The cudnn backend is the
+        # exception: it never reads them and keeps its D2H-free plan.
         if max_sequence_kv is not None:
             self._max_kv_len = max_sequence_kv
-        else:
+        if max_sequence_kv is None or self._backend != "cudnn":
             paged_kv_indptr_host = paged_kv_indptr.to("cpu")
             paged_kv_last_page_len_host = paged_kv_last_page_len.to("cpu")
             if seq_lens is None:
@@ -2560,7 +2566,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._kv_lens_buffer[:required_size].copy_(
                 kv_lens_arr_host, non_blocking=non_blocking
             )
-            self._max_kv_len = max(kv_lens_arr_host).item()
+            if max_sequence_kv is None:
+                self._max_kv_len = int(kv_lens_arr_host.max())
 
         if self.is_cuda_graph_enabled:
             if self._max_total_num_rows is None:

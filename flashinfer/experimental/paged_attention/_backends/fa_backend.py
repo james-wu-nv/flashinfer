@@ -460,9 +460,10 @@ class _FaBackend:
             upload.synchronize()
         # Host arrays: pinned views the derivation layer already computed, so
         # nothing is allocated or derived here and every upload the wrapper
-        # issues from them is asynchronous.  seq_lens= and
-        # max_token_per_sequence= hand the wrapper values it would otherwise
-        # recompute from the indptrs on the host.
+        # issues from them is asynchronous.  seq_lens=, max_token_per_sequence=
+        # and max_sequence_kv= hand the wrapper values it would otherwise
+        # recompute from the host arrays (the KV max is an O(batch) Python
+        # loop there; the fa kernels never read the wrapper's copy of it).
         wrapper.plan(
             derived.require("qo_indptr_host"),
             derived.require("kv_page_indptr_host"),
@@ -483,6 +484,7 @@ class _FaBackend:
             kv_data_type=meta.kv_dtype,
             seq_lens=derived.require("kv_seq_lens_host"),
             max_token_per_sequence=meta.max_q_len,
+            max_sequence_kv=meta.max_kv_len,
         )
         if upload is None:
             upload = self._upload_events[id(wrapper)] = torch.cuda.Event()
