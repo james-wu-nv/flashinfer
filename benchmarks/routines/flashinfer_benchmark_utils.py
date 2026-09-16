@@ -21,6 +21,7 @@ output_column_dict = {
         "phase",
         "status",
         "layers",
+        "static_backend",
         "kv_input_form",
         "lse_mode",
         "window_left",

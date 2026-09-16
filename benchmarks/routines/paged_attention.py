@@ -22,8 +22,12 @@ it is timed, and every (backend, phase) pair yields one CSV row:
     for a model with N attention layers sharing one plan.
 
 Rows for unsupported / erroring / incorrect candidates are KEPT with a
-``status`` column (never dropped, never NaN-only); ``auto`` rows record the
-resolved backend.  ``auto`` is the facade's static selection, not autotuning.
+``status`` column (never dropped, never NaN-only).  ``static_backend`` is
+the facade's static choice (``resolve_paged_attention(...).chosen``);
+``resolved_backend`` is the backend the plan actually ran (``attn.backend``
+after ``plan()``), which differs when a candidate declined the batch at
+plan time and the walk moved on.  ``auto`` is the facade's static
+selection, not autotuning.
 
 ``--pa_legacy`` adds ``api_variant=legacy`` rows: the SAME inputs through the
 legacy public API of the same kernel, with the same phases, so
@@ -304,6 +308,7 @@ class _PhaseRows:
             row = defaultdict(str)
             row["routine"] = args.routine
             row["backend"] = backend
+            row["static_backend"] = backend
             row["resolved_backend"] = backend
             row["api_variant"] = api_variant
             row["phase"] = phase
@@ -333,7 +338,13 @@ class _PhaseRows:
             row["case_tag"] = args.case_tag
             self.rows.append(row)
 
+    def set_static(self, static_backend):
+        """The static choice of ``resolve_paged_attention`` (before plan)."""
+        for row in self.rows:
+            row["static_backend"] = static_backend
+
     def set_resolved(self, resolved_backend):
+        """The backend the plan actually ran (``attn.backend`` after plan())."""
         for row in self.rows:
             row["resolved_backend"] = resolved_backend
         if self.rows and self.rows[0]["backend"] != resolved_backend:
@@ -476,8 +487,12 @@ def _bench_unified(args, case, backend, ctx):
             reason = reason[len(prefix) : -1]
         phases.set_all(f"unsupported: {reason[:240]}")
         return phases, None
-    resolved = resolution.chosen
-    phases.set_resolved(resolved)
+    # The static choice is provisional: plan() walks the pinned candidates and
+    # a typed preflight decline (trtllm-gen on a narrow page-table view, cake
+    # on a batch with a padding row, ...) moves on to the next one, so the
+    # backend that ran is read from the instance after plan().
+    phases.set_static(resolution.chosen)
+    phases.set_resolved(resolution.chosen)
     if args.verbose >= 1 and backend == "auto":
         print(f"[INFO] auto resolution:\n{resolution.explain()}")
 
@@ -503,6 +518,8 @@ def _bench_unified(args, case, backend, ctx):
     try:
         ctx["workspace"].zero_()
         plan_once()
+        resolved = attn.backend  # the candidate that accepted the batch
+        phases.set_resolved(resolved)
         got_out, got_lse = run_once(
             case["q"], case["k_cache"], case["v_cache"], case["out"], case["lse"]
         )
@@ -511,8 +528,13 @@ def _bench_unified(args, case, backend, ctx):
         phases.set_all(_error_status(exc))
         if args.verbose >= 2:
             traceback.print_exc()
-        # the kernel was admitted by resolve(); the legacy row shows whether
-        # its public API fails on the same inputs too
+        # Pair a legacy row only with a kernel we can name: the one that
+        # planned (run failed), or the explicitly requested backend (its plan
+        # failed; the legacy row shows whether the public API fails on the
+        # same inputs too).  A failed `auto` plan names no kernel.
+        resolved = attn.backend or (backend if backend != "auto" else None)
+        if resolved is not None:
+            phases.set_resolved(resolved)
         return phases, resolved
 
     recheck = None
