@@ -12,6 +12,14 @@ import pytest
 import torch
 
 from flashinfer.experimental.paged_attention import Resolution
+from flashinfer.experimental.paged_attention._backends import (
+    cudnn_backend,
+    fa_backend,
+    trtllm_gen_backend,
+)
+from flashinfer.experimental.paged_attention._backends._capabilities import (
+    _BackendPlanUnsupportedError,
+)
 from flashinfer.prefill import PagedAttention, resolve_paged_attention
 
 from .test_paged_attention_prototype import (
@@ -154,3 +162,106 @@ def test_plan_rejects_a_resolution_pinned_elsewhere():
     # semantic drift is still reported as such (not as a device problem)
     with pytest.raises(ValueError, match="pinned Resolution"):
         attn.plan(md, backend=res, **dict(plan_kw, num_kv_heads=p["num_qo_heads"]))
+
+
+# --------------------------------------------------------------------------
+# typed plan-time fallback within the pinned candidate set
+# --------------------------------------------------------------------------
+
+_BACKEND_CLASS = {
+    "fa2": fa_backend._FaBackend,
+    "fa3": fa_backend._FaBackend,
+    "cudnn": cudnn_backend._CudnnBackend,
+    "trtllm-gen": trtllm_gen_backend._TrtllmGenBackend,
+}
+
+
+def _inject_preflight(monkeypatch, name, exc):
+    def preflight(self, meta):
+        if self.name == name:
+            raise exc
+        return real(self, meta)
+
+    real = _BACKEND_CLASS[name].preflight
+    monkeypatch.setattr(_BACKEND_CLASS[name], "preflight", preflight)
+
+
+def _plan_kw(p):
+    return dict(
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim_qk"],
+        q_dtype=p["dtype"],
+        causal=True,
+        lse_mode="base2",
+    )
+
+
+@needs_cuda
+def test_typed_unsupported_moves_to_the_next_candidate(monkeypatch):
+    p = make_problem(seed=71, **_SHAPE)
+    res = _resolve_or_skip(p, "auto")
+    if len(res.backends) < 2:
+        pytest.skip("needs two runnable candidates")
+    first, second = res.backends[0], res.backends[1]
+    _inject_preflight(
+        monkeypatch,
+        first,
+        _BackendPlanUnsupportedError("injected: cannot do this batch"),
+    )
+    attn = PagedAttention(torch.device(p["device"]))
+    attn.plan(make_metadata(p), backend=res, **_plan_kw(p))
+    assert attn.backend == second
+    trace = attn._impl.selection_trace
+    assert trace[0] == (first, "preflight", "injected: cannot do this batch")
+    assert trace[1] == (second, "preflight", "accepted")
+    text = attn.explain()
+    assert f"chosen: {second}" in text and "injected" in text
+    out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]))
+    assert torch.isfinite(out.float()).all() and torch.isfinite(lse).all()
+
+
+@needs_cuda
+def test_other_exceptions_from_a_candidate_are_not_swallowed(monkeypatch):
+    p = make_problem(seed=73, **_SHAPE)
+    res = _resolve_or_skip(p, "auto")
+    _inject_preflight(monkeypatch, res.backends[0], ValueError("boom: not a fallback"))
+    attn = PagedAttention(torch.device(p["device"]))
+    with pytest.raises(ValueError, match="boom: not a fallback"):
+        attn.plan(make_metadata(p), backend=res, **_plan_kw(p))
+    assert attn.backend is None
+    _inject_preflight(monkeypatch, res.backends[0], RuntimeError("plain runtime error"))
+    with pytest.raises(RuntimeError, match="plain runtime error"):
+        attn.plan(make_metadata(p), backend=res, **_plan_kw(p))
+
+
+@needs_cuda
+def test_explicit_backend_never_falls_back(monkeypatch):
+    p = make_problem(seed=79, **_SHAPE)
+    _resolve_or_skip(p, "fa2")
+    _inject_preflight(monkeypatch, "fa2", _BackendPlanUnsupportedError("declined"))
+    attn = PagedAttention(torch.device(p["device"]))
+    with pytest.raises(ValueError, match="'fa2' cannot plan this batch: declined"):
+        attn.plan(make_metadata(p), backend="fa2", **_plan_kw(p))
+    # a Resolution whose every member declines: ValueError with the trace
+    res = _resolve_or_skip(p, "fa2")
+    with pytest.raises(ValueError, match="no pinned candidate.*fa2: declined"):
+        attn.plan(make_metadata(p), backend=res, **_plan_kw(p))
+    assert attn.backend is None
+
+
+@needs_cuda
+def test_preflight_runs_before_any_reserved_buffer_write(monkeypatch):
+    """Graph mode: a batch every candidate declines must leave the reserved
+    storage untouched (the walk happens before the staging transaction)."""
+    p = make_problem(seed=83, **_SHAPE)
+    res = _resolve_or_skip(p, "auto")
+    for name in res.backends:
+        _inject_preflight(monkeypatch, name, _BackendPlanUnsupportedError("declined"))
+    attn = PagedAttention(torch.device(p["device"]), use_cuda_graph=True)
+    with pytest.raises(ValueError, match="no pinned candidate"):
+        attn.plan(make_metadata(p), backend=res, **_plan_kw(p))
+    gb = attn._impl._graph
+    assert gb is not None
+    for buf in (gb.qo_indptr, gb.kv_seq_lens, gb.block_tables, gb.kv_page_indices):
+        assert not buf.any(), "reserved storage was written before preflight"

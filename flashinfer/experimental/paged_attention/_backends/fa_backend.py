@@ -12,6 +12,7 @@ import torch
 
 from .._contracts import LN2, PlanMetadata
 from .._planning import Derived
+from ._capabilities import _BackendPlanUnsupportedError
 
 
 class _FaBackend:
@@ -21,6 +22,7 @@ class _FaBackend:
         from ....prefill import BatchPrefillWithPagedKVCacheWrapper
 
         self.name = backend
+        self._device = device
         if graph_capacity is None:
             self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
                 workspace, kv_layout, backend=backend
@@ -51,6 +53,16 @@ class _FaBackend:
         self._lse_mode = "none"
         self._total_q_tokens = 0
         self._head_dim_vo = 0
+
+    def preflight(self, meta: PlanMetadata) -> None:
+        """Batch-specific checks; typed unsupported only, no allocation."""
+        if self.name == "fa3":
+            from ....utils import is_sm90a_supported
+
+            if not is_sm90a_supported(self._device):
+                raise _BackendPlanUnsupportedError(
+                    f"fa3 needs SM90a and CUDA >= 12.3; {self._device} does not qualify"
+                )
 
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
         # The kernel walks kv_page_indices as a raw int32 pointer bounded by

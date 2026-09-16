@@ -407,5 +407,6 @@ class PagedAttention:
         )
 
     def explain(self) -> str:
-        """Chosen backend plus the per-backend exclusion reasons."""
+        """Chosen backend, the plan-time trace (every candidate tried and why
+        it was accepted or declined) and the resolve-time exclusion reasons."""
         return self._impl.explain()

@@ -2,9 +2,11 @@
 
 Owns the public lifecycle behind ``flashinfer.prefill``:
 validation, level-1 pinning against a ``Resolution``, level-2 choice within
-it, derivation, and transactional publication of the planned backend. It does
-not own any backend dialect (``_backends/``) or selection policy
-(``_selection.py``).
+it (a preference-ordered walk in which only the typed
+``_BackendPlanUnsupportedError`` from a candidate's ``preflight()`` moves on to
+the next candidate), derivation, and transactional publication of the planned
+backend. It does not own any backend dialect (``_backends/``) or selection
+policy (``_selection.py``).
 
 Publication is transactional at this layer: ``plan()`` only swaps the
 published metadata, derived forms, and active backend after the candidate
@@ -21,11 +23,11 @@ import dataclasses
 import inspect
 import math
 import threading
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
-from ._backends import CAPABILITIES, make_backend
+from ._backends import CAPABILITIES, _BackendPlanUnsupportedError, make_backend
 from ._contracts import (
     PagedAttentionMetadata,
     PlanMetadata,
@@ -183,6 +185,8 @@ class PagedAttentionController:
         self._planned = False
         self._backend_name: Optional[str] = None
         self._resolution: Optional[Resolution] = None
+        # plan-time selection trace: (backend, phase, reason) per candidate tried
+        self._trace: List[Tuple[str, str, str]] = []
         self._meta: Optional[PlanMetadata] = None
         self._derived: Optional[Derived] = None
         self._active = None
@@ -291,12 +295,17 @@ class PagedAttentionController:
                 kv_input_form=kv_input_form,
                 backend=backend,
             )
-        # Plan-time choice within the pinned set (level 2).  The prototype
-        # takes the heuristic head; the autotune hook (proposal §5.4) would
-        # consult its cache here, keyed on bucketed (total_q_tokens, max_kv_len).
-        name = resolution.chosen
-        needs_dense = CAPABILITIES[name].needs_dense
-
+        # Plan-time choice within the pinned set (level 2): walk the
+        # candidates in preference order.  A candidate may decline THIS batch
+        # from its cheap preflight() with the typed unsupported signal, in
+        # which case the next member is tried; every other exception (invalid
+        # input, OOM, JIT failure) propagates unchanged, and an explicit
+        # backend string never falls back.  The walk finishes before any
+        # reserved-buffer write in graph mode.  The autotune hook (proposal
+        # §5.4) would rank the survivors here, keyed on bucketed
+        # (total_q_tokens, max_kv_len).
+        explicit = isinstance(backend, str) and backend != "auto"
+        gb: Optional[GraphBuffers] = None
         if self._use_cuda_graph:
             _expect_not_capturing("plan()")
             # Graph mode: backends only ever see the reserved storage, so the
@@ -308,60 +317,93 @@ class PagedAttentionController:
             else:
                 gb = self._graph
             gb.preflight(metadata)
-            cap = gb.capacity
-            if needs_dense:
-                # flat form: only a backend that reads the dense table pays
-                # for it, and only once (no-op in the dense form)
-                gb.reserve_dense_table()
             # Capacity substitution: the captured kernels were planned with
             # the capacity maxes and keep reading them, so backends see those
             # rather than this batch's own (validated <= in preflight); the
             # derived dense table is sized to the reserved one likewise.
-            max_q_len, max_kv_len = cap.max_q_len, cap.max_kv_len
-            fresh = metadata.derived(needs_dense=needs_dense, max_kv_len=cap.max_kv_len)
-            transaction = Transaction(gb.targets(metadata, fresh))
-            derived = gb.derived_view(needs_dense=needs_dense)
-            qo_indptr, kv_seq_lens = gb.qo_indptr, gb.kv_seq_lens
-            block_tables = (
-                gb.block_tables
-                if (needs_dense or metadata.block_tables is not None)
-                else None
-            )
+            max_q_len, max_kv_len = gb.capacity.max_q_len, gb.capacity.max_kv_len
         else:
-            gb = None
             max_q_len, max_kv_len = metadata.max_q_len, metadata.max_kv_len
-            fresh = metadata.derived(needs_dense=needs_dense)
-            transaction = None
-            derived = fresh
-            qo_indptr, kv_seq_lens = metadata.qo_indptr, metadata.kv_seq_lens
-            # dense table given by the caller or derived (None where truly absent)
-            block_tables = (
-                metadata.block_tables
-                if metadata.block_tables is not None
-                else derived.block_tables
+
+        trace: List[Tuple[str, str, str]] = []
+        chosen = None
+        for name in resolution.backends:
+            needs_dense = CAPABILITIES[name].needs_dense
+            if gb is not None:
+                if needs_dense:
+                    # flat form: only a backend that reads the dense table pays
+                    # for it, and only once (no-op in the dense form)
+                    gb.reserve_dense_table()
+                derived = gb.derived_view(needs_dense=needs_dense)
+                qo_indptr, kv_seq_lens = gb.qo_indptr, gb.kv_seq_lens
+                block_tables = (
+                    gb.block_tables
+                    if (needs_dense or metadata.block_tables is not None)
+                    else None
+                )
+            else:
+                derived = metadata.derived(needs_dense=needs_dense)
+                qo_indptr, kv_seq_lens = metadata.qo_indptr, metadata.kv_seq_lens
+                # dense table given by the caller or derived (None where truly absent)
+                block_tables = (
+                    metadata.block_tables
+                    if metadata.block_tables is not None
+                    else derived.block_tables
+                )
+            meta = PlanMetadata(
+                qo_indptr=qo_indptr,
+                kv_seq_lens=kv_seq_lens,
+                block_tables=block_tables,
+                kv_input_form=kv_input_form,
+                page_size=metadata.page_size,
+                max_q_len=max_q_len,
+                max_kv_len=max_kv_len,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                q_dtype=q_dtype,
+                kv_dtype=kv_dtype,
+                causal=causal,
+                window_left=window_left,
+                kv_layout=kv_layout,
+                lse_mode=lse_mode,
+                batch_size=metadata.batch_size,
+                qo_indptr_cpu=metadata.qo_indptr_cpu,
+                kv_seq_lens_cpu=metadata.kv_seq_lens_cpu,
             )
-        meta = PlanMetadata(
-            qo_indptr=qo_indptr,
-            kv_seq_lens=kv_seq_lens,
-            block_tables=block_tables,
-            kv_input_form=kv_input_form,
-            page_size=metadata.page_size,
-            max_q_len=max_q_len,
-            max_kv_len=max_kv_len,
-            num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            q_dtype=q_dtype,
-            kv_dtype=kv_dtype,
-            causal=causal,
-            window_left=window_left,
-            kv_layout=kv_layout,
-            lse_mode=lse_mode,
-            batch_size=metadata.batch_size,
-            qo_indptr_cpu=metadata.qo_indptr_cpu,
-            kv_seq_lens_cpu=metadata.kv_seq_lens_cpu,
-        )
+            key = (name, kv_layout)
+            candidate = self._backends.get(key)
+            if candidate is None:
+                # construction only (no plan state); cached so a candidate
+                # that keeps declining is not rebuilt on every plan
+                candidate = make_backend(
+                    name,
+                    self.device,
+                    kv_layout,
+                    self._scratch_workspace(),
+                    graph_capacity=gb.capacity if gb is not None else None,
+                )
+                self._backends[key] = candidate
+            try:
+                candidate.preflight(meta)
+            except _BackendPlanUnsupportedError as exc:
+                trace.append((name, "preflight", str(exc)))
+                if explicit:
+                    raise ValueError(
+                        f"backend {name!r} cannot plan this batch: {exc}"
+                    ) from exc
+                continue
+            trace.append((name, "preflight", "accepted"))
+            chosen = (name, candidate, meta, derived, needs_dense)
+            break
+        if chosen is None:
+            detail = "; ".join(f"{n}: {r}" for n, _, r in trace)
+            raise ValueError(
+                "no pinned candidate can plan this batch "
+                f"(candidates {list(resolution.backends)}: {detail})"
+            )
+        name, candidate, meta, derived, needs_dense = chosen
 
         # graph mode: the frozen contract is checked before any reserved
         # buffer is written (the staging copies run inside the transaction)
@@ -369,26 +411,21 @@ class PagedAttentionController:
         if self._frozen is not None:
             _check_frozen_contract(self._frozen, contract)
 
-        key = (name, kv_layout)
-        candidate = self._backends.get(key)
-        if candidate is None:
-            candidate = make_backend(
-                name,
-                self.device,
-                kv_layout,
-                self._scratch_workspace(),
-                graph_capacity=gb.capacity if gb is not None else None,
-            )
-        if transaction is not None:
+        if gb is not None:
             # stage the new batch into reserved storage; any failure below
             # (including inside the backend's own plan) restores every buffer
+            fresh = metadata.derived(
+                needs_dense=needs_dense, max_kv_len=gb.capacity.max_kv_len
+            )
+            transaction = Transaction(gb.targets(metadata, fresh))
             with transaction:
                 candidate.plan(meta, derived)
                 transaction.commit()
         else:
             candidate.plan(meta, derived)
 
-        # publish — nothing above mutated the published state
+        # publish — nothing above mutated the published state (the backend
+        # cache holds constructed objects, not plan state)
         if gb is not None:
             self._graph = gb
             self._frozen = contract
@@ -396,10 +433,10 @@ class PagedAttentionController:
                 k: v for k, v in contract.items() if k in _PLAN_PARAMS
             }
             self._frozen_plan_kwargs["backend"] = name
-        self._backends[key] = candidate
         self._active = candidate
         self._backend_name = name
         self._resolution = resolution
+        self._trace = trace
         self._meta = meta
         self._derived = derived
         self._planned = True
@@ -602,10 +639,19 @@ class PagedAttentionController:
             v_scale=v_scale,
         )
 
+    @property
+    def selection_trace(self) -> Tuple[Tuple[str, str, str], ...]:
+        """``(backend, phase, reason)`` for every candidate the last plan() tried."""
+        return tuple(self._trace)
+
     def explain(self) -> str:
         _expect(self._planned, "explain() called before plan() — call plan() first")
         assert self._resolution is not None
-        return f"chosen: {self._backend_name}\n{self._resolution.explain()}"
+        lines = [f"chosen: {self._backend_name}", "plan-time trace:"]
+        for name, phase, reason in self._trace:
+            lines.append(f"  {name} [{phase}]: {reason}")
+        lines.append(self._resolution.explain())
+        return "\n".join(lines)
 
 
 # plan() keyword arguments update() re-issues from the frozen contract; the
