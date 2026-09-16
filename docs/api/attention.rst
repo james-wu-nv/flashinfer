@@ -285,8 +285,10 @@ unlimited, ``lse_mode`` 0/1/2 = none/base-2/natural log. The resolved backend
 is not part of the identity, so fa2, fa3, cuDNN and trtllm-gen traces of one
 plan compare against the same definition. Tracing requires the planned
 instance: ``PagedAttention.run.fi_trace(...)`` and a trace before ``plan()``
-raise instead of guessing, and a plan that uses ``logits_soft_cap``, a custom
-mask or attention sinks refuses to trace until the definition encodes them.
+raise instead of guessing; a plan that uses ``logits_soft_cap``, a custom
+mask or attention sinks refuses to trace until the definition encodes them,
+and so does a batch with padding rows (``kv_len == 0``), which the
+definition's ``min(kv_seq_lens) >= 1`` constraint excludes.
 With the fa2/fa3 backends auto-dump also emits the nested legacy
 ``gqa_paged_prefill`` definition of the wrapper they run on.
 
