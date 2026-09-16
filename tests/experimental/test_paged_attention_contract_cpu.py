@@ -598,6 +598,31 @@ def test_validate_values_rejects_mismatched_mirrors():
         validate_values(qo, kv, bt, None, 4, 3, 10, qo, kv[:-1])
 
 
+@pytest.mark.parametrize(
+    "name,dtype",
+    [
+        ("qo_indptr", torch.int64),
+        ("qo_indptr", torch.float32),
+        ("kv_seq_lens", torch.int64),
+        ("kv_seq_lens", torch.float32),
+    ],
+)
+def test_validate_values_rejects_mirrors_of_the_wrong_dtype(name, dtype):
+    """A float mirror used to surface as a numpy casting error and an int64
+    one was truncated to int32 silently; both are contract violations."""
+    qo = torch.tensor([0, 4, 6, 9], dtype=torch.int32)
+    kv = torch.tensor([10, 6, 9], dtype=torch.int32)
+    bt = torch.zeros(3, 3, dtype=torch.int32)
+    mirrors = dict(qo_indptr=qo, kv_seq_lens=kv)
+    mirrors[name] = mirrors[name].to(dtype)
+    with pytest.raises(
+        ValueError, match=f"{name}_cpu must be int32 like {name}, got {dtype}"
+    ):
+        validate_values(
+            qo, kv, bt, None, 4, 4, 10, mirrors["qo_indptr"], mirrors["kv_seq_lens"]
+        )
+
+
 def test_causal_envelope_names_the_offending_request():
     qo = torch.tensor([0, 2, 7, 9], dtype=torch.int32)
     bt = torch.zeros(3, 3, dtype=torch.int32)  # capacity 3 x 4 = 12

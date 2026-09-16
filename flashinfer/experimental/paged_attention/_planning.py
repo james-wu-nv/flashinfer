@@ -271,18 +271,26 @@ def validate_values(
     metadata object keeps them for the causal-envelope check and derivation
     instead of recomputing the same differences and prefix sums.
     """
-    _expect(
-        isinstance(qo_indptr_cpu, torch.Tensor)
-        and qo_indptr_cpu.device.type == "cpu"
-        and tuple(qo_indptr_cpu.shape) == tuple(qo_indptr.shape),
-        "qo_indptr_cpu must be a CPU mirror with the same shape as qo_indptr",
-    )
-    _expect(
-        isinstance(kv_seq_lens_cpu, torch.Tensor)
-        and kv_seq_lens_cpu.device.type == "cpu"
-        and tuple(kv_seq_lens_cpu.shape) == tuple(kv_seq_lens.shape),
-        "kv_seq_lens_cpu must be a CPU mirror with the same shape as kv_seq_lens",
-    )
+    for name, mirror, device_tensor in (
+        ("qo_indptr", qo_indptr_cpu, qo_indptr),
+        ("kv_seq_lens", kv_seq_lens_cpu, kv_seq_lens),
+    ):
+        _expect(
+            isinstance(mirror, torch.Tensor)
+            and mirror.device.type == "cpu"
+            and tuple(mirror.shape) == tuple(device_tensor.shape),
+            f"{name}_cpu must be a CPU mirror with the same shape as {name}",
+        )
+        # The mirrors feed numpy below and are copied into the int32 pinned
+        # staging: a float mirror would fail inside numpy with a casting
+        # error and an int64 one would be truncated silently, so hold them to
+        # the device tensors' dtype.
+        _expect(
+            mirror.dtype == torch.int32,
+            f"{name}_cpu must be int32 like {name}, got {mirror.dtype} — "
+            "torch.tensor([...]) and cumsum default to int64; build with "
+            "dtype=torch.int32 or .int()",
+        )
     host = HostArrays(qo_indptr_cpu, kv_seq_lens_cpu, page_size)
     qo = host.numpy("qo_indptr")
     q_lens = host.numpy("q_seq_lens")
