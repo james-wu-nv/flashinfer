@@ -33,8 +33,11 @@ marked xfail rather than dropped, so the gap stays visible in reports):
 - block_tables VALUES (page ids) are trusted to be in-pool — a negative or
   stale id returns finite plausible garbage on every backend; the production
   answer is an opt-in debug validation pass (FLASHINFER_VALIDATE_INPUTS).
-Zero-length sequences and causal q_len>kv_len are REJECTED by validation
-(fully-masked rows have backend-divergent LSE semantics).
+Zero-length queries and causal q_len>kv_len on live rows are REJECTED by
+validation (fully-masked rows have backend-divergent LSE semantics); kv_len 0
+rows are padding rows with unspecified values and are covered by the
+prototype suite (the valid-config sampler never draws them because the
+oracle would have nothing to compare).
 """
 
 import os

@@ -4,7 +4,8 @@ Pure-torch fp32 implementation of paged batch prefill with bottom-right
 causal masking, returning both the output and the contract-form LSE
 (base-2, packed ``(total_q_tokens, num_qo_heads)``).  Deliberately written
 request-by-request from first principles — slow and obvious beats fast and
-kernel-shaped for an oracle.
+kernel-shaped for an oracle.  Padding rows (kv_len 0) get a zero output and
+LSE -inf; the library contract leaves them unspecified, so compare live rows.
 """
 
 import math
@@ -60,6 +61,13 @@ def reference_paged_prefill(
         s, e = int(qo_indptr_cpu[i]), int(qo_indptr_cpu[i + 1])
         lq, lkv = e - s, int(kv_seq_lens_cpu[i])
         if lq == 0:
+            continue
+        if lkv == 0:
+            # padding row: the contract leaves its values unspecified (finite
+            # output); the oracle's convention is the empty softmax, so tests
+            # exclude these rows from the comparison rather than rely on it
+            out[s:e] = 0.0
+            lse[s:e] = float("-inf")
             continue
         q_i = q[s:e].float()  # (lq, Hq, Dqk)
         n_pages = (lkv + page_size - 1) // page_size

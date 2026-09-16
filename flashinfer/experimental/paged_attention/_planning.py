@@ -293,12 +293,15 @@ def validate_values(
         f"query ({q_max}) — this would silently corrupt scheduling "
         "or graph shapes downstream",
     )
-    if kv.min() < 1:
-        bad = int(np.argmax(kv < 1))
+    # kv_len 0 is a PADDING ROW (vLLM fills seq_lens[num_reqs:] with 0 for
+    # CUDA-graph padding): legal, its output row is finite and unspecified,
+    # its LSE unspecified, no page of its table row is read.  Only negative
+    # lengths are corrupt.
+    if kv.min() < 0:
+        bad = int(np.argmax(kv < 0))
         raise ValueError(
-            f"kv_seq_lens must be >= 1 (request {bad} has {int(kv[bad])}) — "
-            "zero-length KV rows are outside the v1 envelope; filter empty "
-            "requests before plan()"
+            f"kv_seq_lens must be >= 0 (request {bad} has {int(kv[bad])}); "
+            "0 marks a padding row"
         )
     kv_max = int(kv.max())
     _expect(
@@ -328,10 +331,14 @@ def validate_values(
 
 
 def validate_causal_envelope(host: HostArrays) -> None:
-    """Causal masking requires q_len_i <= kv_len_i (host arrays, zero sync)."""
+    """Causal masking requires q_len_i <= kv_len_i (host arrays, zero sync).
+
+    Padding rows (kv_len 0) are exempt: their queries attend to nothing by
+    contract, so the fully-masked-row question does not arise for them.
+    """
     q_lens = host.numpy("q_seq_lens")
     kv = host.numpy("kv_seq_lens")
-    over = q_lens > kv
+    over = (q_lens > kv) & (kv > 0)
     if over.any():
         bad = int(np.argmax(over))
         raise ValueError(
@@ -412,18 +419,28 @@ def derive(
         if block_tables is not None:
             out.block_tables = block_tables
         else:
-            kv_page_indptr = host.device_view("kv_page_indptr", device)
             width = (max_kv_len + page_size - 1) // page_size  # host int, no sync
+            if int(host.numpy("kv_page_indptr")[-1]) == 0:
+                # every row is a padding row: nothing to gather (the flat list
+                # may be empty); no kernel reads a page of a kv_len-0 row
+                out.block_tables = torch.zeros(
+                    b, width, dtype=torch.int32, device=device
+                )
+                return out
+            kv_page_indptr = host.device_view("kv_page_indptr", device)
             col = torch.arange(width, device=device, dtype=torch.int64)
             src = kv_page_indptr[:-1].to(torch.int64).unsqueeze(1) + col.unsqueeze(0)
-            # clamp each row's tail to the request's OWN last live page (kv_len
-            # >= 1 is validated, so every row owns at least one).  Load-bearing:
-            # cuDNN gathers K/V pages by table width before masking, so a tail
-            # pointing into a neighbouring request or the over-allocated
-            # (possibly uninitialized) region of kv_page_indices produced NaN
-            # outputs / out-of-pool reads (fuzzer: csr_overallocated_nan_tail).
+            # clamp each row's tail to the request's OWN last live page.
+            # Load-bearing: cuDNN gathers K/V pages by table width before
+            # masking, so a tail pointing into a neighbouring request or the
+            # over-allocated (possibly uninitialized) region of kv_page_indices
+            # produced NaN outputs / out-of-pool reads (fuzzer:
+            # csr_overallocated_nan_tail).  A padding row (kv_len 0) owns no
+            # page; its clamp lands on the previous row's last page (or index
+            # 0 for a leading padding row), a live in-pool id that no kernel
+            # reads for that row.
             row_last = kv_page_indptr[1:].to(torch.int64).unsqueeze(1) - 1
-            src = torch.minimum(src, row_last)
+            src = torch.minimum(src, row_last).clamp_(min=0)
             out.block_tables = (
                 kv_page_indices.to(torch.int64)
                 .gather(0, src.reshape(-1))
