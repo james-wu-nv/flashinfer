@@ -13,6 +13,7 @@ import torch
 
 from .._contracts import PlanMetadata
 from .._planning import Derived
+from ._capabilities import _BackendPlanUnsupportedError
 
 
 class _CudnnBackend:
@@ -51,6 +52,15 @@ class _CudnnBackend:
             )
             self._scale_tensors[value] = t
         return t
+
+    def preflight(self, meta: PlanMetadata) -> None:
+        """Batch-specific checks; typed unsupported only, no allocation."""
+        from ....cudnn import prefill as cudnn_prefill
+
+        if not cudnn_prefill.CUDNN_AVAILABLE:
+            raise _BackendPlanUnsupportedError(
+                "cudnn-frontend python package not importable"
+            )
 
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
         # Page-table ABI: cuDNN requires the table's page dimension to equal

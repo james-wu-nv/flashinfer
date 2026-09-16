@@ -20,6 +20,21 @@ from typing import Dict, Optional
 
 import torch
 
+
+class _BackendPlanUnsupportedError(RuntimeError):
+    """Typed signal for a plan-time (batch-specific) preflight rejection.
+
+    Mirrors the private type of the same name in
+    ``flashinfer/mla/_batch_mla/_backends/_capabilities.py`` (also a
+    ``RuntimeError`` subclass); the two are to be unified once the shared
+    location is decided.  A backend raises it from ``preflight(meta)`` -- before
+    any live-state write -- for a batch it cannot run although the static
+    capability check admitted the configuration.  The controller treats it as
+    "try the next pinned candidate"; every other exception (invalid input, OOM,
+    JIT/compile failure) propagates unchanged, and ``run()`` never falls back.
+    """
+
+
 # Below this page size a dense (b, max_pages) block table degenerates toward
 # (b, max_context): the dense INPUT form requires page_size >= this floor, and
 # dense DERIVATION from the flat-indices form is refused below it (backends
@@ -199,4 +214,9 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
     ),
 }
 
-__all__ = ["CAPABILITIES", "MIN_DENSE_PAGE_SIZE", "PagedAttentionCapabilities"]
+__all__ = [
+    "CAPABILITIES",
+    "MIN_DENSE_PAGE_SIZE",
+    "PagedAttentionCapabilities",
+    "_BackendPlanUnsupportedError",
+]

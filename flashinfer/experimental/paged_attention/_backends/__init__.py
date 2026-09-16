@@ -1,8 +1,10 @@
 """Concrete paged-prefill backends and the factory the controller uses.
 
-Each backend owns one complete implementation behind the same two calls:
-``plan(meta, derived)`` and ``run(q, k_cache, v_cache, *, out, lse)``.
-Nothing outside a backend knows its native dialect or LSE format.
+Each backend owns one complete implementation behind the same three calls:
+``preflight(meta)`` (cheap, allocation-free, may raise the typed
+``_BackendPlanUnsupportedError`` for a batch it cannot run), ``plan(meta,
+derived)`` and ``run(q, k_cache, v_cache, *, out, lse)``.  Nothing outside a
+backend knows its native dialect or LSE format.
 """
 
 from __future__ import annotations
@@ -11,7 +13,12 @@ from typing import Callable, Dict
 
 import torch
 
-from ._capabilities import CAPABILITIES, MIN_DENSE_PAGE_SIZE, PagedAttentionCapabilities
+from ._capabilities import (
+    CAPABILITIES,
+    MIN_DENSE_PAGE_SIZE,
+    PagedAttentionCapabilities,
+    _BackendPlanUnsupportedError,
+)
 from .cudnn_backend import _CudnnBackend
 from .fa_backend import _FaBackend
 from .trtllm_gen_backend import _TrtllmGenBackend
@@ -45,5 +52,6 @@ __all__ = [
     "CAPABILITIES",
     "MIN_DENSE_PAGE_SIZE",
     "PagedAttentionCapabilities",
+    "_BackendPlanUnsupportedError",
     "make_backend",
 ]

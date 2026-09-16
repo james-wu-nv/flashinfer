@@ -23,6 +23,11 @@ import torch
 
 from .._contracts import LN2, PlanMetadata
 from .._planning import Derived
+from ._capabilities import _BackendPlanUnsupportedError
+
+# Page sizes the trtllm-gen paged context kernel is shipped for (the
+# capability table admits a verified subset of these).
+_KERNEL_PAGE_SIZES = frozenset({16, 32, 64, 128, 256, 512, 1024})
 
 
 class _TrtllmGenBackend:
@@ -36,6 +41,19 @@ class _TrtllmGenBackend:
         self._counter: Optional[torch.Tensor] = None  # zeroed multi-CTA KV counters
         self._meta: Optional[PlanMetadata] = None
         self._derived: Optional[Derived] = None
+
+    def preflight(self, meta: PlanMetadata) -> None:
+        """Batch-specific checks; typed unsupported only, no allocation."""
+        if meta.page_size not in _KERNEL_PAGE_SIZES:
+            raise _BackendPlanUnsupportedError(
+                f"trtllm-gen has no paged context kernel for page_size "
+                f"{meta.page_size} (shipped: {sorted(_KERNEL_PAGE_SIZES)})"
+            )
+        if not meta.causal and meta.window_left >= 0:
+            raise _BackendPlanUnsupportedError(
+                "trtllm-gen has no non-causal sliding-window context kernel "
+                "(window_left >= 0 requires causal=True)"
+            )
 
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
         from ....utils import (
