@@ -111,8 +111,9 @@ Notes that came out of the review and the library work:
   would therefore pay one D2H per step through the unified API.
 - **Zero rows.** vLLM's graph padding (`seq_lens[num_reqs:].fill_(0)` in
   `vllm/v1/worker/gpu_model_runner.py:2202`) is legal input: a `kv_len == 0`
-  row is a padding row whose page is never read, whose output row is finite
-  and whose values and LSE are unspecified. The padding rows' `q_len == 0`
+  row is a padding row whose page is never read and whose output row and LSE
+  are unspecified (trtllm-gen leaves them unwritten; vLLM never reads padded
+  rows). The padding rows' `q_len == 0`
   (`query_start_loc.np[num_reqs + 1:].fill(...)`, `:2084`) is **not** yet
   accepted (ledger M17), so the eager prefill path above is unaffected but a
   captured decode-shaped bucket would have to give each padding row one query

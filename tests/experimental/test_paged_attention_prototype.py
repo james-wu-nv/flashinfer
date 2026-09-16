@@ -687,13 +687,14 @@ def _padded_problem(
 def test_zero_length_kv_rows_are_padding(backend, input_form, style):
     """kv_len 0 rows are legal padding rows (ledger M11): the call succeeds,
     reads no page of those rows (page 0 is NaN-poisoned in the vLLM style),
-    their output is finite, and every live row matches the oracle.  Their
-    LSE is unspecified and not compared.  The sglang style (fill 1) is an
-    ordinary batch and must match the oracle on every row."""
+    and every live row matches the oracle.  Their output and LSE are
+    unspecified (trtllm-gen leaves them unwritten) and not compared.  The
+    sglang style (fill 1) is an ordinary batch and must match the oracle on
+    every row."""
     p, live, padding = _padded_problem(seed=61, input_form=input_form, style=style)
     _resolve_or_skip(p, backend)
     _, out, lse = run_unified(p, backend)
-    assert torch.isfinite(out.float()).all()
+    assert torch.isfinite(out.float()[live.to(out.device)]).all()
     ref_out, ref_lse = reference_paged_prefill(
         p["q"],
         p["k_ref"],

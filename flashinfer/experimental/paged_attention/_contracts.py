@@ -254,12 +254,12 @@ class PagedAttentionMetadata:
     Padding rows: ``kv_seq_lens[i] == 0`` is legal and marks a padding row
     (vLLM's CUDA-graph padding fills ``seq_lens`` with 0 and the table row
     with its null block; sglang's fill value 1 is an ordinary live row).  The
-    library guarantees no page of that row is read, a finite output row, and
-    unchanged results for every other row; the row's output values and LSE
-    are unspecified.  Every backend handles it natively (measured on B200:
-    trtllm-gen ``seq_lens=0``, cuDNN ``actual_seq_lens_kv=0``, the FA kernels
-    a CSR row with zero pages all give a zero output row and LSE -inf; cake
-    declines the batch, see the backend).  A request may also have
+    library guarantees no page of that row is read and unchanged results for
+    every other row; the row's output and LSE are unspecified and may be left
+    unwritten — never read a padding row.  Measured on B200: cuDNN
+    (``actual_seq_lens_kv=0``) and the FA kernels (a CSR row with zero pages)
+    write a zero output row and LSE -inf, trtllm-gen (``seq_lens=0``) leaves
+    the rows untouched; cake declines the batch, see the backend.  A request may also have
     ``q_len == 0`` (``qo_indptr[i] == qo_indptr[i + 1]``, vLLM's padded
     ``query_start_loc`` tail): it owns no query token and no output row, and
     every backend leaves the other rows correct (ledger M17, measured with
