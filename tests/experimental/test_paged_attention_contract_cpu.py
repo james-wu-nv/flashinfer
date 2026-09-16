@@ -1,0 +1,926 @@
+"""Host-only contract tests for the unified paged attention package.
+
+Everything here runs with ``CUDA_VISIBLE_DEVICES=""``: the environment probes
+are monkeypatched away, ``Transaction`` / ``GraphBuffers`` are exercised on
+hand-built CPU buffers, and metadata validation goes through the host-mirror
+validators.  This is the "host/static" CI layer of the test-coverage report
+(§5.2): the contract is checked before any kernel exists, so a capability or
+key regression fails on a CPU-only runner.
+
+Known gaps recorded as strict xfails (they flip to XPASS when fixed):
+
+- ledger M2 (WP-A): ``Transaction.__enter__`` does not roll back the copies
+  made before a failing copy in the staging loop.
+- WP-E (mla-alignment F6): ``Resolution.config`` does not carry the device /
+  compute-capability identity it was resolved for.
+"""
+
+import dataclasses
+import inspect
+import os
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from flashinfer.experimental import paged_attention as pa
+from flashinfer.experimental.paged_attention import (
+    CAPABILITIES,
+    HEURISTIC_ORDER,
+    MIN_DENSE_PAGE_SIZE,
+    GraphBuffers,
+    GraphCapacity,
+    PagedAttentionMetadata,
+    _selection,
+    resolve_paged_attention,
+)
+from flashinfer.experimental.paged_attention._contracts import (
+    LSE_MODES,
+    _expect_lse_mode,
+    _expect_page_size,
+    _expect_window_left,
+    resolve_config_key,
+)
+from flashinfer.experimental.paged_attention._controller import (
+    PagedAttentionController,
+)
+from flashinfer.experimental.paged_attention._graph import Transaction
+from flashinfer.experimental.paged_attention._planning import (
+    Derived,
+    validate_causal_envelope,
+    validate_values,
+)
+from flashinfer.prefill import PagedAttention
+
+
+@pytest.fixture
+def no_probes(monkeypatch):
+    """Selection without touching CUDA: every environment probe reports 'available'."""
+    monkeypatch.setattr(
+        _selection, "PROBES", {name: (lambda: None) for name in CAPABILITIES}
+    )
+
+
+_BASE = dict(
+    num_qo_heads=8,
+    num_kv_heads=2,
+    head_dim_qk=128,
+    q_dtype=torch.bfloat16,
+    page_size=16,
+    need_lse=True,
+)
+
+
+def _resolve(cc_major, **kw):
+    return resolve_paged_attention(cc_major=cc_major, **{**_BASE, **kw})
+
+
+# ---------------------------------------------------------------------------
+# resolve_config_key: the drift detector between resolve() and plan()
+# ---------------------------------------------------------------------------
+
+KEY_KW = dict(
+    num_qo_heads=8,
+    num_kv_heads=2,
+    head_dim_qk=128,
+    head_dim_vo=128,
+    q_dtype=torch.bfloat16,
+    kv_dtype=torch.bfloat16,
+    page_size=16,
+    kv_layout="HND",
+    causal=True,
+    need_lse=True,
+    window_left=-1,
+    kv_input_form="block_tables",
+)
+KEY_DRIFT = dict(
+    num_qo_heads=16,
+    num_kv_heads=1,
+    head_dim_qk=64,
+    head_dim_vo=64,
+    q_dtype=torch.float16,
+    kv_dtype=torch.float8_e4m3fn,
+    page_size=32,
+    kv_layout="NHD",
+    causal=False,
+    need_lse=False,
+    window_left=0,
+    kv_input_form="page_indices",
+)
+
+
+def test_resolve_config_key_layout_is_pinned():
+    """plan() compares this tuple against Resolution.config.  A layout change
+    must be deliberate: update this pin together with the drift test below."""
+    assert resolve_config_key(**KEY_KW) == (
+        8,
+        2,
+        128,
+        128,
+        "torch.bfloat16",
+        "torch.bfloat16",
+        16,
+        "HND",
+        True,
+        True,
+        -1,
+        "block_tables",
+    )
+
+
+@pytest.mark.parametrize("field", sorted(KEY_KW))
+def test_resolve_config_key_detects_single_field_drift(field):
+    base = resolve_config_key(**KEY_KW)
+    drifted = resolve_config_key(**{**KEY_KW, field: KEY_DRIFT[field]})
+    assert drifted != base, field
+    assert resolve_config_key(**KEY_KW) == base  # deterministic
+
+
+def test_every_semantic_plan_kwarg_is_part_of_the_key():
+    """A plan() kwarg (soft-cap, sinks, ...) that is not in the key would let
+    a pinned Resolution silently accept a different configuration."""
+    renamed = {
+        "lse_mode": "need_lse"
+    }  # plan() speaks lse_mode; the key stores need_lse
+    key_params = set(inspect.signature(resolve_config_key).parameters)
+    for plan in (PagedAttentionController.plan, PagedAttention.plan):
+        plan_params = set(inspect.signature(plan).parameters) - {
+            "self",
+            "metadata",
+            "backend",
+        }
+        missing = {renamed.get(p, p) for p in plan_params} - key_params
+        assert not missing, (
+            f"{plan.__qualname__} kwargs missing from resolve_config_key: "
+            f"{sorted(missing)}"
+        )
+    # the two metadata-derived facts the key must carry
+    assert {"page_size", "kv_input_form"} <= key_params
+    # resolve() accepts exactly the key fields plus its own routing arguments
+    resolve_params = set(inspect.signature(resolve_paged_attention).parameters)
+    assert resolve_params - key_params <= {"device", "cc_major", "backend"}
+    assert key_params <= resolve_params
+
+
+def test_resolution_is_frozen_and_config_matches_key(no_probes):
+    res = _resolve(9)
+    assert res.config == resolve_config_key(
+        8,
+        2,
+        128,
+        128,
+        torch.bfloat16,
+        torch.bfloat16,
+        16,
+        "HND",
+        True,
+        True,
+        -1,
+        "block_tables",
+    )
+    assert res.chosen == res.backends[0]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        res.backends = ()
+    text = res.explain()
+    assert "candidates" in text
+    assert all(name in text for name in res.excluded)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="WP-E (mla-alignment F6): Resolution.config must carry the resolved "
+    "(cc_major, cc_minor, device index) so a Resolution taken on another GPU "
+    "fails plan()'s drift check instead of pinning the wrong candidate set",
+)
+def test_resolution_config_carries_device_identity(no_probes):
+    assert _resolve(9).config != _resolve(10).config
+
+
+# ---------------------------------------------------------------------------
+# PagedAttentionCapabilities.rejection_reason matrix
+# ---------------------------------------------------------------------------
+
+
+def _reason(name, **over):
+    cap = CAPABILITIES[name]
+    kw = dict(
+        cc_major=min(cap.cc_majors),
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        head_dim_qk=128,
+        head_dim_vo=128,
+        page_size=16,
+        kv_layout="HND",
+        causal=True,
+        need_lse=True,
+        window_left=-1,
+        kv_input_form="block_tables",
+    )
+    kw.update(over)
+    return cap.rejection_reason(**kw)
+
+
+def _capability_rows():
+    rows = []
+    for name, cap in CAPABILITIES.items():
+        for cc in sorted(cap.cc_majors):
+            rows.append((name, f"cc{cc}", dict(cc_major=cc), None))
+        rows += [
+            (name, "cc7", dict(cc_major=7), "compute capability"),
+            # rejection order is pinned: compute capability is checked first
+            (
+                name,
+                "cc7-before-dtype",
+                dict(cc_major=7, q_dtype=torch.float32, kv_dtype=torch.float32),
+                "compute capability",
+            ),
+            (
+                name,
+                "q-fp32",
+                dict(q_dtype=torch.float32, kv_dtype=torch.float32),
+                "unsupported q dtype",
+            ),
+            (name, "kv-e5m2", dict(kv_dtype=torch.float8_e5m2), "unsupported kv dtype"),
+            (name, "kv-f16-q-bf16", dict(kv_dtype=torch.float16), "dtype pair"),
+            (name, "d32", dict(head_dim_qk=32, head_dim_vo=32), "head dims"),
+            (name, "nhd", dict(kv_layout="NHD"), None),
+            (name, "no-lse", dict(need_lse=False), None),
+        ]
+    rows += [
+        ("fa2", "fp8-kv", dict(kv_dtype=torch.float8_e4m3fn), None),
+        ("fa2", "d64", dict(head_dim_qk=64, head_dim_vo=64), None),
+        ("fa2", "d256", dict(head_dim_qk=256, head_dim_vo=256), None),
+        ("fa2", "d192-128", dict(head_dim_qk=192, head_dim_vo=128), "head dims"),
+        ("fa2", "csr-page1", dict(kv_input_form="page_indices", page_size=1), None),
+        ("fa2", "csr-page5", dict(kv_input_form="page_indices", page_size=5), None),
+        ("fa2", "page1024", dict(page_size=1024), None),
+        ("fa2", "noncausal", dict(causal=False), None),
+        ("fa2", "window0", dict(window_left=0), None),
+        ("fa3", "cc10", dict(cc_major=10), "compute capability"),
+        ("fa3", "fp8-kv", dict(kv_dtype=torch.float8_e4m3fn), "unsupported kv dtype"),
+        ("fa3", "d192-128", dict(head_dim_qk=192, head_dim_vo=128), "head dims"),
+        ("fa3", "window0", dict(window_left=0), None),
+        ("fa3", "noncausal", dict(causal=False), None),
+        ("cudnn", "d192-128", dict(head_dim_qk=192, head_dim_vo=128), None),
+        ("cudnn", "d64", dict(head_dim_qk=64, head_dim_vo=64), "head dims"),
+        ("cudnn", "window0", dict(window_left=0), "sliding window"),
+        ("cudnn", "noncausal", dict(causal=False), None),
+        (
+            "cudnn",
+            "csr-page1",
+            dict(kv_input_form="page_indices", page_size=1),
+            "dense block table",
+        ),
+        (
+            "cudnn",
+            "csr-page4",
+            dict(kv_input_form="page_indices", page_size=4),
+            "dense block table",
+        ),
+        ("cudnn", "csr-page8", dict(kv_input_form="page_indices", page_size=8), None),
+        ("cudnn", "fp8-kv", dict(kv_dtype=torch.float8_e4m3fn), "unsupported kv dtype"),
+        ("trtllm-gen", "cc9", dict(cc_major=9), "compute capability"),
+        ("trtllm-gen", "page8", dict(page_size=8), "unsupported page_size"),
+        ("trtllm-gen", "page128", dict(page_size=128), "unsupported page_size"),
+        ("trtllm-gen", "page32", dict(page_size=32), None),
+        ("trtllm-gen", "page64", dict(page_size=64), None),
+        ("trtllm-gen", "noncausal", dict(causal=False), "non-causal"),
+        ("trtllm-gen", "window0", dict(window_left=0), None),
+        ("trtllm-gen", "d64", dict(head_dim_qk=64, head_dim_vo=64), "head dims"),
+        (
+            "trtllm-gen",
+            "fp8-kv",
+            dict(kv_dtype=torch.float8_e4m3fn),
+            "unsupported kv dtype",
+        ),
+        (
+            "trtllm-gen",
+            "csr-page16",
+            dict(kv_input_form="page_indices", page_size=16),
+            None,
+        ),
+    ]
+    return rows
+
+
+_CAP_ROWS = _capability_rows()
+
+
+@pytest.mark.parametrize(
+    "backend,label,over,expected",
+    _CAP_ROWS,
+    ids=[f"{r[0]}-{r[1]}" for r in _CAP_ROWS],
+)
+def test_capability_rejection_reason_matrix(backend, label, over, expected):
+    reason = _reason(backend, **over)
+    if expected is None:
+        assert reason is None, f"{backend}/{label} unexpectedly excluded: {reason}"
+    else:
+        assert reason is not None, f"{backend}/{label} unexpectedly admitted"
+        assert expected in reason, f"{backend}/{label}: {reason!r}"
+
+
+# ---------------------------------------------------------------------------
+# resolve_paged_attention(): ordering, explain, contract rejections
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cc_major", sorted(HEURISTIC_ORDER))
+def test_auto_orders_by_heuristic_and_explains_every_backend(no_probes, cc_major):
+    res = _resolve(cc_major)
+    expected = tuple(
+        n for n in HEURISTIC_ORDER[cc_major] if _reason(n, cc_major=cc_major) is None
+    )
+    assert res.backends == expected
+    assert set(res.backends) | set(res.excluded) == set(CAPABILITIES)
+    assert not (set(res.backends) & set(res.excluded))
+    for name, why in res.excluded.items():
+        assert why == _reason(name, cc_major=cc_major)
+    assert res.kv_layout == "HND"
+
+
+def test_explicit_pin_evaluates_only_that_backend(no_probes):
+    res = _resolve(10, backend="fa2")
+    assert res.backends == ("fa2",)
+    assert res.excluded == {}
+    with pytest.raises(ValueError, match="unknown backend"):
+        _resolve(10, backend="fa9")
+    with pytest.raises(ValueError, match="compute capability"):
+        _resolve(8, backend="trtllm-gen")
+
+
+def test_no_runnable_backend_lists_every_reason(no_probes):
+    with pytest.raises(ValueError, match="no runnable backend") as ei:
+        _resolve(10, head_dim_qk=32)
+    assert all(name in str(ei.value) for name in CAPABILITIES)
+
+
+def test_probe_failure_becomes_an_exclusion_reason(monkeypatch):
+    probes = {name: (lambda: None) for name in CAPABILITIES}
+    probes["cudnn"] = lambda: "cudnn-frontend python package not importable"
+    monkeypatch.setattr(_selection, "PROBES", probes)
+    res = _resolve(10)
+    assert "cudnn" not in res.backends
+    assert res.excluded["cudnn"] == "cudnn-frontend python package not importable"
+    assert res.backends == ("trtllm-gen", "fa2")
+
+
+def test_probes_run_only_for_capability_admitted_backends(monkeypatch):
+    calls = []
+
+    def probe_for(name):
+        def probe():
+            calls.append(name)
+            return None
+
+        return probe
+
+    monkeypatch.setattr(_selection, "PROBES", {n: probe_for(n) for n in CAPABILITIES})
+    _resolve(8)  # fa3 / trtllm-gen are excluded statically on sm_8x
+    assert set(calls) == {"fa2", "cudnn"}
+
+
+@pytest.mark.parametrize(
+    "kw,match",
+    [
+        (dict(num_qo_heads=7), "divisible"),
+        (dict(num_qo_heads=0), "positive"),
+        (dict(num_kv_heads=0), "positive"),
+        (dict(kv_input_form="csr"), "kv_input_form"),
+        (dict(window_left=-2), "window_left"),
+        (dict(page_size=0), "page_size"),
+        (dict(page_size=4), f"< {MIN_DENSE_PAGE_SIZE}"),
+    ],
+)
+def test_resolve_rejects_contract_violations_before_capabilities(no_probes, kw, match):
+    with pytest.raises(ValueError, match=match):
+        _resolve(10, **kw)
+
+
+def test_resolve_accepts_token_csr_below_the_dense_floor(no_probes):
+    res = _resolve(10, page_size=4, kv_input_form="page_indices")
+    assert res.backends == ("fa2",)
+    assert "dense block table" in res.excluded["cudnn"]
+    assert "unsupported page_size" in res.excluded["trtllm-gen"]
+
+
+def test_heuristic_order_covers_declared_cc_majors():
+    declared = set().union(*(cap.cc_majors for cap in CAPABILITIES.values()))
+    assert declared <= set(HEURISTIC_ORDER), (
+        f"cc majors without a preference order: {sorted(declared - set(HEURISTIC_ORDER))}"
+    )
+    for cc, order in HEURISTIC_ORDER.items():
+        assert len(set(order)) == len(order), (cc, order)
+        declared_here = {n for n, cap in CAPABILITIES.items() if cc in cap.cc_majors}
+        assert set(order) == declared_here, (
+            f"sm_{cc}x order {order} != backends declaring sm_{cc}x "
+            f"{sorted(declared_here)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# the small loud-error helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", LSE_MODES)
+def test_lse_modes_accepted(mode):
+    _expect_lse_mode(mode)
+
+
+@pytest.mark.parametrize("mode", ["base10", "BASE2", "", None, 2])
+def test_lse_modes_rejected(mode):
+    with pytest.raises(ValueError, match="lse_mode"):
+        _expect_lse_mode(mode)
+
+
+@pytest.mark.parametrize("window_left", [-1, 0, 1, 4096])
+def test_window_left_accepted(window_left):
+    _expect_window_left(window_left)
+
+
+@pytest.mark.parametrize("window_left", [-2, -100, 1.5, "3", None])
+def test_window_left_rejected(window_left):
+    with pytest.raises(ValueError, match="window_left"):
+        _expect_window_left(window_left)
+
+
+@pytest.mark.parametrize(
+    "page_size,form,ok",
+    [
+        (1, "page_indices", True),
+        (5, "page_indices", True),
+        (MIN_DENSE_PAGE_SIZE, "block_tables", True),
+        (MIN_DENSE_PAGE_SIZE - 1, "block_tables", False),
+        (1, "block_tables", False),
+        (0, "page_indices", False),
+        (-1, "block_tables", False),
+        (1.5, "page_indices", False),
+    ],
+)
+def test_page_size_floor(page_size, form, ok):
+    if ok:
+        _expect_page_size(page_size, form)
+    else:
+        with pytest.raises(ValueError, match="page_size"):
+            _expect_page_size(page_size, form)
+
+
+# ---------------------------------------------------------------------------
+# validate_values: the host-mirror checks behind PagedAttentionMetadata
+# ---------------------------------------------------------------------------
+
+
+def _host_case(**over):
+    case = dict(
+        qo=[0, 4, 6, 9],
+        kv=[10, 6, 9],
+        page_size=4,
+        width=3,  # dense capacity 3 x 4 = 12 tokens
+        max_q_len=4,
+        max_kv_len=10,
+        csr=None,  # or the length of a flat page-id list
+        causal=False,
+    )
+    case.update(over)
+    return case
+
+
+def _validate(case):
+    qo = torch.tensor(case["qo"], dtype=torch.int32)
+    kv = torch.tensor(case["kv"], dtype=torch.int32)
+    bt = idx = None
+    if case["csr"] is None:
+        bt = torch.zeros(len(case["kv"]), case["width"], dtype=torch.int32)
+    else:
+        idx = torch.zeros(case["csr"], dtype=torch.int32)
+    validate_values(
+        qo,
+        kv,
+        bt,
+        idx,
+        case["page_size"],
+        case["max_q_len"],
+        case["max_kv_len"],
+        qo,
+        kv,
+        causal=case["causal"],
+    )
+
+
+_HOST_ROWS = [
+    ("valid-dense", {}, None),
+    ("valid-csr-exact", dict(csr=3 + 2 + 3), None),
+    ("valid-csr-overallocated", dict(csr=300), None),
+    ("csr-too-short", dict(csr=7), "kv_page_indices has 7 entries"),
+    ("indptr-not-increasing", dict(qo=[0, 4, 4, 9]), "strictly increasing"),
+    ("indptr-not-from-zero", dict(qo=[1, 4, 6, 9]), r"qo_indptr\[0\] must be 0"),
+    ("max-q-underclaim", dict(max_q_len=2), r"max_q_len \(2\) is smaller"),
+    ("kv-zero", dict(kv=[10, 0, 9]), ">= 1"),
+    ("kv-negative", dict(kv=[10, -1, 9]), ">= 1"),
+    ("causal-q-gt-kv", dict(kv=[10, 1, 9], causal=True), "q_len_i <= kv_len_i"),
+    ("noncausal-q-gt-kv-ok", dict(kv=[10, 1, 9], causal=False), None),
+    ("max-kv-underclaim", dict(max_kv_len=9), r"max_kv_len \(9\) is smaller"),
+    (
+        "dense-over-capacity",
+        dict(kv=[13, 6, 9], max_kv_len=13),
+        "exceeds block_tables capacity",
+    ),
+]
+
+
+@pytest.mark.parametrize("label,over,match", _HOST_ROWS, ids=[r[0] for r in _HOST_ROWS])
+def test_validate_values_matrix(label, over, match):
+    case = _host_case(**over)
+    if match is None:
+        _validate(case)
+    else:
+        with pytest.raises(ValueError, match=match):
+            _validate(case)
+
+
+def test_validate_values_rejects_mismatched_mirrors():
+    qo = torch.tensor([0, 4, 6, 9], dtype=torch.int32)
+    kv = torch.tensor([10, 6, 9], dtype=torch.int32)
+    bt = torch.zeros(3, 3, dtype=torch.int32)
+    with pytest.raises(ValueError, match="qo_indptr_cpu must be a CPU mirror"):
+        validate_values(qo, kv, bt, None, 4, 3, 10, qo[:-1], kv, causal=False)
+    with pytest.raises(ValueError, match="kv_seq_lens_cpu must be a CPU mirror"):
+        validate_values(qo, kv, bt, None, 4, 3, 10, qo, kv[:-1], causal=False)
+
+
+def test_causal_envelope_names_the_offending_request():
+    qo = torch.tensor([0, 2, 7, 9], dtype=torch.int32)
+    validate_causal_envelope(qo, torch.tensor([2, 5, 2], dtype=torch.int32))
+    with pytest.raises(ValueError, match="request 1 has q_len 5 > kv_len 4"):
+        validate_causal_envelope(qo, torch.tensor([2, 4, 2], dtype=torch.int32))
+
+
+def test_metadata_constructor_rejects_cpu_tensors_and_paging_form_errors():
+    qo = torch.tensor([0, 2], dtype=torch.int32)
+    kv = torch.tensor([4], dtype=torch.int32)
+    bt = torch.zeros(1, 1, dtype=torch.int32)
+    idx = torch.zeros(1, dtype=torch.int32)
+    common = dict(page_size=16, max_q_len=2, max_kv_len=4)
+    with pytest.raises(ValueError, match="CUDA tensor"):
+        PagedAttentionMetadata.dense(qo, kv, bt, **common)
+    with pytest.raises(ValueError, match="CUDA tensor"):
+        PagedAttentionMetadata.csr(qo, kv, idx, **common)
+    with pytest.raises(ValueError, match="EXACTLY ONE"):
+        PagedAttentionMetadata(
+            qo_indptr=qo, kv_seq_lens=kv, block_tables=bt, kv_page_indices=idx, **common
+        )
+    with pytest.raises(ValueError, match="EXACTLY ONE"):
+        PagedAttentionMetadata(qo_indptr=qo, kv_seq_lens=kv, **common)
+
+
+# ---------------------------------------------------------------------------
+# controller / public class: rejections that need no device
+# ---------------------------------------------------------------------------
+
+
+def test_controller_rejects_calls_before_plan_without_cuda():
+    ctl = PagedAttentionController(torch.device("cpu"))
+    assert ctl.backend is None and ctl.resolution is None
+    z = torch.zeros(1)
+    with pytest.raises(ValueError, match="before plan"):
+        ctl.run(z, (z, z))
+    with pytest.raises(ValueError, match="before plan"):
+        ctl.explain()
+    with pytest.raises(ValueError, match="PagedAttentionMetadata"):
+        ctl.plan(
+            "not metadata",
+            num_qo_heads=8,
+            num_kv_heads=2,
+            head_dim_qk=128,
+            q_dtype=torch.bfloat16,
+        )
+
+
+def test_public_class_validates_workspace_buffer_without_cuda():
+    dev = torch.device("cpu")
+    PagedAttention(dev, workspace_buffer=torch.empty(64, dtype=torch.uint8))
+    PagedAttention(dev, workspace_buffer=torch.empty(64, dtype=torch.int8))
+    with pytest.raises(ValueError, match="1-D"):
+        PagedAttention(dev, workspace_buffer=torch.empty(4, 4, dtype=torch.uint8))
+    with pytest.raises(ValueError, match="uint8"):
+        PagedAttention(dev, workspace_buffer=torch.empty(16, dtype=torch.float32))
+    with pytest.raises(ValueError, match="torch.Tensor"):
+        PagedAttention(dev, workspace_buffer=1 << 20)
+    with pytest.raises(ValueError, match="1-D"):
+        PagedAttention(dev, workspace_buffer=torch.empty(64, dtype=torch.uint8)[::2])
+
+
+# ---------------------------------------------------------------------------
+# Transaction: snapshot / restore on fake buffers
+# ---------------------------------------------------------------------------
+
+
+def _staging(n=3, fail_at=None):
+    dsts = [torch.full((2,), float(i + 1)) for i in range(n)]
+    originals = [d.clone() for d in dsts]
+    srcs = [torch.full((2,), 10.0 * (i + 1)) for i in range(n)]
+    if fail_at is not None:
+        srcs[fail_at] = torch.zeros(3)  # shape mismatch: copy_ raises RuntimeError
+    return dsts, srcs, originals
+
+
+def test_transaction_commit_publishes_every_copy():
+    dsts, srcs, _ = _staging()
+    with Transaction(list(zip(dsts, srcs, strict=True))) as tx:
+        for d, s in zip(dsts, srcs, strict=True):
+            assert torch.equal(d, s)  # staged on enter
+        tx.commit()
+    for d, s in zip(dsts, srcs, strict=True):
+        assert torch.equal(d, s)
+
+
+def test_transaction_body_failure_restores_every_destination():
+    dsts, srcs, originals = _staging()
+    with (
+        pytest.raises(RuntimeError, match="backend plan failed"),
+        Transaction(list(zip(dsts, srcs, strict=True))),
+    ):
+        raise RuntimeError("backend plan failed")
+    for d, o in zip(dsts, originals, strict=True):
+        assert torch.equal(d, o)
+
+
+def test_transaction_without_commit_restores():
+    dsts, srcs, originals = _staging()
+    with Transaction(list(zip(dsts, srcs, strict=True))):
+        pass
+    for d, o in zip(dsts, originals, strict=True):
+        assert torch.equal(d, o)
+
+
+_M2 = pytest.mark.xfail(
+    strict=True,
+    reason="ledger M2; WP-A: Transaction.__enter__ raises before __exit__ can run, "
+    "so destinations copied before the failing pair keep the new values",
+)
+
+
+@pytest.mark.parametrize(
+    "fail_at", [0, pytest.param(1, marks=_M2), pytest.param(2, marks=_M2)]
+)
+def test_transaction_failing_copy_in_enter_restores_earlier_destinations(fail_at):
+    """Every copy position may fail (mla-alignment F2 acceptance); the
+    destinations written before it must be back at their previous values."""
+    dsts, srcs, originals = _staging(fail_at=fail_at)
+    with pytest.raises(RuntimeError), Transaction(list(zip(dsts, srcs, strict=True))):
+        pass
+    for i, (d, o) in enumerate(zip(dsts, originals, strict=True)):
+        assert torch.equal(d, o), f"destination {i} not restored: {d.tolist()}"
+
+
+# ---------------------------------------------------------------------------
+# GraphBuffers.preflight / targets with hand-built capacity (no CUDA storage)
+# ---------------------------------------------------------------------------
+
+CAP_DENSE = GraphCapacity(
+    batch_size=4,
+    kv_input_form="block_tables",
+    page_size=16,
+    max_q_len=32,
+    max_kv_len=256,
+    total_q_tokens=64,
+    table_width=16,
+    flat_capacity=64,
+)
+CAP_CSR = GraphCapacity(
+    batch_size=4,
+    kv_input_form="page_indices",
+    page_size=1,
+    max_q_len=32,
+    max_kv_len=256,
+    total_q_tokens=64,
+    table_width=256,
+    flat_capacity=700,
+)
+
+
+def _buffers(cap):
+    gb = GraphBuffers.__new__(GraphBuffers)  # __init__ would allocate CUDA storage
+    gb.capacity = cap
+    return gb
+
+
+def _meta(cap, **over):
+    m = dict(
+        batch_size=cap.batch_size,
+        kv_input_form=cap.kv_input_form,
+        page_size=cap.page_size,
+        max_q_len=cap.max_q_len,
+        max_kv_len=cap.max_kv_len,
+        total_q_tokens=cap.total_q_tokens,
+        qo_indptr=torch.zeros(cap.batch_size + 1, dtype=torch.int32),
+        kv_seq_lens=torch.zeros(cap.batch_size, dtype=torch.int32),
+    )
+    if cap.kv_input_form == "block_tables":
+        m.update(
+            block_tables=torch.zeros(
+                cap.batch_size, cap.table_width, dtype=torch.int32
+            ),
+            kv_page_indices=None,
+        )
+    else:
+        m.update(
+            block_tables=None,
+            kv_page_indices=torch.zeros(cap.flat_capacity, dtype=torch.int32),
+        )
+    m.update(over)
+    return SimpleNamespace(**m)
+
+
+_PREFLIGHT_REJECT = [
+    ("batch", CAP_DENSE, dict(batch_size=3), "batch_size"),
+    (
+        "form",
+        CAP_DENSE,
+        dict(
+            kv_input_form="page_indices",
+            block_tables=None,
+            kv_page_indices=torch.zeros(64, dtype=torch.int32),
+        ),
+        "kv_input_form",
+    ),
+    ("page", CAP_DENSE, dict(page_size=32), "page_size"),
+    ("max_q-over", CAP_DENSE, dict(max_q_len=64), "max_q_len"),
+    ("max_kv-over", CAP_DENSE, dict(max_kv_len=512), "max_kv_len"),
+    ("total_q-over", CAP_DENSE, dict(total_q_tokens=80), "total_q_tokens"),
+    (
+        "width-wider",
+        CAP_DENSE,
+        dict(block_tables=torch.zeros(4, 17, dtype=torch.int32)),
+        "block_tables width",
+    ),
+    (
+        "width-narrower",
+        CAP_DENSE,
+        dict(block_tables=torch.zeros(4, 15, dtype=torch.int32)),
+        "block_tables width",
+    ),
+    (
+        "csr-over-capacity",
+        CAP_CSR,
+        dict(kv_page_indices=torch.zeros(701, dtype=torch.int32)),
+        "kv_page_indices has",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label,cap,over,match", _PREFLIGHT_REJECT, ids=[r[0] for r in _PREFLIGHT_REJECT]
+)
+def test_preflight_rejects_what_a_captured_kernel_would_misread(
+    label, cap, over, match
+):
+    with pytest.raises(ValueError, match=match) as ei:
+        _buffers(cap).preflight(_meta(cap, **over))
+    assert "CUDA graph re-plan" in str(ei.value)
+
+
+_PREFLIGHT_ACCEPT = [
+    ("dense-same", CAP_DENSE, {}),
+    ("csr-same", CAP_CSR, {}),
+    ("csr-shorter", CAP_CSR, dict(kv_page_indices=torch.zeros(300, dtype=torch.int32))),
+]
+
+
+@pytest.mark.parametrize(
+    "label,cap,over", _PREFLIGHT_ACCEPT, ids=[r[0] for r in _PREFLIGHT_ACCEPT]
+)
+def test_preflight_accepts_a_batch_that_fits(label, cap, over):
+    _buffers(cap).preflight(_meta(cap, **over))
+
+
+_FIXED_CAPACITY_ROWS = [
+    ("max_q-under", dict(max_q_len=16), "max_q_len"),
+    ("max_kv-under", dict(max_kv_len=128), "max_kv_len"),
+    ("total_q-under", dict(total_q_tokens=48), "total_q_tokens"),
+]
+
+
+@pytest.mark.parametrize(
+    "label,over,match", _FIXED_CAPACITY_ROWS, ids=[r[0] for r in _FIXED_CAPACITY_ROWS]
+)
+def test_preflight_fixed_capacity_contract_rejects_smaller_batches(label, over, match):
+    """TODAY's contract: the capture shapes must match exactly.  WP-A's capacity
+    substitution (ledger M10) turns these rows into accepted '<=' cases; when it
+    lands, move them into ``_PREFLIGHT_ACCEPT``."""
+    with pytest.raises(ValueError, match=match) as ei:
+        _buffers(CAP_DENSE).preflight(_meta(CAP_DENSE, **over))
+    assert "one PagedAttention(use_cuda_graph=True) instance per graph bucket" in str(
+        ei.value
+    )
+
+
+def _cpu_reserved(cap):
+    gb = _buffers(cap)
+    b = cap.batch_size
+    i32 = dict(dtype=torch.int32)
+    gb.qo_indptr = torch.zeros(b + 1, **i32)
+    gb.kv_seq_lens = torch.zeros(b, **i32)
+    gb.block_tables = torch.zeros(b, cap.table_width, **i32)
+    gb.kv_page_indices = torch.zeros(cap.flat_capacity, **i32)
+    gb.q_seq_lens = torch.zeros(b, **i32)
+    gb.cum_kv_seq_lens = torch.zeros(b + 1, **i32)
+    gb.kv_page_indptr = torch.zeros(b + 1, **i32)
+    return gb
+
+
+def _fresh(cap, n_flat, dense):
+    b = cap.batch_size
+    return Derived(
+        q_seq_lens=torch.ones(b, dtype=torch.int32),
+        cum_kv_seq_lens=torch.arange(b + 1, dtype=torch.int32),
+        kv_page_indptr=torch.arange(b + 1, dtype=torch.int32),
+        kv_page_indices=torch.arange(n_flat, dtype=torch.int32),
+        block_tables=torch.ones(b, cap.table_width, dtype=torch.int32)
+        if dense
+        else None,
+    )
+
+
+def test_csr_staging_writes_only_the_live_prefix_of_the_reserved_flat_buffer():
+    gb = _cpu_reserved(CAP_CSR)
+    n = 300
+    meta = _meta(CAP_CSR, kv_page_indices=torch.arange(1, n + 1, dtype=torch.int32))
+    pairs = gb.targets(meta, _fresh(CAP_CSR, n, dense=False))
+    for dst, src in pairs:
+        assert dst.shape == src.shape, (dst.shape, src.shape)
+    dsts = [d for d, _ in pairs]
+    flat = [d for d in dsts if d.data_ptr() == gb.kv_page_indices.data_ptr()]
+    assert len(flat) == 1 and flat[0].numel() == n  # a prefix view, not the buffer
+    assert not any(d is gb.block_tables for d in dsts)  # no dense candidate
+    with Transaction(pairs) as tx:
+        tx.commit()
+    assert torch.equal(
+        gb.kv_page_indices[:n], torch.arange(1, n + 1, dtype=torch.int32)
+    )
+    assert not gb.kv_page_indices[n:].any()  # the reserved tail is untouched
+    # a dense-needing candidate adds the derived table
+    pairs = gb.targets(meta, _fresh(CAP_CSR, n, dense=True))
+    assert any(d is gb.block_tables for d, _ in pairs)
+
+
+def test_dense_staging_covers_the_whole_table_and_flat_buffer():
+    gb = _cpu_reserved(CAP_DENSE)
+    meta = _meta(CAP_DENSE, block_tables=torch.full((4, 16), 7, dtype=torch.int32))
+    pairs = gb.targets(meta, _fresh(CAP_DENSE, 64, dense=True))
+    dsts = [d for d, _ in pairs]
+    assert any(d is gb.block_tables for d in dsts)
+    flat = [d for d in dsts if d.data_ptr() == gb.kv_page_indices.data_ptr()]
+    assert len(flat) == 1 and flat[0].numel() == CAP_DENSE.flat_capacity  # b*W exactly
+    for dst, src in pairs:
+        assert dst.shape == src.shape, (dst.shape, src.shape)
+
+
+def test_derived_view_exposes_reserved_storage_by_identity():
+    gb = _cpu_reserved(CAP_DENSE)
+    view = gb.derived_view(needs_dense=False)
+    assert view.block_tables is None
+    assert view.kv_page_indices is gb.kv_page_indices
+    assert view.q_seq_lens is gb.q_seq_lens
+    assert view.cum_kv_seq_lens is gb.cum_kv_seq_lens
+    assert view.kv_page_indptr is gb.kv_page_indptr
+    assert gb.derived_view(needs_dense=True).block_tables is gb.block_tables
+
+
+# ---------------------------------------------------------------------------
+# import hygiene / public surface
+# ---------------------------------------------------------------------------
+
+
+def test_importing_flashinfer_does_not_load_the_experimental_package():
+    code = (
+        "import sys, flashinfer, flashinfer.prefill as p\n"
+        "assert p.PagedAttention and p.resolve_paged_attention\n"
+        "print('EXPERIMENTAL_LOADED', "
+        "'flashinfer.experimental.paged_attention' in sys.modules)\n"
+    )
+    env = {**os.environ, "CUDA_VISIBLE_DEVICES": ""}
+    proc = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, env=env
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "EXPERIMENTAL_LOADED False" in proc.stdout
+
+
+def test_lazy_value_types_are_reachable_from_prefill():
+    from flashinfer import _paged_attention as entry
+    from flashinfer import prefill
+
+    assert prefill.PagedAttentionMetadata is pa.PagedAttentionMetadata
+    assert prefill.Resolution is pa.Resolution
+    assert prefill.PagedAttentionCapabilities is pa.PagedAttentionCapabilities
+    assert entry.BackendCapability is pa.PagedAttentionCapabilities  # pre-rename alias
+    assert entry.CAPABILITIES is pa.CAPABILITIES
+    assert {"PagedAttentionMetadata", "Resolution", "CAPABILITIES"} <= set(dir(entry))
+    with pytest.raises(AttributeError):
+        prefill.NoSuchPagedAttentionThing  # noqa: B018
+    with pytest.raises(AttributeError):
+        entry.NoSuchPagedAttentionThing  # noqa: B018
