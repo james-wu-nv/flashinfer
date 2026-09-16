@@ -199,6 +199,9 @@ class PagedAttentionController:
         self._trace: List[Tuple[str, str, str]] = []
         self._meta: Optional[PlanMetadata] = None
         self._derived: Optional[Derived] = None
+        # flat form only: the page ids the plan was made from (reserved storage
+        # in graph mode), independent of whether the chosen backend reads them
+        self._kv_page_indices: Optional[torch.Tensor] = None
         self._active = None
 
     @property
@@ -481,6 +484,10 @@ class PagedAttentionController:
         self._trace = trace
         self._meta = meta
         self._derived = derived
+        if metadata.kv_page_indices is not None:
+            self._kv_page_indices = (
+                gb.kv_page_indices if gb is not None else metadata.kv_page_indices
+            )
         self._planned = True
 
     # ----------------------------- update -----------------------------
@@ -723,22 +730,6 @@ class PagedAttentionController:
         lines.append(self._resolution.explain())
         return "\n".join(lines)
 
-
-# plan() keyword arguments update() re-issues from the frozen contract; the
-# remaining frozen keys (kv_input_form, page_size, dense_table) come from the
-# metadata and the chosen backend and are checked, not passed
-_PLAN_PARAMS = frozenset(
-    inspect.signature(PagedAttentionController.plan).parameters
-) - {"self", "metadata"}
-
-
-def _expect_not_capturing(what: str) -> None:
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            f"{what} cannot run during CUDA graph capture: plan or update before "
-            "capture, replay inside it"
-        )
-
     # --------------------------- read-only trace -----------------------
 
     def trace_context(self) -> Dict[str, Any]:
@@ -753,24 +744,29 @@ def _expect_not_capturing(what: str) -> None:
         Exactly one paging form is present, matching the plan's input form:
         ``block_tables`` for the dense form (the caller's table, or its copy
         in reserved storage), ``kv_page_indices`` for the flat form (the live
-        prefix of the flat page-id list, its length computed from the host
-        mirrors).  ``backend`` / ``excluded_backends`` / ``graph_capacity``
-        are provenance, not part of a trace's mathematical identity.
+        prefix of the caller's flat page-id list — or its reserved copy — its
+        length computed from the host mirrors; this is the plan's source even
+        when the chosen backend reads a dense table derived from it).
+        ``logits_soft_cap`` / ``has_custom_mask`` / ``use_sinks`` are the
+        plan's feature knobs.  ``backend`` / ``excluded_backends`` /
+        ``graph_capacity`` are provenance, not part of a trace's mathematical
+        identity.
         """
         _expect(
             self._planned,
             "trace_context() called before plan() — trace a planned instance "
             "(call plan() first)",
         )
-        m, d, res = self._meta, self._derived, self._resolution
-        assert m is not None and d is not None and res is not None
+        m, res = self._meta, self._resolution
+        assert m is not None and res is not None
         page = m.page_size
         block_tables = kv_page_indices = None
         if m.kv_input_form == "block_tables":
             block_tables = m.block_tables
         else:
+            assert self._kv_page_indices is not None
             live = int(torch.sum((m.kv_seq_lens_cpu + page - 1) // page))
-            kv_page_indices = d.kv_page_indices[:live]
+            kv_page_indices = self._kv_page_indices[:live]
         return {
             "qo_indptr": m.qo_indptr,
             "kv_seq_lens": m.kv_seq_lens,
@@ -788,6 +784,9 @@ def _expect_not_capturing(what: str) -> None:
             "causal": m.causal,
             "window_left": m.window_left,
             "lse_mode": m.lse_mode,
+            "logits_soft_cap": m.logits_soft_cap,
+            "has_custom_mask": m.custom_mask is not None,
+            "use_sinks": m.use_sinks,
             "max_q_len": m.max_q_len,
             "max_kv_len": m.max_kv_len,
             "batch_size": m.batch_size,
@@ -799,6 +798,22 @@ def _expect_not_capturing(what: str) -> None:
             "excluded_backends": dict(res.excluded),
             "graph_capacity": self._graph.capacity if self._graph is not None else None,
         }
+
+
+# plan() keyword arguments update() re-issues from the frozen contract; the
+# remaining frozen keys (kv_input_form, page_size, dense_table) come from the
+# metadata and the chosen backend and are checked, not passed
+_PLAN_PARAMS = frozenset(
+    inspect.signature(PagedAttentionController.plan).parameters
+) - {"self", "metadata"}
+
+
+def _expect_not_capturing(what: str) -> None:
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"{what} cannot run during CUDA graph capture: plan or update before "
+            "capture, replay inside it"
+        )
 
 
 __all__ = ["PagedAttentionController"]
