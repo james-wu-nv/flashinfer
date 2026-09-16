@@ -78,13 +78,28 @@ def _sdpa_decode_key_fn(
         actual_seq_lens_q is not None,
         actual_seq_lens_kv is not None,
         block_tables is not None,
+        # The page table is bound with tensor_like(), so its shape and strides
+        # are baked into the graph as well (same gap the prefill key closed):
+        # a graph built for a width-64 table would be replayed for a width-67
+        # table, and a column view of a wider table (row stride > width) for a
+        # contiguous table of the same shape, reading the wrong pages.
+        tuple(block_tables.shape) if block_tables is not None else None,
+        tuple(block_tables.stride()) if block_tables is not None else None,
     )
 
 
 if CUDNN_AVAILABLE:
-
-    @cudnn.jit(heur_modes=[cudnn.heur_mode.A])
+    # graph_cache must be the OUTER decorator (as in prefill.py): it caches
+    # whatever the wrapped call returns, and jit is what calls build().  With
+    # jit outside, the un-built graph was inserted before build() ran, so a
+    # build that failed at finalize (e.g. an over-wide page table ->
+    # CUDNN_STATUS_BAD_PARAM) left a half-built graph under its key; every
+    # later same-key call then re-built that object and failed with the
+    # unrelated "attn_scale with tensor and value cannot be set at the same
+    # time".  Outer cache: a failed build inserts nothing, and the cached
+    # value is always a built graph.
     @cudnn.graph_cache(key_fn=_sdpa_decode_key_fn)
+    @cudnn.jit(heur_modes=[cudnn.heur_mode.A])
     def _build_decode_graph(
         q: torch.Tensor,
         k_cache: torch.Tensor,
