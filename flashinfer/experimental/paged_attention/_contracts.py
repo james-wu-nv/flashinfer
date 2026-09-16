@@ -119,6 +119,7 @@ def resolve_config_key(
     logits_soft_cap,
     custom_mask,
     sinks,
+    max_q_len,
     cc_major,
     cc_minor,
     device_index,
@@ -129,6 +130,12 @@ def resolve_config_key(
     ``sinks`` (booleans) are the feature axes: pinning covers them, so a
     plan() that requests a feature the Resolution was not resolved for is a
     drift error rather than a silent capability change.
+
+    ``max_q_len`` is the caller's shape hint (``None`` = none): the upper
+    bound on query tokens per request the resolution's candidate order was
+    chosen for.  It is part of the key so two Resolutions of one model
+    configuration with different hints (decode vs. prefill order) are
+    distinct, and plan() checks each batch against it.
 
     The last element is the device binding ``(cc_major, cc_minor,
     device_index)``: a Resolution resolved on one device must not be handed
@@ -154,6 +161,7 @@ def resolve_config_key(
         logits_soft_cap,
         bool(custom_mask),
         bool(sinks),
+        max_q_len,
         (cc_major, cc_minor, device_index),
     )
 
@@ -215,6 +223,16 @@ class Resolution:
         """``(cc_major, cc_minor, device_index)`` this Resolution answers for."""
         return self.config[-1] if self.config else (None, None, None)
 
+    @property
+    def max_q_len(self) -> Optional[int]:
+        """The ``max_q_len`` hint this Resolution was resolved with, or ``None``.
+
+        With a hint the candidate order is the one for batches whose requests
+        have at most that many query tokens, and plan() rejects a batch (in
+        CUDA-graph mode: a capacity) whose ``max_q_len`` exceeds it.
+        """
+        return self.config[-2] if len(self.config) >= 2 else None
+
     def explain(self) -> str:
         cc_major, cc_minor, index = self.device_binding
         if cc_major is not None:
@@ -227,6 +245,13 @@ class Resolution:
             lines = [f"resolved for: {where}"]
         else:
             lines = []
+        if self.max_q_len is not None:
+            lines.append(
+                f"max_q_len hint: {self.max_q_len} (order for batches with at most "
+                f"{self.max_q_len} query tokens per request)"
+            )
+        else:
+            lines.append("max_q_len hint: none (default order)")
         lines.append(f"candidates (preference order): {list(self.backends)}")
         for name, reason in self.excluded.items():
             lines.append(f"excluded {name}: {reason}")

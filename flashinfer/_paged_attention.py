@@ -48,8 +48,10 @@ Prototype simplifications (documented, not hidden):
 - dtypes: fp16/bf16 activations; an fp8 (e4m3) KV cache with per-tensor
   ``k_scale`` / ``v_scale`` at ``run()`` where the capability table declares
   it (fa2).  fp8 Q and nvfp4 are undeclared axes.
-- Heuristic order is a static per-arch placeholder, to be seeded from the
-  benchmark suite (proposal §5.2).  Autotune hook (§5.4) is not wired.
+- Heuristic order is a static per-arch table bucketed by the optional
+  ``max_q_len`` hint of ``resolve_paged_attention`` (seeded from the B200
+  sweep in the WP-K report; proposal §5.2).  Autotune hook (§5.4) is not
+  wired: ``auto`` never times anything.
 - ``logits_soft_cap`` / ``custom_mask`` / ``use_sinks`` are explicit
   capability axes (fa2: all three; fa3: soft cap + sinks; trtllm-gen and
   cake: sinks; cuDNN: none) — a backend lacking a requested feature is excluded, never
@@ -172,6 +174,7 @@ def resolve_paged_attention(
     logits_soft_cap: Optional[float] = None,
     custom_mask: bool = False,
     sinks: bool = False,
+    max_q_len: Optional[int] = None,
     backend: str = "auto",
 ) -> "Resolution":
     """Static backend resolution — no plan state, no tensors.
@@ -191,6 +194,24 @@ def resolve_paged_attention(
       ``custom_mask`` and ``sinks``: the features the plans will request.  A
       backend that cannot apply a requested feature is excluded with the
       reason — ``auto`` never drops a feature silently.
+    - ``max_q_len``: optional shape hint — the batches planned with this
+      Resolution have at most this many query tokens per request (1 for
+      plain decode, the draft length for speculative decode; leave ``None``
+      for prefill or mixed batches).  It picks the ``auto`` candidate ORDER
+      from a small per-architecture table seeded from measurements, never
+      the candidate set: on sm_100 (B200) the paged context kernels behind
+      trtllm-gen / cake are 1.0-9.5x slower than fa2 at ``max_q_len <= 16``
+      (B=32, kv=4096, q=1: 513 vs 92 us; B=1, kv=16384, q=1: 209 vs 22 us)
+      and ahead from 64-256 query tokens per request depending on kv_len,
+      so hints ``<= 16`` put fa2 first and larger hints (or none) keep
+      today's order.  ``auto`` remains a static selection made
+      here, not autotuning: nothing is timed and ``plan()`` never reorders.
+      The hint is pinned in the Resolution (``explain()`` shows it, and two
+      Resolutions of one model configuration with different hints have
+      different ``config`` keys), and a ``plan()`` whose batch — in
+      CUDA-graph mode, whose capacity — has a larger ``max_q_len`` is
+      rejected with a ``ValueError``; hold one Resolution per query-length
+      bucket, as vLLM's decode / prefill split does.
     """
     from .experimental.paged_attention import resolve_paged_attention as _resolve
 
@@ -212,6 +233,7 @@ def resolve_paged_attention(
         logits_soft_cap=logits_soft_cap,
         custom_mask=custom_mask,
         sinks=sinks,
+        max_q_len=max_q_len,
         backend=backend,
     )
 
