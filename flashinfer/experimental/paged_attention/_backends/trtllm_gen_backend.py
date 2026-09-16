@@ -25,7 +25,7 @@ from typing import Optional
 import torch
 
 from .._contracts import LN2, PlanMetadata
-from .._planning import Derived
+from .._planning import FORM_BLOCK_TABLES, FORM_CUM_KV_SEQ_LENS, Derived
 from ._capabilities import _BackendPlanUnsupportedError
 
 # Page sizes the trtllm-gen paged context kernel is shipped for (the
@@ -34,6 +34,9 @@ _KERNEL_PAGE_SIZES = frozenset({16, 32, 64, 128, 256, 512, 1024})
 
 
 class _TrtllmGenBackend:
+    # the canonical form natively, plus cumulative KV lengths and the dense table
+    DERIVED_NEEDS = frozenset({FORM_CUM_KV_SEQ_LENS, FORM_BLOCK_TABLES})
+
     def __init__(self, device, kv_layout, workspace, backend: str = "trtllm-gen"):
         self.name = backend  # "trtllm-gen" or "cake"
         self._workspace = workspace  # the controller's shared scratch
@@ -127,7 +130,7 @@ class _TrtllmGenBackend:
             v_scale if v_scale is not None else 1.0,  # bmm2 (v descale)
             meta.batch_size,
             meta.qo_indptr,
-            derived.cum_kv_seq_lens,
+            derived.require(FORM_CUM_KV_SEQ_LENS),
             window_left=meta.window_left,
             kv_layout=self._kv_layout,
             causal=meta.causal,

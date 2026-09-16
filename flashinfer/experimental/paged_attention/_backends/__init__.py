@@ -9,7 +9,7 @@ backend knows its native dialect or LSE format.
 
 from __future__ import annotations
 
-from typing import Callable, Dict
+from typing import Callable, Dict, FrozenSet
 
 import torch
 
@@ -30,6 +30,20 @@ _FACTORIES: Dict[str, Callable] = {
     "trtllm-gen": lambda dev, layout, ws, cap: _TrtllmGenBackend(dev, layout, ws),
     "cake": lambda dev, layout, ws, cap: _TrtllmGenBackend(dev, layout, ws, "cake"),
 }
+_CLASSES: Dict[str, type] = {
+    "fa2": _FaBackend,
+    "fa3": _FaBackend,
+    "cudnn": _CudnnBackend,
+    "trtllm-gen": _TrtllmGenBackend,
+    "cake": _TrtllmGenBackend,
+}
+
+
+def derived_needs(name: str) -> FrozenSet[str]:
+    """The derived forms backend ``name`` reads (``_planning.DERIVED_FORMS``
+    names, declared as ``DERIVED_NEEDS`` on the backend class).  An adapter
+    detail, so it lives here and not in the capability table."""
+    return _CLASSES[name].DERIVED_NEEDS
 
 
 def make_backend(
@@ -54,5 +68,6 @@ __all__ = [
     "MIN_DENSE_PAGE_SIZE",
     "PagedAttentionCapabilities",
     "_BackendPlanUnsupportedError",
+    "derived_needs",
     "make_backend",
 ]

@@ -23,7 +23,15 @@ import torch
 
 from ._backends._capabilities import MIN_DENSE_PAGE_SIZE
 from ._contracts import PagedAttentionMetadata, _expect, _expect_page_size
-from ._planning import Derived
+from ._planning import (
+    FORM_BLOCK_TABLES,
+    FORM_CUM_KV_SEQ_LENS,
+    FORM_KV_PAGE_INDICES,
+    FORM_KV_PAGE_INDPTR,
+    FORM_Q_SEQ_LENS,
+    Derived,
+    normalize_needs,
+)
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -309,13 +317,22 @@ class GraphBuffers:
                 pairs.append((self.block_tables, fresh.block_tables))
         return [(dst, src) for dst, src in pairs if src is not None]
 
-    def derived_view(self, *, needs_dense: bool) -> Derived:
+    def derived_view(self, *, needs) -> Derived:
+        """The reserved storage of the requested forms (None elsewhere)."""
+        needs = normalize_needs(needs)
         return Derived(
-            q_seq_lens=self.q_seq_lens,
-            cum_kv_seq_lens=self.cum_kv_seq_lens,
-            kv_page_indptr=self.kv_page_indptr,
-            kv_page_indices=self.kv_page_indices,
-            block_tables=self.block_tables if needs_dense else None,
+            needs=needs,
+            q_seq_lens=self.q_seq_lens if FORM_Q_SEQ_LENS in needs else None,
+            cum_kv_seq_lens=(
+                self.cum_kv_seq_lens if FORM_CUM_KV_SEQ_LENS in needs else None
+            ),
+            kv_page_indptr=self.kv_page_indptr
+            if FORM_KV_PAGE_INDPTR in needs
+            else None,
+            kv_page_indices=(
+                self.kv_page_indices if FORM_KV_PAGE_INDICES in needs else None
+            ),
+            block_tables=self.block_tables if FORM_BLOCK_TABLES in needs else None,
         )
 
 

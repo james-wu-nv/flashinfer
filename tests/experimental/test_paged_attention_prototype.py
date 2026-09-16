@@ -597,7 +597,7 @@ def test_derive_is_sync_free():
             None,
             p["page_size"],
             p["max_kv_len"],
-            needs_dense=False,
+            needs={"kv_page_indices", "kv_page_indptr", "cum_kv_seq_lens"},
         )
         # reverse direction: flat indices -> dense, also zero-sync
         d2 = _derive(
@@ -607,7 +607,7 @@ def test_derive_is_sync_free():
             p["kv_page_indices"],
             p["page_size"],
             p["max_kv_len"],
-            needs_dense=True,
+            needs={"block_tables", "q_seq_lens"},
         )
     finally:
         torch.cuda.set_sync_debug_mode("default")
@@ -626,6 +626,37 @@ def test_derive_is_sync_free():
     for i in range(p["kv_seq_lens_cpu"].shape[0]):
         n = int(pages[i])
         assert torch.equal(dense[i, :n], p["block_tables"].cpu()[i, :n])
+
+
+def test_derived_forms_are_need_based():
+    """Only the forms a backend declares are derived (ledger M7): unrequested
+    fields are None and reading one through require() fails loudly, while
+    the same object caches one derivation per need set."""
+    from flashinfer.experimental.paged_attention import derived_needs
+
+    p = make_problem(
+        seed=33,
+        batch_size=3,
+        max_q=8,
+        max_kv=64,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+    )
+    md = make_metadata(p)
+    trt = md.derived(needs=derived_needs("trtllm-gen"))
+    assert trt.cum_kv_seq_lens is not None and trt.block_tables is not None
+    assert trt.q_seq_lens is None and trt.kv_page_indices is None
+    with pytest.raises(AssertionError, match="not requested"):
+        trt.require("kv_page_indices")
+    assert md.derived(needs=derived_needs("trtllm-gen")) is trt  # cached
+    fa = md.derived(needs=derived_needs("fa2"))
+    assert fa is not trt and fa.kv_page_indices is not None
+    assert fa.cum_kv_seq_lens is None
+    with pytest.raises(ValueError, match="unknown derived form"):
+        md.derived(needs={"nonsense"})
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

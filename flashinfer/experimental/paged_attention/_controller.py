@@ -27,7 +27,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
-from ._backends import CAPABILITIES, _BackendPlanUnsupportedError, make_backend
+from ._backends import (
+    CAPABILITIES,
+    _BackendPlanUnsupportedError,
+    derived_needs,
+    make_backend,
+)
 from ._contracts import (
     PagedAttentionMetadata,
     PlanMetadata,
@@ -41,7 +46,7 @@ from ._contracts import (
     resolve_config_key,
 )
 from ._graph import GraphBuffers, GraphCapacity, Transaction
-from ._planning import Derived, validate_causal_envelope
+from ._planning import FORM_BLOCK_TABLES, Derived, validate_causal_envelope
 from ._selection import resolve_paged_attention
 
 # ---------------------------------------------------------------------------
@@ -351,21 +356,22 @@ class PagedAttentionController:
         trace: List[Tuple[str, str, str]] = []
         chosen = None
         for name in resolution.backends:
-            needs_dense = CAPABILITIES[name].needs_dense
+            # derive exactly the forms this candidate declared it reads
+            needs = derived_needs(name)
             if gb is not None:
-                if needs_dense:
+                if FORM_BLOCK_TABLES in needs:
                     # flat form: only a backend that reads the dense table pays
                     # for it, and only once (no-op in the dense form)
                     gb.reserve_dense_table()
-                derived = gb.derived_view(needs_dense=needs_dense)
+                derived = gb.derived_view(needs=needs)
                 qo_indptr, kv_seq_lens = gb.qo_indptr, gb.kv_seq_lens
                 block_tables = (
                     gb.block_tables
-                    if (needs_dense or metadata.block_tables is not None)
+                    if (FORM_BLOCK_TABLES in needs or metadata.block_tables is not None)
                     else None
                 )
             else:
-                derived = metadata.derived(needs_dense=needs_dense)
+                derived = metadata.derived(needs=needs)
                 qo_indptr, kv_seq_lens = metadata.qo_indptr, metadata.kv_seq_lens
                 # dense table given by the caller or derived (None where truly absent)
                 block_tables = (
@@ -426,7 +432,7 @@ class PagedAttentionController:
                     ) from exc
                 continue
             trace.append((name, "preflight", "accepted"))
-            chosen = (name, candidate, meta, derived, needs_dense)
+            chosen = (name, candidate, meta, derived, needs)
             break
         if chosen is None:
             detail = "; ".join(f"{n}: {r}" for n, _, r in trace)
@@ -434,7 +440,7 @@ class PagedAttentionController:
                 "no pinned candidate can plan this batch "
                 f"(candidates {list(resolution.backends)}: {detail})"
             )
-        name, candidate, meta, derived, needs_dense = chosen
+        name, candidate, meta, derived, needs = chosen
         key = (name, kv_layout)
 
         # graph mode: the frozen contract is checked before any reserved
@@ -446,9 +452,7 @@ class PagedAttentionController:
         if gb is not None:
             # stage the new batch into reserved storage; any failure below
             # (including inside the backend's own plan) restores every buffer
-            fresh = metadata.derived(
-                needs_dense=needs_dense, max_kv_len=gb.capacity.max_kv_len
-            )
+            fresh = metadata.derived(needs=needs, max_kv_len=gb.capacity.max_kv_len)
             transaction = Transaction(gb.targets(metadata, fresh))
             with transaction:
                 candidate.plan(meta, derived)
