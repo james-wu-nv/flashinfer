@@ -4,6 +4,11 @@ Dialect: CSR page metadata + host arrays for the split-KV scheduler
 (computed from the mirrors the contract layer guarantees — zero-sync).
 The generated FA wrapper holds its own plan state, so this backend keeps one
 wrapper instance as stable storage and re-plans it in place.
+
+Features: ``logits_soft_cap`` and ``custom_mask`` go to the wrapper's plan()
+(the kernel's own soft-cap variant; the mask in the legacy flattened
+per-request layout, ANDed here with the causal / sliding-window envelope
+because MaskMode.CUSTOM replaces the kernel's causal mask).
 """
 
 from __future__ import annotations
@@ -15,6 +20,39 @@ from .._planning import Derived
 from ._capabilities import _BackendPlanUnsupportedError
 
 
+def _envelope_mask(custom_mask: torch.Tensor, meta: PlanMetadata) -> torch.Tensor:
+    """AND the caller's flattened mask with the causal / window envelope.
+
+    Pure device ops sized from the host mirrors (``repeat_interleave`` gets
+    its ``output_size``), so no sync.  Positions follow the oracle: query
+    ``p`` of a request sits at absolute KV position ``kv_len - q_len + p``.
+    """
+    if not meta.causal and meta.window_left < 0:
+        return custom_mask
+    dev = custom_mask.device
+    q_lens = meta.qo_indptr_cpu.diff().to(torch.int64)
+    kv_lens = meta.kv_seq_lens_cpu.to(torch.int64)
+    sizes = q_lens * kv_lens
+    total = int(sizes.sum())
+    starts = torch.cumsum(sizes, 0) - sizes
+    req = torch.repeat_interleave(
+        torch.arange(meta.batch_size, device=dev),
+        sizes.to(dev),
+        output_size=total,
+    )
+    off = torch.arange(total, device=dev) - starts.to(dev)[req]
+    kv_len = kv_lens.to(dev)[req]
+    q_pos = torch.div(off, kv_len, rounding_mode="floor")
+    kv_pos = off - q_pos * kv_len
+    diag = kv_len - q_lens.to(dev)[req] + q_pos
+    allowed = custom_mask
+    if meta.causal:
+        allowed = allowed & (kv_pos <= diag)
+    if meta.window_left >= 0:
+        allowed = allowed & (kv_pos >= diag - meta.window_left)
+    return allowed
+
+
 class _FaBackend:
     def __init__(
         self, device, kv_layout, workspace, backend: str = "fa2", graph_capacity=None
@@ -23,6 +61,7 @@ class _FaBackend:
 
         self.name = backend
         self._device = device
+        self._graph_capacity = graph_capacity
         if graph_capacity is None:
             self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
                 workspace, kv_layout, backend=backend
@@ -63,6 +102,15 @@ class _FaBackend:
                 raise _BackendPlanUnsupportedError(
                     f"fa3 needs SM90a and CUDA >= 12.3; {self._device} does not qualify"
                 )
+        if meta.custom_mask is not None and self._graph_capacity is not None:
+            # Not a fallback case (no other backend takes custom masks): the
+            # wrapper's reserved packed-mask storage (custom_mask_buf /
+            # mask_indptr_buf) is not wired into the graph capacity yet.
+            raise ValueError(
+                "custom_mask with use_cuda_graph=True is follow-up work for the "
+                "fa backends (reserved packed-mask storage is not part of the "
+                "graph capacity yet); plan the masked batch on an eager instance"
+            )
 
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
         # The kernel walks kv_page_indices as a raw int32 pointer bounded by
@@ -87,6 +135,11 @@ class _FaBackend:
             ]
         )
         last_len_host = ((kv_lens_host - 1) % page + 1).to(torch.int32)
+        custom_mask = (
+            _envelope_mask(meta.custom_mask, meta)
+            if meta.custom_mask is not None
+            else None
+        )
         self._wrapper.plan(
             qo_host,
             kv_indptr_host,
@@ -97,8 +150,12 @@ class _FaBackend:
             meta.head_dim_qk,
             page,
             head_dim_vo=meta.head_dim_vo,
+            # with a custom mask the wrapper selects MaskMode.CUSTOM and the
+            # causal envelope is already folded into the mask above
+            custom_mask=custom_mask,
             causal=meta.causal,
             window_left=meta.window_left,
+            logits_soft_cap=meta.logits_soft_cap,  # None -> 0.0 (off) in the wrapper
             q_data_type=meta.q_dtype,
             kv_data_type=meta.kv_dtype,
         )

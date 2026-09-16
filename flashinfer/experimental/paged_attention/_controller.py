@@ -33,9 +33,11 @@ from ._contracts import (
     PlanMetadata,
     Resolution,
     _expect,
+    _expect_custom_mask,
     _expect_lse_mode,
     _expect_pinned_device,
     _expect_window_left,
+    _normalize_logits_soft_cap,
     resolve_config_key,
 )
 from ._graph import GraphBuffers, GraphCapacity, Transaction
@@ -103,6 +105,9 @@ _PER_BATCH_FIELDS = frozenset(
         "qo_indptr",
         "kv_seq_lens",
         "block_tables",
+        # per-batch mask values (a tensor; graph mode rejects custom masks in
+        # the fa preflight until the mask storage joins the capacity contract)
+        "custom_mask",
         "qo_indptr_cpu",
         "kv_seq_lens_cpu",
         "batch_size",
@@ -226,6 +231,9 @@ class PagedAttentionController:
         causal: bool = True,
         window_left: int = -1,
         lse_mode: str = "none",
+        logits_soft_cap: Optional[float] = None,
+        custom_mask: Optional[torch.Tensor] = None,
+        use_sinks: bool = False,
         backend: Union[str, Resolution] = "auto",
     ) -> None:
         _expect(
@@ -250,6 +258,15 @@ class PagedAttentionController:
         need_lse = lse_mode != "none"
         if causal:
             validate_causal_envelope(metadata.qo_indptr_cpu, metadata.kv_seq_lens_cpu)
+        logits_soft_cap = _normalize_logits_soft_cap(logits_soft_cap)
+        if custom_mask is not None:
+            q_lens = metadata.qo_indptr_cpu.diff().to(torch.int64)
+            _expect_custom_mask(
+                custom_mask,
+                self.device,
+                int((q_lens * metadata.kv_seq_lens_cpu.to(torch.int64)).sum()),
+            )
+        use_sinks = bool(use_sinks)
 
         if isinstance(backend, Resolution):
             # Level-1 pinning (proposal §5.3): verify the plan config AND the
@@ -268,9 +285,9 @@ class PagedAttentionController:
                 need_lse,
                 window_left,
                 kv_input_form,
-                None,  # logits_soft_cap: plan-time feature kwargs land next
-                False,  # custom_mask
-                False,  # sinks
+                logits_soft_cap,
+                custom_mask is not None,
+                use_sinks,
                 *self._device_binding(),
             )
             _expect(
@@ -296,6 +313,9 @@ class PagedAttentionController:
                 need_lse=need_lse,
                 window_left=window_left,
                 kv_input_form=kv_input_form,
+                logits_soft_cap=logits_soft_cap,
+                custom_mask=custom_mask is not None,
+                sinks=use_sinks,
                 backend=backend,
             )
         # Plan-time choice within the pinned set (level 2): walk the
@@ -374,6 +394,9 @@ class PagedAttentionController:
                 batch_size=metadata.batch_size,
                 qo_indptr_cpu=metadata.qo_indptr_cpu,
                 kv_seq_lens_cpu=metadata.kv_seq_lens_cpu,
+                logits_soft_cap=logits_soft_cap,
+                custom_mask=custom_mask,
+                use_sinks=use_sinks,
             )
             key = (name, kv_layout)
             candidate = self._backends.get(key)

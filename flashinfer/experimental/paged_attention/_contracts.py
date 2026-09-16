@@ -58,6 +58,36 @@ def _normalize_logits_soft_cap(logits_soft_cap: Optional[float]) -> Optional[flo
     return float(logits_soft_cap) if logits_soft_cap > 0 else None
 
 
+def _expect_custom_mask(
+    custom_mask: torch.Tensor, device: torch.device, numel: int
+) -> None:
+    """The flattened per-request boolean mask contract (legacy mask layout)."""
+    _expect(
+        isinstance(custom_mask, torch.Tensor),
+        f"custom_mask must be a torch.Tensor, got {type(custom_mask).__name__}",
+    )
+    _expect(
+        custom_mask.dtype == torch.bool,
+        f"custom_mask must be a bool tensor (True = may attend), got {custom_mask.dtype}",
+    )
+    _expect(
+        custom_mask.device == device,
+        f"custom_mask lives on {custom_mask.device} but this instance is bound to {device}",
+    )
+    _expect(
+        custom_mask.dim() == 1 and custom_mask.is_contiguous(),
+        "custom_mask must be a contiguous 1-D tensor: the per-request "
+        "(q_len_i, kv_len_i) masks flattened row-major and concatenated in "
+        f"request order, got shape {tuple(custom_mask.shape)}",
+    )
+    _expect(
+        custom_mask.numel() == numel,
+        f"custom_mask has {custom_mask.numel()} elements but the batch needs "
+        f"sum(q_len_i * kv_len_i) = {numel} (flattened per-request masks in "
+        "request order)",
+    )
+
+
 def _expect_page_size(page_size: int, kv_input_form: str) -> None:
     _expect(
         isinstance(page_size, int) and page_size >= 1,
@@ -410,6 +440,17 @@ class PlanMetadata:
     batch_size: int
     qo_indptr_cpu: torch.Tensor
     kv_seq_lens_cpu: torch.Tensor
+    # ---- feature axes (declared at plan time; capability-checked) ----
+    # softmax logits soft cap: cap * tanh(score / cap) on the scaled scores
+    # (None = off; normalized by the controller)
+    logits_soft_cap: Optional[float] = None
+    # per-request flattened boolean mask, concatenated in request order
+    # (sum(q_len_i * kv_len_i),), True = may attend; ANDed into the
+    # causal/window envelope
+    custom_mask: Optional[torch.Tensor] = None
+    # attention sinks will be passed to run(): the backend must plan the
+    # sink-aware kernel variant
+    use_sinks: bool = False
 
     @property
     def total_q_tokens(self) -> int:
@@ -419,6 +460,12 @@ class PlanMetadata:
     def need_lse(self) -> bool:
         return self.lse_mode != "none"
 
+    @property
+    def mask_numel(self) -> int:
+        """Length of the flattened custom mask this batch requires (host)."""
+        q_lens = self.qo_indptr_cpu.diff().to(torch.int64)
+        return int((q_lens * self.kv_seq_lens_cpu.to(torch.int64)).sum())
+
 
 __all__ = [
     "LN2",
@@ -426,6 +473,7 @@ __all__ = [
     "PagedAttentionMetadata",
     "PlanMetadata",
     "Resolution",
+    "_expect_custom_mask",
     "_expect_pinned_device",
     "_normalize_logits_soft_cap",
     "resolve_config_key",
