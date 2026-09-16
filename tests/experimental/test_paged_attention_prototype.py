@@ -598,6 +598,8 @@ def test_derive_is_sync_free():
             p["page_size"],
             p["max_kv_len"],
             needs={"kv_page_indices", "kv_page_indptr", "cum_kv_seq_lens"},
+            qo_indptr_cpu=p["qo_indptr_cpu"],
+            kv_seq_lens_cpu=p["kv_seq_lens_cpu"],
         )
         # reverse direction: flat indices -> dense, also zero-sync
         d2 = _derive(
@@ -608,6 +610,8 @@ def test_derive_is_sync_free():
             p["page_size"],
             p["max_kv_len"],
             needs={"block_tables", "q_seq_lens"},
+            qo_indptr_cpu=p["qo_indptr_cpu"],
+            kv_seq_lens_cpu=p["kv_seq_lens_cpu"],
         )
     finally:
         torch.cuda.set_sync_debug_mode("default")
@@ -657,6 +661,62 @@ def test_derived_forms_are_need_based():
     assert fa.cum_kv_seq_lens is None
     with pytest.raises(ValueError, match="unknown derived form"):
         md.derived(needs={"nonsense"})
+
+
+@pytest.mark.parametrize("input_form", ["block_tables", "page_indices"])
+def test_host_derivation_matches_device_reference(input_form):
+    """Every derived form comes from the host mirrors through one pinned
+    staging upload; the values must equal what the device tensors imply, the
+    host arrays must be pinned int32, and derivation must not sync."""
+    from flashinfer.experimental.paged_attention import DERIVED_FORMS
+
+    p = make_problem(
+        seed=35,
+        batch_size=5,
+        max_q=16,
+        max_kv=200,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+        input_form=input_form,
+    )
+    md = make_metadata(p)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        d = md.derived(needs=DERIVED_FORMS)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    page = p["page_size"]
+    kv = p["kv_seq_lens"]
+    zero = torch.zeros(1, dtype=torch.int32, device=kv.device)
+    pages = (kv + page - 1) // page
+    assert torch.equal(d.q_seq_lens, p["qo_indptr"].diff())
+    assert torch.equal(
+        d.cum_kv_seq_lens, torch.cat([zero, torch.cumsum(kv, 0, dtype=torch.int32)])
+    )
+    assert torch.equal(
+        d.kv_page_indptr, torch.cat([zero, torch.cumsum(pages, 0, dtype=torch.int32)])
+    )
+    for name, want in (
+        ("qo_indptr_host", p["qo_indptr_cpu"]),
+        ("kv_seq_lens_host", p["kv_seq_lens_cpu"]),
+        ("kv_page_indptr_host", d.kv_page_indptr.cpu()),
+        ("kv_last_page_len_host", ((p["kv_seq_lens_cpu"] - 1) % page + 1)),
+    ):
+        got = getattr(d, name)
+        assert got.dtype == torch.int32 and got.is_pinned(), name
+        assert torch.equal(got, want.to(torch.int32)), name
+    # cross-form conversions still agree with the caller's tables
+    live = torch.cat(
+        [p["block_tables"][i, : int(pages[i])] for i in range(kv.shape[0])]
+    )
+    assert torch.equal(d.kv_page_indices[: live.shape[0]], live)
+    for i in range(kv.shape[0]):
+        n = int(pages[i])
+        assert torch.equal(d.block_tables[i, :n], p["block_tables"][i, :n])
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

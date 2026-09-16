@@ -242,7 +242,9 @@ class PagedAttentionMetadata:
     make "exactly one paging form" structural.  Construction validates shapes
     and values against the host mirrors — pass the mirrors the engine already
     owns and construction is zero-sync; otherwise it performs ONE documented
-    D2H here, and every later ``plan()`` on this object is sync-free.
+    D2H here, and every later ``plan()`` on this object is sync-free.  The
+    derived forms are computed from the mirrors on the host and reach the
+    device through one pinned upload (see ``_planning.derive``).
 
     The object also owns the backend-neutral derived forms (CSR page indptr,
     cumulative KV lengths, dense table) lazily and per need set, so several
@@ -345,10 +347,16 @@ class PagedAttentionMetadata:
         )
         # Value-level validation is unconditional — it is what makes the
         # reject-or-correct property hold.  Zero-sync iff the caller hands us
-        # the host mirrors it already owns; otherwise ONE documented D2H here.
-        if self.qo_indptr_cpu is None:
+        # the host mirrors it already owns; otherwise ONE documented D2H here
+        # (both arrays packed into one transfer when both are missing).
+        if self.qo_indptr_cpu is None and self.kv_seq_lens_cpu is None:
+            b = self.kv_seq_lens.shape[0]
+            packed = torch.cat([self.qo_indptr, self.kv_seq_lens]).cpu()
+            object.__setattr__(self, "qo_indptr_cpu", packed[: b + 1])
+            object.__setattr__(self, "kv_seq_lens_cpu", packed[b + 1 :])
+        elif self.qo_indptr_cpu is None:
             object.__setattr__(self, "qo_indptr_cpu", self.qo_indptr.cpu())
-        if self.kv_seq_lens_cpu is None:
+        elif self.kv_seq_lens_cpu is None:
             object.__setattr__(self, "kv_seq_lens_cpu", self.kv_seq_lens.cpu())
         validate_values(
             self.qo_indptr,
@@ -411,6 +419,8 @@ class PagedAttentionMetadata:
                 self.page_size,
                 width_max,
                 needs=key[0],
+                qo_indptr_cpu=self.qo_indptr_cpu,
+                kv_seq_lens_cpu=self.kv_seq_lens_cpu,
             )
             self._derived[key] = d
         return d

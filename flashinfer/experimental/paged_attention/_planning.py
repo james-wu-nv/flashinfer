@@ -3,7 +3,8 @@
 Mirrors ``flashinfer/mla/_batch_mla/_planning.py``: everything here is
 backend-neutral. Structural checks are host-only; value checks read the host
 mirrors the contract guarantees; derivation computes only the forms the chosen
-backend declared it needs, as pure device ops with no sync.
+backend declared it needs, on the host from the mirrors, and reaches the device
+through one pinned upload (no sync).
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import FrozenSet, Iterable, Optional
 
+import numpy as np
 import torch
 
 from ._contracts import _expect, _expect_page_size
@@ -27,6 +29,8 @@ FORM_CUM_KV_SEQ_LENS = "cum_kv_seq_lens"
 FORM_KV_PAGE_INDPTR = "kv_page_indptr"
 FORM_KV_PAGE_INDICES = "kv_page_indices"
 FORM_BLOCK_TABLES = "block_tables"
+# pinned int32 host arrays for a CPU-side scheduler (the generated FA planner)
+FORM_HOST_ARRAYS = "host_arrays"
 DERIVED_FORMS: FrozenSet[str] = frozenset(
     {
         FORM_Q_SEQ_LENS,
@@ -34,8 +38,10 @@ DERIVED_FORMS: FrozenSet[str] = frozenset(
         FORM_KV_PAGE_INDPTR,
         FORM_KV_PAGE_INDICES,
         FORM_BLOCK_TABLES,
+        FORM_HOST_ARRAYS,
     }
 )
+_DEVICE_FORMS = frozenset({FORM_Q_SEQ_LENS, FORM_CUM_KV_SEQ_LENS, FORM_KV_PAGE_INDPTR})
 
 
 def normalize_needs(needs: Iterable[str]) -> FrozenSet[str]:
@@ -65,6 +71,13 @@ class Derived:
     # prefix up to kv_page_indptr[-1]; any tail is untouched scratch never read
     # by kernels, which bound reads by the indptr)
     block_tables: Optional[torch.Tensor] = None  # (b, width) dense - given or derived
+    # FORM_HOST_ARRAYS: pinned int32 CPU views into one staging tensor (the
+    # same tensor the device forms above were uploaded from), so a wrapper's
+    # non_blocking upload of them is a real asynchronous copy
+    qo_indptr_host: Optional[torch.Tensor] = None  # (b+1,)
+    kv_seq_lens_host: Optional[torch.Tensor] = None  # (b,)
+    kv_page_indptr_host: Optional[torch.Tensor] = None  # (b+1,)
+    kv_last_page_len_host: Optional[torch.Tensor] = None  # (b,)
 
     def require(self, name: str) -> torch.Tensor:
         value = getattr(self, name)
@@ -234,6 +247,84 @@ def validate_causal_envelope(qo_indptr_cpu, kv_seq_lens_cpu) -> None:
         )
 
 
+class _HostStaging:
+    """All derived host arrays of one batch in ONE pinned int32 tensor.
+
+    Layout (b = batch size): qo_indptr (b+1) | q_seq_lens (b) |
+    cum_kv_seq_lens (b+1) | kv_page_indptr (b+1) | pages (b) |
+    kv_last_page_len (b) | kv_seq_lens (b).  Filled with numpy on the mirrors
+    (small-array torch CPU ops cost 2-5 us each; numpy about 1.5 us), then
+    uploaded with one ``copy_(non_blocking=True)`` when a device form is
+    requested; the device forms are slices of that one device buffer.
+
+    Lifetime: the staging tensor lives as long as the ``Derived`` that
+    references it, i.e. per metadata object (v1).  PyTorch's caching host
+    allocator makes that safe and cheap: a pinned block freed while an
+    asynchronous copy from it is in flight is only reused after the copy's
+    stream event completes, and same-size re-allocations are served from the
+    cache (about 1 us).  Follow-up: pool one staging slot pair per
+    PagedAttention instance so the graph-mode update path can upload straight
+    into its reserved storage.
+    """
+
+    def __init__(
+        self, qo_indptr_cpu: torch.Tensor, kv_seq_lens_cpu: torch.Tensor, page_size: int
+    ):
+        b = kv_seq_lens_cpu.shape[0]
+        self.b = b
+        o_qo, o_q, o_ck, o_pi, o_pg, o_ll, o_kv, total = (
+            0,
+            b + 1,
+            2 * b + 1,
+            3 * b + 2,
+            4 * b + 3,
+            5 * b + 3,
+            6 * b + 3,
+            7 * b + 3,
+        )
+        self.slices = dict(
+            qo_indptr=slice(o_qo, o_q),
+            q_seq_lens=slice(o_q, o_ck),
+            cum_kv_seq_lens=slice(o_ck, o_pi),
+            kv_page_indptr=slice(o_pi, o_pg),
+            pages=slice(o_pg, o_ll),
+            kv_last_page_len=slice(o_ll, o_kv),
+            kv_seq_lens=slice(o_kv, total),
+        )
+        self.host = torch.empty(total, dtype=torch.int32, pin_memory=True)
+        st = self.host.numpy()
+        qo = qo_indptr_cpu.numpy()
+        kv = kv_seq_lens_cpu.numpy()
+        st[o_qo:o_q] = qo
+        np.subtract(qo[1:], qo[:-1], out=st[o_q:o_ck])
+        st[o_ck] = 0
+        np.cumsum(kv, out=st[o_ck + 1 : o_pi])
+        pages = st[o_pg:o_ll]
+        np.floor_divide(kv + (page_size - 1), page_size, out=pages)
+        st[o_pi] = 0
+        np.cumsum(pages, out=st[o_pi + 1 : o_pg])
+        # last page occupancy; a kv_len of 0 (no pages) yields page_size,
+        # which the FA kernels never read (get_length() returns 0 first)
+        np.subtract(kv, (pages - 1) * page_size, out=st[o_ll:o_kv])
+        st[o_kv:total] = kv
+        self.device: Optional[torch.Tensor] = None
+
+    def upload(self, device: torch.device) -> None:
+        """ONE non_blocking H2D of the whole staging into a device buffer."""
+        if self.device is None:
+            self.device = torch.empty(
+                self.host.shape[0], dtype=torch.int32, device=device
+            )
+            self.device.copy_(self.host, non_blocking=True)
+
+    def on_device(self, name: str) -> torch.Tensor:
+        assert self.device is not None
+        return self.device[self.slices[name]]
+
+    def on_host(self, name: str) -> torch.Tensor:
+        return self.host[self.slices[name]]
+
+
 def derive(
     qo_indptr,
     kv_seq_lens,
@@ -243,12 +334,18 @@ def derive(
     max_kv_len,
     *,
     needs: Iterable[str],
+    qo_indptr_cpu: torch.Tensor,
+    kv_seq_lens_cpu: torch.Tensor,
 ) -> Derived:
     """Canonical -> the derived forms in ``needs`` (see ``DERIVED_FORMS``).
 
-    Pure device ops, zero sync; nothing outside ``needs`` is computed (ledger
-    M7: the dense input used to pay the CSR compaction for every backend).  All
-    output shapes are static functions of the input shapes and host ints:
+    Zero sync; nothing outside ``needs`` is computed (ledger M7: the dense
+    input used to pay the CSR compaction for every backend).  The length
+    arithmetic runs on the host mirrors (``_HostStaging``) and reaches the
+    device through one pinned upload, so a plan that needs only cumulative KV
+    lengths or query lengths costs one memcpy and no kernel (ledger M5).  The
+    only device work is the two cross-form conversions; their output shapes
+    are static functions of the input shapes and host ints:
 
     - dense given -> flat indices by capacity scatter (a boolean masked-select
       would sync to size its result; scatter does not);
@@ -260,35 +357,39 @@ def derive(
       kv_page_indices produced NaN outputs / out-of-pool reads (found
       empirically by the NaN-page probe; see the fuzzer's
       csr_overallocated_nan_tail mutation).
+
+    The host mirrors are trusted to match the device tensors (documented
+    caller contract, same as validation).
     """
     needs = normalize_needs(needs)
     dev = kv_seq_lens.device
     b = kv_seq_lens.shape[0]
     out = Derived(needs=needs)
-
-    def zero_prefixed_cumsum(values):
-        zero = torch.zeros(1, dtype=torch.int32, device=dev)
-        return torch.cat([zero, torch.cumsum(values, 0, dtype=torch.int32)])
-
-    if FORM_Q_SEQ_LENS in needs:
-        out.q_seq_lens = qo_indptr.diff()
-    if FORM_CUM_KV_SEQ_LENS in needs:
-        out.cum_kv_seq_lens = zero_prefixed_cumsum(kv_seq_lens)
+    staging = _HostStaging(qo_indptr_cpu, kv_seq_lens_cpu, page_size)
 
     # the page-unit indptr feeds both cross-form conversions
     compact_flat = FORM_KV_PAGE_INDICES in needs and block_tables is not None
     gather_dense = FORM_BLOCK_TABLES in needs and block_tables is None
-    pages = kv_page_indptr = None
-    if FORM_KV_PAGE_INDPTR in needs or compact_flat or gather_dense:
-        pages = (kv_seq_lens + page_size - 1) // page_size  # (b,)
-        kv_page_indptr = zero_prefixed_cumsum(pages)
+    if (needs & _DEVICE_FORMS) or compact_flat or gather_dense:
+        staging.upload(dev)
+    if FORM_Q_SEQ_LENS in needs:
+        out.q_seq_lens = staging.on_device("q_seq_lens")
+    if FORM_CUM_KV_SEQ_LENS in needs:
+        out.cum_kv_seq_lens = staging.on_device("cum_kv_seq_lens")
     if FORM_KV_PAGE_INDPTR in needs:
-        out.kv_page_indptr = kv_page_indptr
+        out.kv_page_indptr = staging.on_device("kv_page_indptr")
+    if FORM_HOST_ARRAYS in needs:
+        out.qo_indptr_host = staging.on_host("qo_indptr")
+        out.kv_seq_lens_host = staging.on_host("kv_seq_lens")
+        out.kv_page_indptr_host = staging.on_host("kv_page_indptr")
+        out.kv_last_page_len_host = staging.on_host("kv_last_page_len")
 
     if FORM_KV_PAGE_INDICES in needs:
         if block_tables is None:
             out.kv_page_indices = kv_page_indices
         else:
+            kv_page_indptr = staging.on_device("kv_page_indptr")
+            pages = staging.on_device("pages")
             width = block_tables.shape[1]
             capacity = b * width
             col = torch.arange(width, device=dev, dtype=torch.int64)
@@ -305,6 +406,7 @@ def derive(
         if block_tables is not None:
             out.block_tables = block_tables
         else:
+            kv_page_indptr = staging.on_device("kv_page_indptr")
             width = (max_kv_len + page_size - 1) // page_size  # host int, no sync
             col = torch.arange(width, device=dev, dtype=torch.int64)
             src = kv_page_indptr[:-1].to(torch.int64).unsqueeze(1) + col.unsqueeze(0)
@@ -329,6 +431,7 @@ __all__ = [
     "DERIVED_FORMS",
     "FORM_BLOCK_TABLES",
     "FORM_CUM_KV_SEQ_LENS",
+    "FORM_HOST_ARRAYS",
     "FORM_KV_PAGE_INDICES",
     "FORM_KV_PAGE_INDPTR",
     "FORM_Q_SEQ_LENS",
