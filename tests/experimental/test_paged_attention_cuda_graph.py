@@ -17,7 +17,13 @@ Contract under test (``PagedAttention(use_cuda_graph=True)``):
 6. A FIRST plan that fails (backend construction or the backend's own plan)
    installs nothing: the next plan may fix any shape, including the batch
    size.
+7. The first successful graph-mode plan freezes the semantic contract (the
+   backend and every non-per-batch ``PlanMetadata`` field); a later plan that
+   changes any of them is rejected before anything is written, because the
+   captured graph would keep launching the old kernels.
 """
+
+import dataclasses
 
 import pytest
 import torch
@@ -107,6 +113,20 @@ def _plan(attn, p, backend):
         lse_mode="base2",
         backend=backend,
     )
+
+
+def _plan_with(attn, p, **overrides):
+    kwargs = dict(
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim_qk"],
+        q_dtype=p["dtype"],
+        causal=True,
+        lse_mode="base2",
+        backend="fa2",
+    )
+    kwargs.update(overrides)
+    attn.plan(make_metadata(p), **kwargs)
 
 
 def _reference(p):
@@ -389,5 +409,86 @@ def test_failed_first_plan_leaves_no_capacity(monkeypatch, stage):
     out, lse = attn.run(p3["q"], (p3["k_cache"], p3["v_cache"]))
     torch.cuda.synchronize()
     ref_out, ref_lse = _reference(p3)
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+
+def test_frozen_contract_covers_every_semantic_field():
+    """The frozen set is derived from PlanMetadata, so a semantic kwarg added
+    later is frozen automatically; only the per-batch values are exempt."""
+    from flashinfer.experimental.paged_attention import _controller
+    from flashinfer.experimental.paged_attention._contracts import PlanMetadata
+
+    names = {f.name for f in dataclasses.fields(PlanMetadata)}
+    semantic = set(_controller._semantic_fields())
+    assert semantic == names - _controller._PER_BATCH_FIELDS
+    assert semantic >= {
+        "kv_input_form",
+        "page_size",
+        "num_qo_heads",
+        "num_kv_heads",
+        "head_dim_qk",
+        "head_dim_vo",
+        "q_dtype",
+        "kv_dtype",
+        "causal",
+        "window_left",
+        "kv_layout",
+        "lse_mode",
+    }
+
+
+# (frozen field named in the error, plan() override that changes it)
+_SEMANTIC_DRIFT = [
+    ("causal", dict(causal=False)),  # mla-alignment F1
+    ("window_left", dict(window_left=16)),
+    ("lse_mode", dict(lse_mode="basee")),
+    ("q_dtype", dict(q_dtype=torch.float16)),
+    ("head_dim_qk", dict(head_dim_qk=64)),
+    ("num_qo_heads", dict(num_qo_heads=4)),
+    ("kv_layout", dict(kv_layout="NHD")),
+    ("backend", dict(backend="cudnn")),
+]
+
+
+@pytest.mark.parametrize(
+    "field,drift", _SEMANTIC_DRIFT, ids=[field for field, _ in _SEMANTIC_DRIFT]
+)
+def test_graph_replan_rejects_semantic_drift(field, drift):
+    """Capture with one configuration, re-plan the SAME metadata with one
+    semantic kwarg changed: the plan must be rejected naming the field, and
+    the captured graph must still replay the captured configuration.  Before
+    the frozen contract the causal=False re-plan was accepted and replay
+    returned the stale causal result (mla-alignment F1)."""
+    p = make_problem(seed=52, **_SHAPE)
+    _resolve_or_skip(p, "fa2")
+    if field == "backend":
+        _resolve_or_skip(p, drift["backend"])
+    dev = torch.device(p["device"])
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    q, k, v = p["q"].clone(), p["k_cache"].clone(), p["v_cache"].clone()
+    out = torch.empty(
+        q.shape[0], p["num_qo_heads"], p["head_dim_vo"], dtype=q.dtype, device=dev
+    )
+    lse = torch.empty(q.shape[0], p["num_qo_heads"], dtype=torch.float32, device=dev)
+    _plan_with(attn, p)
+    attn.run(q, (k, v), out=out, lse=lse)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        attn.run(q, (k, v), out=out, lse=lse)
+    g.replay()
+    torch.cuda.synchronize()
+    before_out, before_lse = out.clone(), lse.clone()
+
+    with pytest.raises(ValueError, match=rf"CUDA graph re-plan: {field} changed"):
+        _plan_with(attn, p, **drift)
+
+    # nothing moved: the published plan and the reserved buffers still
+    # describe the captured configuration, and replay is still correct for it
+    assert attn.backend == "fa2"
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, before_out) and torch.equal(lse, before_lse)
+    ref_out, ref_lse = _reference(p)
     torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
     torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
