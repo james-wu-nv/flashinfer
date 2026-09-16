@@ -32,6 +32,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
         - Speculative decode is supported by setting `--s_qo > 1` (subject to backend limitations noted below).
     - `BatchPrefillWithPagedKVCacheWrapper` - Prefill attention with paged KV cache.
         - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` and  `trtllm_batch_context_with_kv_cache`.
+    - `PagedAttention` - Experimental unified paged attention (`flashinfer.prefill.PagedAttention`) over the fa2/fa3, cuDNN and trtllm-gen kernels behind one contract; decode (`--s_qo 1`), speculative and prefill shapes, dense or CSR paging. Reports `plan` / `run` / `step` phase rows gated on an fp32 oracle; `--pa_legacy` adds rows through the legacy public API of the same kernel. See [PagedAttention Routine](#pagedattention-routine-experimental-unified-paged-attention).
     - `BatchPrefillWithRaggedKVCacheWrapper` - Prefill attention with ragged KV cache.
         - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` (cudnn-native) and  `trtllm_ragged_attention_deepseek`.
     - `BatchMLAPagedAttentionWrapper` - MLA attention proposed in DeepSeek series of models.
@@ -259,7 +260,39 @@ The output CSV will contain detailed metrics including:
 | `--compressed_topk`      | DSV4 sparse MLA only: maximum compressed-cache rows selected per query. Default: 1920.                    |
 | `--compressed_kv_len`    | DSV4 sparse MLA only: compressed-cache rows per request. Default: `ceil(s_kv / 4)`.                       |
 | `--compressed_page_size` | DSV4 sparse MLA only: compressed-cache page size. Default: 64.                                             |
-| `--kv_layout`            | DSV4 sparse MLA only: `HND` (default) or `NHD` for both KV-cache pools.                                    |
+| `--kv_layout`            | PagedAttention and DSV4 sparse MLA: `HND` (default) or `NHD` for the KV-cache pool(s).                     |
+| `--lse_mode`             | PagedAttention only: base of the returned LSE, `none` (default, no LSE), `base2` or `basee`. Decides the plan, the preallocated buffer and the oracle comparison. |
+| `--kv_input_form`        | PagedAttention only: `dense` (default) builds `PagedAttentionMetadata.dense` from a vLLM-style block table (page_size >= 8); `csr` builds `.csr` from sglang-style flat page ids (any page_size). |
+| `--window_left`          | PagedAttention only: sliding-window size; `-1` (default) disables the window. Backends without window support become `unsupported` rows. |
+| `--pa_layers`            | PagedAttention only: layer counts N for the `step` phase (one plan followed by N `run()` calls); one CSV row per value. Default `1 32`. |
+| `--pa_legacy`            | PagedAttention only: also time the same inputs through the legacy public API of each resolved backend as `api_variant=legacy` rows. |
+
+### PagedAttention Routine (experimental unified paged attention)
+
+`--routine PagedAttention` benchmarks `flashinfer.prefill.PagedAttention`, the experimental facade over the fa2/fa3, cuDNN and trtllm-gen paged-attention kernels. It reuses the attention flags above; `--causal` must be given explicitly (the CLI default is non-causal, which trtllm-gen cannot run).
+
+```bash
+python3 flashinfer_benchmark.py --routine PagedAttention --backends fa2 cudnn trtllm-gen auto \
+    --batch_size 8 --s_qo 128 --s_kv 4096 --num_qo_heads 32 --num_kv_heads 8 \
+    --head_dim_qk 128 --head_dim_vo 128 --page_size 16 --causal --kv_layout HND \
+    --lse_mode none --refcheck --pa_legacy --output_path pa.csv
+```
+
+Every requested backend sees **one** set of inputs: packed Q, a paged K/V pool with a shuffled (non-contiguous) page mapping and spare pages, a dense block table a few columns wider than any request needs (unused slots hold foreign page ids), exact per-request lengths (fixed, or `--random_actual_seq_len`), and `PagedAttentionMetadata.dense`/`.csr` per `--kv_input_form` with host mirrors supplied. With `--refcheck` each candidate's output (and LSE, when requested) is compared against the fp32 oracle in `tests/experimental/paged_attention_reference.py` **before** it is timed, and the buffers written by the timed run are checked again afterwards.
+
+Phases (one CSV row per backend, `api_variant` and phase; `median_time`/`std_time` are milliseconds for every phase):
+
+| `phase`  | Timed region | Timer |
+|----------|--------------|-------|
+| `plan`   | Fresh `PagedAttentionMetadata` construction plus `PagedAttention.plan()`. With CUDA graphs on (default) the instance is `use_cuda_graph=True`, so this is the graph-mode re-plan into reserved storage; with `--no_cuda_graph` it is the eager plan. | synchronized host wall (`timing_metric=host_wall`) |
+| `run`    | Warmed `run()` with preallocated `out`/`lse`, cold L2. | `bench_gpu_time`: CUDA graph replay by default (`cuda_graph_events`, or `cupti` when installed), eager CUDA events with `--no_cuda_graph` |
+| `step`   | One `plan` followed by N `run()` calls (N from `--pa_layers`, column `layers`), eager. | synchronized host wall |
+
+Columns specific to this routine: `api_variant` (`unified` or `legacy`), `phase`, `status`, `layers`, `kv_input_form`, `lse_mode`, `window_left`, plus `resolved_backend` (for `auto` rows the backend the facade chose). `status` is `ok`, `unsupported: <reason>` (static capability rejection from `resolve_paged_attention`, or a backend this routine does not cover), `error: <exception>` (any plan/run/timing failure), or `incorrect: <mismatch>` (oracle mismatch; no timing unless `--allow_output_mismatch`). Rows are never dropped: a backend that cannot run keeps one row per phase with its reason. `auto` is the facade's **static** heuristic selection (`resolve_paged_attention(backend="auto").chosen`), not autotuning; `--autotune` is rejected for this routine. `tflops`/`tb_per_sec` are filled for `run` rows only and do not account for `--window_left`.
+
+`--pa_legacy` adds `api_variant=legacy` rows for every kernel the facade ran (`auto` contributes its resolved backend), so `facade overhead = unified / legacy - 1` can be read per phase. The legacy providers call public APIs only: fa2/fa3 use `BatchPrefillWithPagedKVCacheWrapper` (for `--kv_input_form csr` the page-unit indptr/last-page lengths are derived on the device and the wrapper's `plan()` copies them to the host itself, a D2H sync the unified plan with host mirrors does not pay; for `dense` they are derived on the host, vLLM-style); cuDNN uses `cudnn_batch_prefill_with_kv_cache` and trtllm-gen uses `trtllm_batch_context_with_kv_cache` (both need the dense table, so their legacy rows are `unsupported` for the CSR form). Legacy rows keep each API's native LSE contract (fa/trtllm-gen packed base-2, cuDNN padded `(batch, max_q, heads)`); the oracle check normalizes outside the timed region, so with an LSE requested the unified/legacy ratio includes the facade's normalization.
+
+`samples/paged_attention_testlist.txt` is a smoke matrix (decode, speculative, chunked and full prefill, mixed lengths, CSR page_size 1, NHD) with small iteration counts.
 
 ### GEMM Flags
 | Flag                     | Description                                                                                                 |
@@ -547,6 +580,7 @@ Legend:
 | **BatchPrefillWithPagedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-fmha-v2, cute-dsl-prims |
 | **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-fmha-v2, cute-dsl-prims |
 | **BatchMLAPagedAttentionWrapper** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-native, cute-dsl, prims-ts | fa2, cutlass, trtllm-native, prims-ts | fa2 |
+| **PagedAttention** (experimental) |  | fa2, cudnn, auto | fa2, cudnn, auto | fa2, cudnn, auto | fa2, fa3, cudnn, auto | fa2, cudnn, trtllm-gen, auto | fa2, cudnn, trtllm-gen, auto | fa2, cudnn, auto |
 | **trtllm_batch_decode_sparse_mla_dsv4** |  |  |  |  |  | trtllm-gen | trtllm-gen |  |
 | **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
 | **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
