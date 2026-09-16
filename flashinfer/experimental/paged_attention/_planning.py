@@ -287,14 +287,24 @@ def validate_values(
     qo = host.numpy("qo_indptr")
     q_lens = host.numpy("q_seq_lens")
     kv = host.numpy("kv_seq_lens")
-    if q_lens.min() <= 0:
-        bad = int(np.argmax(q_lens <= 0))
+    # q_len 0 is a PADDING ROW as well (vLLM's CUDA-graph padding repeats the
+    # last query_start_loc value for the rows past num_reqs): legal, it owns
+    # no query token and no output row.  Measured on B200 with the native
+    # calls (ledger M17): fa2, cuDNN, trtllm-gen and cake all accept a q_len 0
+    # row (kv_len > 0 or 0) and leave every other row correct; cake's kv_len 0
+    # hang (M19) is declined by its preflight.  Only a decreasing indptr is
+    # corrupt.
+    if q_lens.min() < 0:
+        bad = int(np.argmax(q_lens < 0))
         raise ValueError(
-            f"qo_indptr must be strictly increasing (q_len >= 1); entry "
-            f"{bad}->{bad + 1} is {int(qo[bad])}->{int(qo[bad + 1])} — "
-            "zero-length requests are outside the v1 envelope; filter them "
-            "before plan()"
+            f"qo_indptr must be non-decreasing; entry {bad}->{bad + 1} is "
+            f"{int(qo[bad])}->{int(qo[bad + 1])}"
         )
+    _expect(
+        int(qo[-1]) >= 1,
+        "qo_indptr[-1] must be >= 1: a batch needs at least one query token "
+        "(every request has q_len 0)",
+    )
     _expect(int(qo[0]) == 0, "qo_indptr[0] must be 0")
     q_max = int(q_lens.max())
     _expect(
