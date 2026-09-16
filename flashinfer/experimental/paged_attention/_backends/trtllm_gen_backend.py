@@ -119,6 +119,20 @@ class _TrtllmGenBackend:
         meta, derived = self._meta, self._derived
         assert meta is not None and derived is not None
         assert meta.block_tables is not None  # needs_dense contract
+        # KV ABI: the launcher takes ONE set of pool strides from the K cache
+        # (csrc/trtllm_fmha_kernel_launcher.cu: kv_stride_* = key_cache.stride(..),
+        # assigned to both kStride* and vStride*), so a V pool with its own
+        # page/head/token strides is read with K's and comes out wrong (ledger
+        # M16, measured max err 2.67 where cuDNN/fa2 are exact).  Same head
+        # dims here, so equal shapes must mean equal strides.
+        if v_cache.stride() != k_cache.stride():
+            raise ValueError(
+                f"{self.name} reads the V cache with the K cache's strides, so "
+                "k_cache and v_cache must share one layout; got K strides "
+                f"{tuple(k_cache.stride())} vs V strides {tuple(v_cache.stride())} "
+                "(independent K/V pools with different page strides are "
+                "supported by the fa2/fa3 and cudnn backends)"
+            )
         result = trtllm_batch_context_with_kv_cache(
             q,
             (k_cache, v_cache),

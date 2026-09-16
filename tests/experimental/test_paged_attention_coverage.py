@@ -27,7 +27,8 @@ The fp32 oracle in ``paged_attention_reference.py`` is the only reference;
 no backend is ever compared against another backend as truth.
 
 Known library gaps are recorded as ``xfail(strict=True)`` with the ledger id
-and the work package that fixes them, so they flip to XPASS when fixed.
+and the work package that fixes them, so they flip to XPASS when fixed; none
+remain at the integrated head.
 """
 
 import math
@@ -1191,12 +1192,6 @@ def test_tc04_skewed_batch_100_decode_rows_plus_8_prefill_rows(backend, form):
 # ---------------------------------------------------------------------------
 
 
-def _m8(why):
-    return pytest.mark.xfail(
-        strict=True, raises=AssertionError, reason=f"ledger M8; WP-B: {why}"
-    )
-
-
 def _tc05_params():
     rows = []
     for backend in EXPLICIT_BACKENDS:
@@ -1207,15 +1202,6 @@ def _tc05_params():
                 backend,
                 "kv_independent_strides",
                 id=f"{backend}-kv_independent_strides",
-                marks=[
-                    _m8(
-                        "trtllm-gen applies the K cache strides to a V cache "
-                        "with a different page stride and computes wrong numbers "
-                        "(mla-alignment F5: K/V page stride)"
-                    )
-                ]
-                if backend == "trtllm-gen"
-                else [],
             )
         )
         rows.append(
@@ -1265,9 +1251,8 @@ def test_tc05_strided_inputs(backend, case):
     support, so fused-QKV slices and head-stride gaps MUST run and be correct
     there; other backends may reject (ValueError) but must never return wrong
     numbers.  Storage offsets are legal everywhere.  Inner-dim stride 2, a
-    narrow page-table view and a K cache on the wrong device must be
-    rejected-or-correct, at plan or at run; the recorded xfail is where a
-    backend is not."""
+    narrow page-table view, independent K/V pool strides and a K cache on the
+    wrong device must be rejected-or-correct, at plan or at run."""
     p = build_problem(
         [6, 1, 19],
         [40, 9, 70],
