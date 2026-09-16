@@ -249,6 +249,51 @@ any of these is the opt-in (an
 `#5007 <https://github.com/flashinfer-ai/flashinfer/issues/5007>`_ for the
 graduation plan.
 
+Backend selection and the ``max_q_len`` hint
+--------------------------------------------
+
+``backend="auto"`` is a **static** selection, not autotuning: nothing is
+timed, ``resolve_paged_attention`` ranks the runnable backends by a small
+per-architecture table (``HEURISTIC_ORDER``), and ``plan()`` walks that
+order, moving on only when a candidate declines the batch. The one shape
+fact the table reads is the optional ``max_q_len`` hint of
+:func:`resolve_paged_attention`: "the batches planned with this Resolution
+have at most this many query tokens per request" (1 for plain decode, the
+draft length for speculative decoding; leave it out for prefill or mixed
+batches). The hint selects the candidate *order*, never the candidate set or
+the exclusions, so it cannot change what a plan computes. It is pinned in the
+Resolution (``explain()`` prints it; Resolutions of one model configuration
+with different hints have different ``config`` keys), and a ``plan()`` whose
+batch (in CUDA-graph mode: whose capacity) has a larger ``max_q_len`` is
+rejected with a ``ValueError`` — hold one Resolution per query-length bucket,
+as an engine's decode / prefill split already does.
+
+The table is seeded from measurements. On sm_100 (B200, bf16, 32 query / 8
+KV heads, head_dim 128, page size 16, causal, dense block table; CUDA-graph
+``run`` medians of the ``PagedAttention`` benchmark routine, in µs) the
+trtllm-gen and cake backends run the paged *context* kernel for every batch,
+which at decode and speculative query lengths reads a request's whole KV for
+a handful of tokens; fa2's split-KV schedule is up to 5x faster there and the
+context kernel is ahead from 64 (short kv) to 256 (kv 16K) query tokens per request:
+
+==========  ==========  =====  =======  ==========  ========================
+batch       kv_len      q_len  fa2      trtllm-gen  auto without / with hint
+==========  ==========  =====  =======  ==========  ========================
+32          4096        1      92       513         trtllm-gen / fa2
+32          4096        8      247      588         trtllm-gen / fa2
+32          4096        16     248      618         trtllm-gen / fa2
+32          4096        64     491      667         trtllm-gen / trtllm-gen
+8           4096        256    487      168         trtllm-gen / trtllm-gen
+1           16384       1      22       209         trtllm-gen / fa2
+==========  ==========  =====  =======  ==========  ========================
+
+Hence on sm_100 a hint ``<= 16`` ranks fa2 first (``fa2, trtllm-gen, cake,
+cudnn``) and a larger hint, or none, keeps the default order (``trtllm-gen,
+cake, cudnn, fa2``); sm_80 / sm_90 / sm_120 have a single order. Numbers were
+taken on a shared, unlocked GPU and are the basis of the table, not a
+performance claim; the full sweep is in the WP-K report. Without a hint the
+selection is exactly what it was before the hint existed.
+
 Benchmarking the unified API
 ----------------------------
 
@@ -269,7 +314,9 @@ per phase:
 graph by default, eager with ``--no_cuda_graph``) and ``step`` (one plan
 followed by N ``run()`` calls, N from ``--pa_layers``). Use ``--s_qo 1`` for
 decode, ``--kv_input_form csr`` for flat page indices,
-``--random_actual_seq_len`` for variable lengths and ``--pa_legacy`` to add
+``--random_actual_seq_len`` for variable lengths, ``--pa_max_q_len_hint N``
+to resolve with the ``max_q_len`` hint (the ``auto`` rows then follow the
+hinted order) and ``--pa_legacy`` to add
 rows for the same inputs through the legacy public API of the same kernel
 (``api_variant=legacy``). Rows for unsupported,
 failing or incorrect backends are kept with a ``status`` column and a
