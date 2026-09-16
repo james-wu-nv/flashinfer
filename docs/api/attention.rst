@@ -206,15 +206,23 @@ Experimental: PagedAttention
 
 :class:`flashinfer.prefill.PagedAttention` is the experimental successor to
 :class:`~flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper` for paged
-attention over the existing fa2/fa3, cuDNN, and trtllm-gen kernels. One
-:class:`~flashinfer.prefill.PagedAttentionMetadata` object per scheduler step
-(token-unit ``qo_indptr``, per-request ``kv_seq_lens``, a dense block table via
-``.dense(...)`` or flat page ids via ``.csr(...)``, required host maxes,
-optional CPU mirrors for a zero-sync plan); :func:`resolve_paged_attention`
-answers at engine init which backends can run a configuration and why the
-others cannot; ``plan()`` declares the LSE base (``lse_mode``) and ``run()``
-takes the per-layer ``sm_scale`` and, for an fp8 KV cache, the per-tensor
-``k_scale`` / ``v_scale``. CUDA graphs follow a three-stage lifecycle:
+attention over the existing fa2/fa3, cuDNN, trtllm-gen and (on SM100/SM103)
+Cake kernels. The contract and lifecycle are described in the
+`unified paged attention design doc <https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/paged_attention_unified_lifecycle.md>`_.
+One :class:`~flashinfer.prefill.PagedAttentionMetadata` object per scheduler
+step (token-unit ``qo_indptr``, per-request ``kv_seq_lens``, a dense block
+table via ``.dense(...)`` or flat page ids via ``.csr(...)``, required host
+maxes, optional CPU mirrors for a zero-sync plan; a ``kv_seq_lens`` entry of 0
+marks a padding row); :func:`resolve_paged_attention` answers at engine init
+which backends can run a configuration and why the others cannot; ``plan()``
+declares the LSE base (``lse_mode``) and the feature axes (``window_left``,
+``logits_soft_cap``, ``custom_mask``, ``use_sinks``), each capability-checked
+so ``backend="auto"`` excludes a backend that cannot apply one instead of
+dropping it; ``run()`` takes the per-layer ``sm_scale``, the ``sinks`` tensor
+when planned, and, for an fp8 KV cache, the per-tensor ``k_scale`` /
+``v_scale``. ``explain()`` prints the chosen backend, every candidate tried
+at plan time and the resolve-time exclusion reasons. CUDA graphs follow a
+three-stage lifecycle:
 ``PagedAttention(graph_capacity=GraphCapacity(...))`` reserves the metadata
 storage of one graph bucket at construction (``use_cuda_graph=True`` infers
 the capacity from the first plan); the first graph-mode ``plan()`` freezes the
@@ -277,8 +285,10 @@ unlimited, ``lse_mode`` 0/1/2 = none/base-2/natural log. The resolved backend
 is not part of the identity, so fa2, fa3, cuDNN and trtllm-gen traces of one
 plan compare against the same definition. Tracing requires the planned
 instance: ``PagedAttention.run.fi_trace(...)`` and a trace before ``plan()``
-raise instead of guessing. With the fa2/fa3 backends auto-dump also emits the
-nested legacy ``gqa_paged_prefill`` definition of the wrapper they run on.
+raise instead of guessing, and a plan that uses ``logits_soft_cap``, a custom
+mask or attention sinks refuses to trace until the definition encodes them.
+With the fa2/fa3 backends auto-dump also emits the nested legacy
+``gqa_paged_prefill`` definition of the wrapper they run on.
 
 .. currentmodule:: flashinfer.prefill
 
