@@ -867,7 +867,10 @@ def cudnn_batch_prefill_with_kv_cache(
     batch_offsets_stats : Optional[torch.Tensor]
         Cumulative per-request start offsets into the LSE / stats tensor,
         shape ``(batch_size + 1,)``, in the units given by
-        ``batch_offsets_units``.
+        ``batch_offsets_units``.  When set, the stats are written packed
+        (``(total_qo_tokens, num_heads_qo)``, the FlashInfer LSE convention;
+        with ``batch_offsets_units="tokens"`` pass ``batch_offsets_q`` itself)
+        instead of padded, and ``lse`` takes that shape.
     batch_offsets_units : str
         Units of the ``batch_offsets_*`` tensors. ``"elements"`` (default, the
         historical behavior): offsets are pre-scaled tensor-element offsets,
@@ -884,8 +887,9 @@ def cudnn_batch_prefill_with_kv_cache(
         when ``None``.
     lse : Optional[torch.Tensor]
         Pre-allocated LSE tensor, shape
-        ``(batch_size, max_token_per_sequence, num_heads_qo)``.  Allocated
-        internally when ``None`` and ``return_lse`` is ``True``.
+        ``(batch_size, max_token_per_sequence, num_heads_qo)``, or packed
+        ``(total_qo_tokens, num_heads_qo)`` when ``batch_offsets_stats`` is
+        set.  Allocated internally when ``None`` and ``return_lse`` is ``True``.
     is_cuda_graph_compatible : bool
         Whether to plan the operation in a CUDA-graph-capture-safe mode.
     backend : Optional[str]
@@ -903,7 +907,8 @@ def cudnn_batch_prefill_with_kv_cache(
     Tuple[torch.Tensor, Optional[torch.Tensor]]
         ``(output, lse)`` where ``output`` has shape
         ``(total_qo_tokens, num_heads_qo, head_dim_vo)``; ``lse`` has shape
-        ``(batch_size, max_token_per_sequence, num_heads_qo)`` when
+        ``(batch_size, max_token_per_sequence, num_heads_qo)`` (packed
+        ``(total_qo_tokens, num_heads_qo)`` with ``batch_offsets_stats``) when
         ``return_lse=True``, else ``None``.
 
     Note
@@ -951,19 +956,25 @@ def cudnn_batch_prefill_with_kv_cache(
     elif v_cache.dim() == 4:
         d_vo = v_cache.shape[3]
 
-    if return_lse:
-        if lse is None:
-            lse = torch.empty(
-                num_sequences,
-                max_token_per_sequence,
-                h_qo,
-                device=q.device,
-                dtype=torch.float32,
-            )
-
-    if lse is not None and lse.shape != (num_sequences, max_token_per_sequence, h_qo):
+    # With batch_offsets_stats the stats land at per-request ragged offsets,
+    # i.e. packed (total_tokens, h_qo) in the FlashInfer LSE convention;
+    # without it they are padded (num_sequences, max_token_per_sequence, h_qo).
+    lse_shape = (
+        (num_tokens, h_qo)
+        if batch_offsets_stats is not None
+        else (num_sequences, max_token_per_sequence, h_qo)
+    )
+    if return_lse and lse is None:
+        lse = torch.empty(*lse_shape, device=q.device, dtype=torch.float32)
+    if lse is not None and tuple(lse.shape) != lse_shape:
         raise ValueError(
-            "lse must have shape (num_sequences, max_token_per_sequence, h_qo)"
+            f"lse must have shape {lse_shape} "
+            + (
+                "(packed (total_tokens, h_qo): batch_offsets_stats is set)"
+                if batch_offsets_stats is not None
+                else "(num_sequences, max_token_per_sequence, h_qo)"
+            )
+            + f", got {tuple(lse.shape)}"
         )
 
     if o_data_type is None:
