@@ -25,7 +25,7 @@ Design rules enforced (each traces to a documented failure mode):
     is derived internally.
 2.  Closed input set + loud errors.  Combinations outside the contract raise
     ``ValueError`` with the fix in the message.  We never guess a layout
-    (cuDNN issue #3800 is what guessing looks like).
+    (cuDNN issue 3800 is what guessing looks like).
 3.  Reject-or-correct.  Anything this API returns must match the reference
     semantics; anything it cannot address must raise.  The companion fuzzer
     (``tests/experimental/test_paged_attention_fuzzer.py``) enforces exactly
@@ -87,10 +87,10 @@ Paging metadata comes in exactly one of two forms (never both):
 - flat ``kv_page_indices`` — sglang-style token/CSR-native, any page_size
   >= 1.  The page-unit indptr and last-page lengths are NOT accepted: they
   are derivable from ``kv_seq_lens`` + ``page_size``, and accepting them
-  would create a second truth (see the #3921 mask-divergence class).
-  Backends that need the dense table (cudnn, trtllm-gen) get it derived by
-  a zero-sync gather when page_size >= 8, and are capability-excluded below
-  that.
+  would create a second truth (see the PR 3921 mask-divergence class).
+  Backends that need the dense table (cudnn, trtllm-gen, cake) get it
+  derived by a zero-sync gather when page_size >= 8, and are
+  capability-excluded below that.
 - Trusted inputs (documented, not validated): host mirrors must match the
   device tensors; ``block_tables`` VALUES (page ids) must be in-pool —
   checking them costs a device-side pass the hot path cannot pay; a debug
@@ -231,13 +231,16 @@ class PagedAttention:
             for layer in model:
                 out, lse = attn.run(q, (k_cache, v_cache), sm_scale=layer.scale)
 
-    One CUDA-graph bucket (the module docstring describes the lifecycle)::
+    One CUDA-graph bucket (the module docstring describes the lifecycle; the
+    ``Resolution`` was resolved with ``need_lse=True``, so the plan must keep
+    ``lse_mode != "none"``, which is part of the pinned config)::
 
         cap = GraphCapacity(batch_size=256, total_q_tokens=1024, max_q_len=4,
                             max_kv_len=8192 * 16, page_size=16, table_width=8192)
         attn = PagedAttention(device, graph_capacity=cap)
         attn.plan(md0, num_qo_heads=8, num_kv_heads=2, head_dim_qk=128,
-                  q_dtype=torch.bfloat16, backend=res)   # freezes backend + semantics
+                  q_dtype=torch.bfloat16, causal=True, lse_mode="base2",
+                  backend=res)                           # freezes backend + semantics
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             attn.run(q_buf, (k_cache, v_cache), out=out_buf, lse=lse_buf)
@@ -268,14 +271,17 @@ class PagedAttention:
         - ``use_cuda_graph``: graph mode with the capacity inferred from the
           FIRST plan (compatibility form of ``graph_capacity``).
         - ``workspace_buffer``: optional caller-owned scratch workspace
-          (contiguous 1-D uint8 on ``device``; the legacy wrappers' 128 MB
-          convention) that every backend's kernels run on — pass the buffer
-          the engine already shares with its legacy wrappers.  By default
-          every instance on a device shares one lazily allocated
-          library-owned pool, so holding one instance per graph bucket costs
-          no workspace per bucket.  Instances sharing a workspace must not run
-          concurrently on different streams; pass a private buffer where that
-          isolation is needed.
+          (contiguous 1-D uint8 or int8 on ``device``) that every backend's
+          kernels run on — pass the buffer the engine already shares with its
+          legacy wrappers.  By default every instance on a device shares one
+          lazily allocated library-owned 128 MiB pool (the legacy wrappers'
+          convention), so holding one instance per graph bucket costs no
+          workspace per bucket; that default has been observed to overflow
+          the fa2 split-KV planner on a single 2048-token, 32-head prefill,
+          so pass the engine's larger buffer where such shapes occur.
+          Instances sharing a workspace must not run concurrently on
+          different streams; pass a private buffer where that isolation is
+          needed.
         """
         from .experimental.paged_attention import PagedAttentionController
 
@@ -328,8 +334,9 @@ class PagedAttention:
         - ``causal``: also enforces ``q_len_i <= kv_len_i`` per request, except
           for padding rows (``kv_len_i == 0``, see
           :class:`PagedAttentionMetadata`): those are legal, read no KV page,
-          and produce a finite output row whose values and LSE are unspecified
-          by contract (every current backend writes zeros and LSE -inf).
+          and produce a finite output row; the row's output values and its
+          LSE are unspecified by contract (every current backend writes a
+          zero row and an LSE of -inf).
         - ``window_left``: sliding-window size (-1 = unlimited); backends
           without window support are capability-excluded.  Plan-time because
           it selects a compiled kernel variant on the FA backends.
@@ -398,7 +405,8 @@ class PagedAttention:
 
         Raises ``RuntimeError`` when the instance is not in graph mode, when
         no ``plan()`` has succeeded yet, or when the current stream is
-        capturing.  A ``plan()`` with the same frozen arguments is equivalent;
+        capturing.  It re-issues ``plan()`` with the frozen arguments and the
+        frozen backend name, so a ``plan()`` spelled that way is equivalent;
         ``update()`` is the engine-facing spelling (sglang's
         ``fast_prefill_plan`` role).
         """
@@ -423,21 +431,25 @@ class PagedAttention:
         - ``q``: ``(total_q_tokens, num_qo_heads, head_dim_qk)``, dtype as
           planned, dense along ``head_dim`` (``q.stride(-1) == 1``).  fa2/fa3
           and trtllm-gen address any such view (e.g. the head slice
-          ``qkv[:, :num_qo_heads]`` of a fused QKV projection); cuDNN needs
-          packed storage and rejects other layouts.  Nothing is copied here.
+          ``qkv[:, :num_qo_heads]`` of a fused QKV projection); cuDNN and
+          cake need packed storage and reject other layouts.  Nothing is
+          copied here.  In CUDA-graph mode ``q`` is the capture buffer and
+          may carry up to the capacity's rows; rows past the batch are
+          neither read nor written.
         - ``kv_cache``: ``(k_cache, v_cache)`` pair, each paged in the planned
           layout — HND ``(pages, num_kv_heads, page_size, head_dim)`` or NHD
           ``(pages, page_size, num_kv_heads, head_dim)``.
         - ``out``: optional preallocated output, contiguous
-          ``(total_q_tokens, num_qo_heads, head_dim_vo)``, dtype == q dtype.
+          ``(q.shape[0], num_qo_heads, head_dim_vo)``, dtype == q dtype.
         - ``lse``: optional preallocated LSE buffer, contiguous fp32
-          ``(total_q_tokens, num_qo_heads)``; requires ``lse_mode != "none"``.
+          ``(q.shape[0], num_qo_heads)``; requires ``lse_mode != "none"``.
         - ``sm_scale``: softmax scale for this call (default
           ``1/sqrt(head_dim_qk)``); a per-layer value, so one plan serves
           layers with different scales.
         - ``k_scale`` / ``v_scale``: per-tensor dequantization scales for an
           fp8 KV cache (``dequant = fp8_value * scale``), host floats so the
-          call stays sync-free; only valid when the plan's ``kv_dtype`` is fp8.
+          call stays sync-free; only valid when the plan's ``kv_dtype`` is
+          fp8, and an omitted scale means no scaling (1.0).
         - ``sinks``: per-head attention sinks, a contiguous fp32
           ``(num_qo_heads,)`` device tensor: head ``h`` gets one extra logit
           ``sinks[h]`` in its softmax denominator with no value contribution
@@ -445,16 +457,19 @@ class PagedAttention:
           ``use_sinks=True``; a per-layer value like ``sm_scale``.
 
         Returns ``(out, lse)``; ``lse`` is packed ``(total_q_tokens,
-        num_qo_heads)`` fp32 in the planned base — identical for every backend.
-        Rows of padding requests (``kv_len == 0``) are finite but unspecified
-        in both ``out`` and ``lse`` (every current backend writes zeros and
-        -inf); exclude them when consuming the LSE.
+        num_qo_heads)`` fp32 in the planned base — identical for every backend
+        (``None`` when ``lse_mode="none"``).  Rows of padding requests
+        (``kv_len == 0``) hold a finite output row; their output values and
+        their LSE are unspecified by contract (every current backend writes a
+        zero row and an LSE of -inf); exclude them when consuming the LSE.
 
         Tracing: ``flashinfer.fi_trace(attn.run, q=q, kv_cache=(k, v))`` on a
         planned instance (or ``FLASHINFER_TRACE_DUMP=1`` during ``run()``)
         exports a flashinfer-bench definition whose identity is the plan's
         paging form, KV layout, causal / window / LSE settings and geometry,
         with the plan-owned metadata read from the last successful ``plan()``.
+        A plan that uses ``logits_soft_cap``, a custom mask or sinks refuses
+        to trace, because the definition does not encode those yet.
         """
         return self._impl.run(
             q,
@@ -469,7 +484,8 @@ class PagedAttention:
 
     def explain(self) -> str:
         """Chosen backend, the plan-time trace (every candidate tried and why
-        it was accepted or declined) and the resolve-time exclusion reasons."""
+        it was accepted or declined) and the resolve-time exclusion reasons.
+        Raises ``ValueError`` before the first successful ``plan()``."""
         return self._impl.explain()
 
     def _trace_context(self) -> Dict[str, Any]:
