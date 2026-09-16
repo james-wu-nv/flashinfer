@@ -6,11 +6,12 @@ backends (``flashinfer/mla/_batch_mla/_backends/_fa_common.py``).
 
 A captured graph bakes in device pointers. In graph mode the controller
 therefore never hands a backend the caller's tensors or a fresh derivation:
-it owns one set of reserved buffers, sized by the FIRST plan (the capture
-shapes), and every later ``plan()`` copies the new batch into them. Shapes a
+it owns one set of reserved buffers sized by a ``GraphCapacity`` — given
+explicitly at construction or inferred from the FIRST plan (the capture
+shapes) — and every later ``plan()`` copies the new batch into them. Shapes a
 captured kernel depends on — batch size, table width, host maxes, total query
-tokens — must match the capture; a plan that would not fit is rejected before
-anything is written, and a plan that fails midway restores every buffer.
+tokens — are checked against the capacity before anything is written, and a
+plan that fails midway restores every buffer.
 """
 
 from __future__ import annotations
@@ -20,56 +21,189 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from ._contracts import PagedAttentionMetadata, _expect
+from ._backends._capabilities import MIN_DENSE_PAGE_SIZE
+from ._contracts import PagedAttentionMetadata, _expect, _expect_page_size
 from ._planning import Derived
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def _expect_positive_int(name: str, value) -> None:
+    _expect(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 1,
+        f"GraphCapacity.{name} must be a positive host int, got {value!r}",
+    )
 
 
 @dataclass(frozen=True)
 class GraphCapacity:
-    """What the FIRST graph-mode plan fixed (the capture shapes)."""
+    """The capture shapes of one CUDA-graph bucket.
+
+    A captured graph bakes in the reserved buffers' pointers, its launch grids
+    and the host integers its kernels were planned with.  ``GraphCapacity``
+    names those shapes so an engine can size a bucket at construction::
+
+        cap = GraphCapacity(batch_size=256, total_q_tokens=1024, max_q_len=4,
+                            max_kv_len=131072, page_size=16, table_width=8192)
+        attn = PagedAttention(device, graph_capacity=cap)
+
+    That is the dense ``block_tables`` form; the flat ``kv_page_indices`` form
+    passes ``kv_input_form="page_indices"`` and ``flat_capacity=`` instead of
+    ``table_width=``.  ``PagedAttention(use_cuda_graph=True)`` infers the
+    capacity from the first plan instead (:meth:`from_metadata`).
+
+    - ``batch_size``, ``kv_input_form`` and ``page_size`` hold exactly for
+      every later batch (each backend's grid and paging dialect follow from
+      them).
+    - ``total_q_tokens``, ``max_q_len``, ``max_kv_len`` are the shapes the
+      kernels are planned with.
+    - dense form: ``table_width`` is the caller's block-table width;
+      ``flat_capacity`` is ``batch_size * table_width`` (the derived CSR form).
+    - flat form: ``flat_capacity`` bounds the length of ``kv_page_indices``.
+      A dense table is reserved at ``ceil(max_kv_len / page_size)`` only once
+      a backend that needs one is chosen — never below
+      ``MIN_DENSE_PAGE_SIZE``, where it would be ``(batch, max_context)``.
+    """
 
     batch_size: int
-    kv_input_form: str
-    page_size: int
+    total_q_tokens: int
     max_q_len: int
     max_kv_len: int
-    total_q_tokens: int
-    # dense (b, W): the caller's width, or ceil(max_kv/page) when derived
-    table_width: int
-    flat_capacity: int  # flat page-id buffer length
+    page_size: int
+    kv_input_form: str = "block_tables"
+    table_width: Optional[int] = None  # dense form: the block table width
+    flat_capacity: Optional[int] = None  # flat form: kv_page_indices length
+
+    def __post_init__(self):
+        for name in ("batch_size", "total_q_tokens", "max_q_len", "max_kv_len"):
+            _expect_positive_int(name, getattr(self, name))
+        _expect(
+            self.kv_input_form in ("block_tables", "page_indices"),
+            "GraphCapacity.kv_input_form must be 'block_tables' or "
+            f"'page_indices', got {self.kv_input_form!r}",
+        )
+        _expect_page_size(self.page_size, self.kv_input_form)
+        _expect(
+            self.total_q_tokens >= self.batch_size,
+            f"GraphCapacity.total_q_tokens ({self.total_q_tokens}) must cover at "
+            f"least one query token per request (batch_size {self.batch_size})",
+        )
+        _expect(
+            self.max_q_len <= self.total_q_tokens,
+            f"GraphCapacity.max_q_len ({self.max_q_len}) exceeds total_q_tokens "
+            f"({self.total_q_tokens})",
+        )
+        if self.kv_input_form == "block_tables":
+            _expect(
+                self.table_width is not None,
+                "GraphCapacity: the dense block_tables form requires table_width "
+                "(the block table's width in pages)",
+            )
+            _expect_positive_int("table_width", self.table_width)
+            _expect(
+                self.table_width * self.page_size >= self.max_kv_len,
+                f"GraphCapacity: table_width {self.table_width} x page_size "
+                f"{self.page_size} = {self.table_width * self.page_size} is too "
+                f"narrow for max_kv_len {self.max_kv_len}",
+            )
+            flat = self.batch_size * self.table_width
+            if self.flat_capacity is None:
+                object.__setattr__(self, "flat_capacity", flat)
+            else:
+                _expect(
+                    self.flat_capacity == flat,
+                    f"GraphCapacity: in the dense form flat_capacity is derived as "
+                    f"batch_size x table_width = {flat}; leave it unset",
+                )
+        else:
+            _expect(
+                self.table_width is None,
+                "GraphCapacity: the flat page_indices form derives its dense table "
+                "at ceil(max_kv_len / page_size) when a backend needs one; do not "
+                "pass table_width",
+            )
+            _expect(
+                self.flat_capacity is not None,
+                "GraphCapacity: the flat page_indices form requires flat_capacity "
+                "(the reserved length of kv_page_indices)",
+            )
+            _expect_positive_int("flat_capacity", self.flat_capacity)
+            need = max(self.batch_size, self.dense_table_width)
+            _expect(
+                self.flat_capacity >= need,
+                f"GraphCapacity.flat_capacity ({self.flat_capacity}) cannot hold "
+                f"one page per request and one request of max_kv_len (needs >= {need})",
+            )
+
+    @property
+    def dense_table_width(self) -> int:
+        """Width of the dense table a backend that needs one reads."""
+        if self.table_width is not None:
+            return self.table_width
+        return _ceil_div(self.max_kv_len, self.page_size)
+
+    @classmethod
+    def from_metadata(cls, metadata: PagedAttentionMetadata) -> "GraphCapacity":
+        """The capacity ``use_cuda_graph=True`` infers from the first batch."""
+        common = dict(
+            batch_size=metadata.batch_size,
+            total_q_tokens=metadata.total_q_tokens,
+            max_q_len=metadata.max_q_len,
+            max_kv_len=metadata.max_kv_len,
+            page_size=metadata.page_size,
+            kv_input_form=metadata.kv_input_form,
+        )
+        if metadata.block_tables is not None:
+            return cls(**common, table_width=int(metadata.block_tables.shape[1]))
+        return cls(**common, flat_capacity=int(metadata.kv_page_indices.shape[0]))
 
 
 class GraphBuffers:
     """Reserved device storage for one PagedAttention instance in graph mode."""
 
-    def __init__(self, metadata: PagedAttentionMetadata, device: torch.device):
-        b = metadata.batch_size
-        if metadata.block_tables is not None:
-            width = int(metadata.block_tables.shape[1])
-            flat_cap = b * width
-        else:
-            width = (metadata.max_kv_len + metadata.page_size - 1) // metadata.page_size
-            flat_cap = int(metadata.kv_page_indices.shape[0])
-        self.capacity = GraphCapacity(
-            batch_size=b,
-            kv_input_form=metadata.kv_input_form,
-            page_size=metadata.page_size,
-            max_q_len=metadata.max_q_len,
-            max_kv_len=metadata.max_kv_len,
-            total_q_tokens=metadata.total_q_tokens,
-            table_width=width,
-            flat_capacity=flat_cap,
-        )
+    def __init__(self, capacity: GraphCapacity, device: torch.device):
+        self.capacity = capacity
+        self._device = device
+        b = capacity.batch_size
         i32 = dict(dtype=torch.int32, device=device)
         # the caller-facing canonical metadata, mirrored into stable storage
         self.qo_indptr = torch.zeros(b + 1, **i32)
         self.kv_seq_lens = torch.zeros(b, **i32)
-        self.block_tables = torch.zeros(b, width, **i32)  # given or derived dense
-        self.kv_page_indices = torch.zeros(flat_cap, **i32)  # given (csr) or derived
+        # flat page ids: given (flat form) or derived from the dense table
+        self.kv_page_indices = torch.zeros(capacity.flat_capacity, **i32)
         # backend-neutral derived forms
         self.q_seq_lens = torch.zeros(b, **i32)
         self.cum_kv_seq_lens = torch.zeros(b + 1, **i32)
         self.kv_page_indptr = torch.zeros(b + 1, **i32)
+        # The dense table.  Dense form: the caller's own, mirrored.  Flat form:
+        # reserved by reserve_dense_table() only once a backend that needs it
+        # is chosen — at token-granular page sizes it would be (b, max_context)
+        # (128 MiB per bucket for sglang's page_size=1 at 128K context).
+        self.block_tables: Optional[torch.Tensor] = (
+            torch.zeros(b, capacity.table_width, **i32)
+            if capacity.kv_input_form == "block_tables"
+            else None
+        )
+
+    def reserve_dense_table(self) -> torch.Tensor:
+        """Flat form: reserve the derived dense table for a backend that needs it."""
+        if self.block_tables is None:
+            cap = self.capacity
+            _expect(
+                cap.page_size >= MIN_DENSE_PAGE_SIZE,
+                f"a dense block table cannot be reserved at page_size {cap.page_size} "
+                f"< {MIN_DENSE_PAGE_SIZE}: it would be (batch, max_context); backends "
+                "that need one are capability-excluded there",
+            )
+            self.block_tables = torch.zeros(
+                cap.batch_size,
+                cap.dense_table_width,
+                dtype=torch.int32,
+                device=self._device,
+            )
+        return self.block_tables
 
     # ---- checks ----
     def preflight(self, metadata: PagedAttentionMetadata) -> None:
@@ -88,7 +222,7 @@ class GraphBuffers:
                 got == want,
                 f"CUDA graph re-plan: {name} {got!r} differs from the captured "
                 f"{want!r}; a captured graph cannot change it — use one "
-                "PagedAttention(use_cuda_graph=True) instance per graph bucket",
+                "PagedAttention graph instance per graph bucket",
             )
         if metadata.block_tables is not None:
             _expect(
@@ -123,6 +257,7 @@ class GraphBuffers:
             n = int(metadata.kv_page_indices.shape[0])
             pairs.append((self.kv_page_indices[:n], metadata.kv_page_indices))
             if fresh.block_tables is not None:
+                assert self.block_tables is not None  # reserve_dense_table() ran
                 pairs.append((self.block_tables, fresh.block_tables))
         return pairs
 

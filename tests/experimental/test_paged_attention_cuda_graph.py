@@ -21,15 +21,25 @@ Contract under test (``PagedAttention(use_cuda_graph=True)``):
    backend and every non-per-batch ``PlanMetadata`` field); a later plan that
    changes any of them is rejected before anything is written, because the
    captured graph would keep launching the old kernels.
+8. ``PagedAttention(graph_capacity=GraphCapacity(...))`` allocates the
+   reserved storage at construction; in the flat ``kv_page_indices`` form the
+   dense block table is reserved only for a backend that reads it (never at
+   ``page_size < 8``, where it would be ``(batch, max_context)``).
 """
 
 import dataclasses
+import gc
 
 import pytest
 import torch
 
 from flashinfer.experimental.paged_attention._graph import Transaction
-from flashinfer.prefill import PagedAttention
+from flashinfer.prefill import (
+    GraphCapacity,
+    PagedAttention,
+    PagedAttentionMetadata,
+    resolve_paged_attention,
+)
 
 from .paged_attention_reference import reference_paged_prefill
 from .test_paged_attention_prototype import (
@@ -127,6 +137,18 @@ def _plan_with(attn, p, **overrides):
     )
     kwargs.update(overrides)
     attn.plan(make_metadata(p), **kwargs)
+
+
+def _graph_capacity_of(p):
+    """Explicit capacity matching one make_problem() batch (dense form)."""
+    return GraphCapacity(
+        batch_size=int(p["kv_seq_lens_cpu"].shape[0]),
+        total_q_tokens=int(p["qo_indptr_cpu"][-1]),
+        max_q_len=p["max_q_len"],
+        max_kv_len=p["max_kv_len"],
+        page_size=p["page_size"],
+        table_width=int(p["block_tables"].shape[1]),
+    )
 
 
 def _reference(p):
@@ -492,3 +514,173 @@ def test_graph_replan_rejects_semantic_drift(field, drift):
     ref_out, ref_lse = _reference(p)
     torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
     torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+
+def test_graph_capacity_validation():
+    dense = dict(
+        batch_size=2, total_q_tokens=8, max_q_len=4, max_kv_len=64, page_size=16
+    )
+    cap = GraphCapacity(**dense, table_width=4)
+    assert cap.flat_capacity == 8 and cap.dense_table_width == 4
+    with pytest.raises(ValueError, match="requires table_width"):
+        GraphCapacity(**dense)
+    with pytest.raises(ValueError, match="too narrow"):
+        GraphCapacity(**dict(dense, max_kv_len=65), table_width=4)
+    with pytest.raises(ValueError, match="leave it unset"):
+        GraphCapacity(**dense, table_width=4, flat_capacity=9)
+    with pytest.raises(ValueError, match="page_size"):
+        GraphCapacity(**dict(dense, page_size=1), table_width=64)  # dense floor
+    with pytest.raises(ValueError, match="total_q_tokens"):
+        GraphCapacity(**dict(dense, total_q_tokens=1), table_width=4)
+    with pytest.raises(ValueError, match="max_q_len"):
+        GraphCapacity(**dict(dense, max_q_len=9), table_width=4)
+    with pytest.raises(ValueError, match="positive host int"):
+        GraphCapacity(**dict(dense, batch_size=0), table_width=4)
+
+    flat = dict(dense, page_size=1, kv_input_form="page_indices")
+    csr = GraphCapacity(**flat, flat_capacity=128)
+    assert csr.dense_table_width == 64 and csr.table_width is None
+    with pytest.raises(ValueError, match="requires flat_capacity"):
+        GraphCapacity(**flat)
+    with pytest.raises(ValueError, match="do not pass table_width"):
+        GraphCapacity(**flat, flat_capacity=128, table_width=64)
+    with pytest.raises(ValueError, match="cannot hold"):
+        GraphCapacity(**flat, flat_capacity=63)
+    with pytest.raises(ValueError, match="kv_input_form"):
+        GraphCapacity(**dict(dense, kv_input_form="csr"), table_width=4)
+
+
+def test_explicit_capacity_allocates_at_construction():
+    """With graph_capacity= the reserved storage exists before the first plan,
+    the first plan publishes that same storage, and a batch outside the
+    capacity is rejected against it."""
+    p = make_problem(seed=53, **_SHAPE)
+    _resolve_or_skip(p, "fa2")
+    dev = torch.device(p["device"])
+    cap = _graph_capacity_of(p)
+    attn = PagedAttention(dev, graph_capacity=cap)
+    gb = attn._impl._graph
+    assert gb is not None and gb.capacity == cap
+    assert tuple(gb.block_tables.shape) == (cap.batch_size, cap.table_width)
+    assert attn.backend is None
+
+    _plan(attn, p, "fa2")
+    assert attn._impl._graph is gb
+    out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]))
+    torch.cuda.synchronize()
+    ref_out, ref_lse = _reference(p)
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+    other = make_problem(seed=54, **dict(_SHAPE, batch_size=3))
+    with pytest.raises(ValueError, match="CUDA graph re-plan: batch_size"):
+        _plan(attn, other, "fa2")
+    with pytest.raises(ValueError, match="must be a GraphCapacity"):
+        PagedAttention(dev, graph_capacity=dict(batch_size=4))
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn", "trtllm-gen"])
+def test_csr_graph_instance_reserves_dense_table_only_for_dense_backends(backend):
+    """Flat page-id form at page_size 16: the dense table is reserved lazily
+    at the first plan, only if the chosen backend reads it; the reserved
+    table then carries the derived dense form through capture and re-plan."""
+    p = make_problem(seed=55, **dict(_SHAPE, input_form="page_indices"))
+    _resolve_or_skip(p, backend)
+    dev = torch.device(p["device"])
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    _plan(attn, p, backend)
+    gb = attn._impl._graph
+    needs_dense = backend in ("cudnn", "trtllm-gen")
+    if needs_dense:
+        width = (p["max_kv_len"] + p["page_size"] - 1) // p["page_size"]
+        assert tuple(gb.block_tables.shape) == (gb.capacity.batch_size, width)
+    else:
+        assert gb.block_tables is None
+    out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]))
+    torch.cuda.synchronize()
+    ref_out, ref_lse = reference_paged_prefill(
+        p["q"],
+        p["k_ref"],
+        p["v_ref"],
+        p["qo_indptr_cpu"],
+        p["kv_seq_lens_cpu"],
+        None,
+        p["page_size"],
+        True,
+        kv_page_indices=p["kv_page_indices"],
+    )
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+
+def test_dense_graph_instance_mirrors_the_caller_width_table():
+    p = make_problem(seed=56, **_SHAPE)
+    _resolve_or_skip(p, "fa2")
+    attn = PagedAttention(torch.device(p["device"]), use_cuda_graph=True)
+    _plan(attn, p, "fa2")
+    assert tuple(attn._impl._graph.block_tables.shape) == tuple(p["block_tables"].shape)
+
+
+def test_csr_page_size_1_graph_instance_reserves_no_dense_table():
+    """sglang shape: page_size=1 flat page ids, one 128K request in a batch of
+    64.  A dense (batch, max_kv) table would be 32 MiB per bucket; a
+    CSR-native backend must not pay for it (findings ledger M1)."""
+    dev = torch.device("cuda:0")
+    b, long_kv = 64, 128 * 1024
+    kv_lens = torch.ones(b, dtype=torch.int32)
+    kv_lens[0] = long_kv
+    qo_indptr_cpu = torch.arange(b + 1, dtype=torch.int32)  # one query token each
+    n_pages = int(kv_lens.sum())  # page_size=1: one page per token
+    kv_page_indices = torch.arange(n_pages, dtype=torch.int32, device=dev)
+    semantic = dict(
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        q_dtype=torch.bfloat16,
+        causal=True,
+        lse_mode="base2",
+    )
+    try:
+        resolve_paged_attention(
+            device=dev,
+            page_size=1,
+            need_lse=True,
+            kv_input_form="page_indices",
+            backend="fa2",
+            **{k: v for k, v in semantic.items() if k not in ("causal", "lse_mode")},
+        )
+    except ValueError as e:
+        pytest.skip(f"fa2 not runnable here: {e}")
+
+    def metadata():
+        return PagedAttentionMetadata.csr(
+            qo_indptr_cpu.to(dev),
+            kv_lens.to(dev),
+            kv_page_indices,
+            page_size=1,
+            max_q_len=1,
+            max_kv_len=long_kv,
+            qo_indptr_cpu=qo_indptr_cpu,
+            kv_seq_lens_cpu=kv_lens,
+        )
+
+    # one-time costs (JIT module, per-device shared workspace) on a warm instance
+    warm = PagedAttention(dev, use_cuda_graph=True)
+    warm.plan(metadata(), backend="fa2", **semantic)
+    torch.cuda.synchronize(dev)
+    gc.collect()
+    before = torch.cuda.memory_allocated(dev)
+
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn.plan(metadata(), backend="fa2", **semantic)
+    torch.cuda.synchronize(dev)
+    gc.collect()
+    growth = torch.cuda.memory_allocated(dev) - before
+
+    assert attn._impl._graph.block_tables is None
+    dense_bytes = b * long_kv * 4
+    assert growth < dense_bytes // 2, (
+        f"a page_size=1 CSR graph instance grew device memory by "
+        f"{growth / 2**20:.1f} MiB; the dense (batch, max_kv) table it must not "
+        f"reserve is {dense_bytes / 2**20:.0f} MiB"
+    )

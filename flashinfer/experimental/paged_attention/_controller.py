@@ -34,7 +34,7 @@ from ._contracts import (
     _expect_window_left,
     resolve_config_key,
 )
-from ._graph import GraphBuffers, Transaction
+from ._graph import GraphBuffers, GraphCapacity, Transaction
 from ._planning import Derived, validate_causal_envelope
 from ._selection import resolve_paged_attention
 
@@ -144,6 +144,7 @@ class PagedAttentionController:
         self,
         device: Optional[torch.device] = None,
         *,
+        graph_capacity: Optional[GraphCapacity] = None,
         use_cuda_graph: bool = False,
         workspace_buffer: Optional[torch.Tensor] = None,
     ):
@@ -159,9 +160,19 @@ class PagedAttentionController:
             if workspace_buffer is not None
             else None
         )
-        # CUDA-graph mode: reserved storage sized by the first plan (_graph.py)
+        # CUDA-graph mode: reserved storage (_graph.py) sized by an explicit
+        # GraphCapacity here, or by the first plan when only use_cuda_graph=True
+        if graph_capacity is not None:
+            _expect(
+                isinstance(graph_capacity, GraphCapacity),
+                "graph_capacity must be a GraphCapacity, got "
+                f"{type(graph_capacity).__name__}",
+            )
+            use_cuda_graph = True
         self._use_cuda_graph = use_cuda_graph
-        self._graph: Optional[GraphBuffers] = None
+        self._graph: Optional[GraphBuffers] = (
+            GraphBuffers(graph_capacity, dev) if graph_capacity is not None else None
+        )
         # what the first successful graph-mode plan froze (_frozen_contract)
         self._frozen: Optional[Dict[str, Any]] = None
         # published plan state (swapped together, only on success)
@@ -281,10 +292,14 @@ class PagedAttentionController:
             # The buffers stay a local until publication below: a first plan
             # that fails in the backend must not leave a capacity behind.
             if self._graph is None:
-                gb = GraphBuffers(metadata, self.device)
+                gb = GraphBuffers(GraphCapacity.from_metadata(metadata), self.device)
             else:
                 gb = self._graph
                 gb.preflight(metadata)
+            if needs_dense:
+                # flat form: only a backend that reads the dense table pays
+                # for it, and only once (no-op in the dense form)
+                gb.reserve_dense_table()
             transaction = Transaction(gb.targets(metadata, fresh))
             derived = gb.derived_view(needs_dense=needs_dense)
             qo_indptr, kv_seq_lens = gb.qo_indptr, gb.kv_seq_lens

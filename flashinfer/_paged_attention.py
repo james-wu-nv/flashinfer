@@ -78,7 +78,11 @@ import torch
 from .api_logging import flashinfer_experimental_api
 
 if TYPE_CHECKING:  # pragma: no cover — types only; the package is imported lazily
-    from .experimental.paged_attention import PagedAttentionMetadata, Resolution
+    from .experimental.paged_attention import (
+        GraphCapacity,
+        PagedAttentionMetadata,
+        Resolution,
+    )
 
 __all__ = [
     "resolve_paged_attention",
@@ -91,6 +95,7 @@ _FEATURE = "PagedAttention"
 # that importing core never loads the experimental package.
 _LAZY_EXPORTS = {
     "PagedAttentionMetadata": "PagedAttentionMetadata",
+    "GraphCapacity": "GraphCapacity",
     "Resolution": "Resolution",
     "PagedAttentionCapabilities": "PagedAttentionCapabilities",
     "BackendCapability": "PagedAttentionCapabilities",  # pre-rename alias
@@ -187,17 +192,23 @@ class PagedAttention:
         self,
         device: Optional[torch.device] = None,
         *,
+        graph_capacity: Optional["GraphCapacity"] = None,
         use_cuda_graph: bool = False,
         workspace_buffer: Optional[torch.Tensor] = None,
     ):
         """
-        - ``use_cuda_graph``: reserve metadata storage so ``run()`` can be
-          captured into a CUDA graph and later ``plan()`` calls re-fill that
-          storage instead of allocating.  The FIRST plan fixes the capture
-          shapes (batch size, table width, host maxes, total query tokens);
-          a later plan that would change any of them is rejected, and a plan
-          that fails midway restores the previous plan's buffers.  Use one
-          instance per graph bucket.
+        - ``graph_capacity``: a :class:`GraphCapacity` — the capture shapes of
+          one CUDA-graph bucket (batch size, total query tokens, host maxes,
+          page size, block-table width or flat page-id capacity).  The
+          reserved metadata storage is allocated here, sized by it, so a
+          captured ``run()`` can be re-planned and replayed; a plan that does
+          not fit the capacity is rejected before anything is written, and a
+          plan that fails midway restores the previous plan's buffers.  In
+          the flat ``kv_page_indices`` form the dense block table is reserved
+          only if the chosen backend needs it (never at ``page_size < 8``).
+          Use one instance per graph bucket; this is the recommended form.
+        - ``use_cuda_graph``: graph mode with the capacity inferred from the
+          FIRST plan (compatibility form of ``graph_capacity``).
         - ``workspace_buffer``: optional caller-owned scratch workspace
           (contiguous 1-D uint8 on ``device``; the legacy wrappers' 128 MB
           convention) that every backend's kernels run on — pass the buffer
@@ -211,7 +222,10 @@ class PagedAttention:
         from .experimental.paged_attention import PagedAttentionController
 
         self._impl = PagedAttentionController(
-            device, use_cuda_graph=use_cuda_graph, workspace_buffer=workspace_buffer
+            device,
+            graph_capacity=graph_capacity,
+            use_cuda_graph=use_cuda_graph,
+            workspace_buffer=workspace_buffer,
         )
 
     @property

@@ -7027,7 +7027,12 @@ from ._paged_attention import (  # noqa: E402
 )
 
 _PAGED_ATTENTION_LAZY = frozenset(
-    {"PagedAttentionMetadata", "Resolution", "PagedAttentionCapabilities"}
+    {
+        "PagedAttentionMetadata",
+        "GraphCapacity",
+        "Resolution",
+        "PagedAttentionCapabilities",
+    }
 )
 
 
