@@ -802,6 +802,79 @@ def test_graph_mode_trace_reads_reserved_storage(form):
 
 
 @cuda_only
+@pytest.mark.parametrize("form", list(FORMS))
+def test_bound_trace_slices_capacity_buffers_to_live_rows(form):
+    """A trace of an instance bound to an explicit GraphCapacity with headroom
+    rows sees q / out / lse cut to the batch's live rows (views), so the
+    definition's ``total_q == qo_indptr[-1]`` constraint holds; a q shorter
+    than the plan is refused."""
+    from flashinfer.prefill import GraphCapacity
+
+    p = _problem(57, form=form)
+    live = int(p["qo_indptr_cpu"][-1])
+    extra = 24
+    width = p["block_tables"].shape[1]
+    capacity = dict(
+        batch_size=int(p["kv_seq_lens_cpu"].shape[0]),
+        total_q_tokens=live + extra,
+        max_q_len=p["max_q_len"],
+        max_kv_len=width * p["page_size"],
+        page_size=p["page_size"],
+    )
+    if form == "dense":
+        cap = GraphCapacity(**capacity, table_width=width)
+    else:
+        cap = GraphCapacity(
+            **capacity,
+            kv_input_form="page_indices",
+            flat_capacity=p["kv_page_indices"].shape[0] + 8,
+        )
+    attn = PagedAttention(torch.device(p["device"]), graph_capacity=cap)
+    _plan_into(attn, p)
+    q_cap = torch.empty(
+        live + extra, *p["q"].shape[1:], dtype=p["q"].dtype, device="cuda"
+    )
+    q_cap[:live] = p["q"]
+    out_cap = torch.empty(
+        live + extra,
+        p["num_qo_heads"],
+        p["head_dim_vo"],
+        dtype=p["q"].dtype,
+        device="cuda",
+    )
+    lse_cap = torch.empty(
+        live + extra, p["num_qo_heads"], dtype=torch.float32, device="cuda"
+    )
+    attn.run(q_cap, (p["k_cache"], p["v_cache"]), out=out_cap, lse=lse_cap)
+
+    tpl = paged_attention_trace_dispatch(self=attn)
+    kwargs = dict(
+        self=attn,
+        q=q_cap,
+        kv_cache=(p["k_cache"], p["v_cache"]),
+        out=out_cap,
+        lse=lse_cap,
+    )
+    norm = tpl.normalize_kwargs(kwargs)
+    for key, buf in (("q", q_cap), ("out", out_cap), ("lse", lse_cap)):
+        assert norm[key].shape[0] == live and norm[key].data_ptr() == buf.data_ptr()
+    assert norm["q"].shape[1:] == q_cap.shape[1:]
+    _assert_constraints_hold(
+        _trace(attn, p),
+        _kwargs_from_context(attn._trace_context(), norm["q"], *norm["kv_cache"]),
+    )
+    # the definition equals the one traced with exactly-sized buffers
+    assert _trace(attn, dict(p, q=q_cap)) == _trace(attn, p)
+    with pytest.raises(ValueError, match="query tokens"):
+        tpl.normalize_kwargs(dict(kwargs, q=q_cap[: live - 1]))
+    # unbound (init bundle) traces are left untouched
+    unbound = tpl.normalize_kwargs(
+        dict(kwargs, self=None, metadata=None) | {"q": q_cap}
+    )
+    assert unbound["q"].shape[0] == live + extra
+
+
+@cuda_only
 def test_trace_is_sync_free_and_read_only():
     p = _problem(47, form="csr")
     attn = _plan(p, "fa2")

@@ -436,39 +436,67 @@ class _PagedAttentionTraceTemplate(TraceTemplate):
         super().__init__(*args, **kwargs)
         self.identity = dict(identity)
 
+    def normalize_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """The trace kwargs the base builder sees for one ``run()`` call.
+
+        Bound instance: the plan-owned tensors come from the trace context,
+        and ``q`` / ``out`` / ``lse`` are cut to the batch's live rows
+        (``qo_indptr[-1]``, as views) — in CUDA-graph mode they are capacity
+        buffers with headroom rows the kernel never reads or writes, and the
+        definition's ``total_q == qo_indptr[-1]`` constraint describes the
+        live rows only.  A ``q`` with fewer rows than the plan is refused.
+        """
+        normalized = dict(kwargs)
+        wrapper = normalized.pop("self", None)
+        if wrapper is not None:
+            ctx = _bound_trace_context(wrapper)
+            planned = _identity_from_context(ctx)
+            if planned != self.identity:
+                raise ValueError(
+                    "Tracing PagedAttention.run: the planned instance "
+                    f"({planned}) does not match this template "
+                    f"({self.identity}); trace through "
+                    "flashinfer.fi_trace(attn.run, ...), which dispatches on "
+                    "the plan"
+                )
+            normalized["qo_indptr"] = ctx["qo_indptr"]
+            normalized["kv_seq_lens"] = ctx["kv_seq_lens"]
+            normalized["block_tables"] = ctx["block_tables"]
+            normalized["kv_page_indices"] = ctx["kv_page_indices"]
+            _require_run_tensors(normalized)
+            live = int(ctx["total_q_tokens"])
+            for key in ("q", "out", "lse"):
+                t = normalized.get(key)
+                if not isinstance(t, torch.Tensor):
+                    continue
+                if t.dim() == 0 or t.shape[0] < live:
+                    raise ValueError(
+                        f"Tracing PagedAttention.run: {key} has {tuple(t.shape)} "
+                        f"rows but the planned batch has {live} query tokens "
+                        "(qo_indptr[-1]); pass the buffer the plan was made for"
+                    )
+                if t.shape[0] > live:
+                    normalized[key] = t[:live]
+        else:
+            metadata = normalized.pop("metadata", None)
+            if metadata is not None:
+                normalized.setdefault("qo_indptr", metadata.qo_indptr)
+                normalized.setdefault("kv_seq_lens", metadata.kv_seq_lens)
+                normalized.setdefault("block_tables", metadata.block_tables)
+                normalized.setdefault("kv_page_indices", metadata.kv_page_indices)
+            _require_run_tensors(normalized)
+        for key in ("kv_layout", "causal", "window_left", "lse_mode"):
+            normalized[key] = self.identity[key]
+        return normalized
+
     def build_fi_trace_fn(self, fi_api):
         base_fi_trace = super().build_fi_trace_fn(fi_api)
         template = self
 
         def fi_trace(save_dir=None, name=None, **kwargs):
-            normalized = dict(kwargs)
-            wrapper = normalized.pop("self", None)
-            if wrapper is not None:
-                ctx = _bound_trace_context(wrapper)
-                planned = _identity_from_context(ctx)
-                if planned != template.identity:
-                    raise ValueError(
-                        "Tracing PagedAttention.run: the planned instance "
-                        f"({planned}) does not match this template "
-                        f"({template.identity}); trace through "
-                        "flashinfer.fi_trace(attn.run, ...), which dispatches on "
-                        "the plan"
-                    )
-                normalized["qo_indptr"] = ctx["qo_indptr"]
-                normalized["kv_seq_lens"] = ctx["kv_seq_lens"]
-                normalized["block_tables"] = ctx["block_tables"]
-                normalized["kv_page_indices"] = ctx["kv_page_indices"]
-            else:
-                metadata = normalized.pop("metadata", None)
-                if metadata is not None:
-                    normalized.setdefault("qo_indptr", metadata.qo_indptr)
-                    normalized.setdefault("kv_seq_lens", metadata.kv_seq_lens)
-                    normalized.setdefault("block_tables", metadata.block_tables)
-                    normalized.setdefault("kv_page_indices", metadata.kv_page_indices)
-            _require_run_tensors(normalized)
-            for key in ("kv_layout", "causal", "window_left", "lse_mode"):
-                normalized[key] = template.identity[key]
-            return base_fi_trace(save_dir=save_dir, name=name, **normalized)
+            return base_fi_trace(
+                save_dir=save_dir, name=name, **template.normalize_kwargs(kwargs)
+            )
 
         fi_trace.__doc__ = base_fi_trace.__doc__
         return fi_trace
