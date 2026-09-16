@@ -1,7 +1,7 @@
 # Smoke matrix for the experimental unified paged attention facade
 # (`--routine PagedAttention`). Every line runs the same inputs through each
 # requested backend of flashinfer.prefill.PagedAttention, gates each on the
-# fp32 oracle (--refcheck) and reports plan / run / step rows; --pa_legacy adds
+# fp32 oracle (always on for this routine) and reports plan / run / step rows; --pa_legacy adds
 # rows through the legacy public API of the same kernel. Small iteration counts:
 # this is a smoke list, not a performance suite. Backends a device or
 # configuration cannot run stay in the CSV as `unsupported` rows.

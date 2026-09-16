@@ -256,7 +256,9 @@ The shared benchmark CLI provides a ``PagedAttention`` routine::
 
 Every requested backend sees the same inputs (packed Q, a paged K/V pool with
 a shuffled page mapping, exact per-request lengths) and is checked against the
-fp32 oracle before it is timed. The routine reports one CSV row per phase:
+fp32 oracle before it is timed (always for this routine; ``--pa_skip_refcheck``
+opts out for shapes the oracle cannot hold). The routine reports one CSV row
+per phase:
 ``plan`` (metadata construction plus ``plan()``, synchronized host wall time),
 ``run`` (a warmed ``run()`` with preallocated outputs; GPU time under a CUDA
 graph by default, eager with ``--no_cuda_graph``) and ``step`` (one plan
@@ -265,11 +267,11 @@ decode, ``--kv_input_form csr`` for flat page indices,
 ``--random_actual_seq_len`` for variable lengths and ``--pa_legacy`` to add
 rows for the same inputs through the legacy public API of the same kernel
 (``api_variant=legacy``). Rows for unsupported,
-failing or incorrect backends are kept with a ``status`` column;
-``static_backend`` records the facade's static choice and
-``resolved_backend`` the backend the plan actually ran, which differ when
-the static choice declined the batch at plan time (``auto`` is a static
-selection, not autotuning). The benchmark generates fp16/bf16 Q and KV; see
+failing or incorrect backends are kept with a ``status`` column and a
+``refcheck_passed`` column; ``static_backend`` records the facade's static
+choice and ``resolved_backend`` the backend the plan actually ran, which
+differ when the static choice declined the batch at plan time (``auto`` is a
+static selection, not autotuning). The benchmark generates fp16/bf16 Q and KV; see
 ``benchmarks/README.md`` for the columns.
 
 Tracing the unified API
