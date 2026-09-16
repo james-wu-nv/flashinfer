@@ -382,39 +382,35 @@ def test_reference_matches_oracle_cpu(
 # ── exported init / reference round trip on the GPU ──────────────────────────
 
 
-@cuda_only
-@pytest.mark.parametrize("lse_mode", ["none", "basee"])
-@pytest.mark.parametrize("layout", LAYOUTS)
-@pytest.mark.parametrize("form", list(FORMS))
-def test_exported_init_and_reference_rebuild_the_traced_plan(form, layout, lse_mode):
-    """init from the JSON builds a valid planned instance of the traced
-    variant; its run() matches the JSON's reference; re-tracing it yields the
-    same definition."""
-    p = _problem(19, form=form, layout=layout)
-    attn = _plan(p, "fa2", lse_mode=lse_mode)
-    defn = _trace(attn, p)
-    const = {k: v["value"] for k, v in defn["axes"].items() if v["type"] == "const"}
+# Var-axis values handed to the exported init: the small default bundle and
+# the committed fixture's own workload (total_q 512 over 4 requests, a pool
+# of 128 pages, a 32-page-wide table / 128 live flat page ids).
+INIT_AXES = {
+    "small": dict(total_q=40, batch_size=3),
+    "sized": dict(total_q=512, batch_size=4, len_indptr=5, num_pages=128),
+}
 
-    init_fn = _exec(defn["init"])["_paged_attention_init"]
+
+def _init_axes(kind, form):
+    axes = dict(INIT_AXES[kind])
+    if kind == "sized":
+        axes["max_pages" if form == "dense" else "num_kv_indices"] = (
+            32 if form == "dense" else 128
+        )
+    return axes
+
+
+def _rebuild_and_check(defn, init_fn, ref_fn, axes, *, form, device, backend="fa2"):
+    """init(axes) -> plan/run on ``backend`` -> reference; returns (inputs, ctx)."""
+    const = {k: v["value"] for k, v in defn["axes"].items() if v["type"] == "const"}
     inputs = init_fn(
-        total_q=40,
-        batch_size=3,
-        csr=int(form == "csr"),
-        backend="fa2",
-        device=p["device"],
-        **const,
+        csr=int(form == "csr"), backend=backend, device=device, **const, **axes
     )
     assert set(inputs) == {"plan", "run"}
-    assert inputs["plan"]["kv_layout"] == layout
-    assert inputs["plan"]["lse_mode"] == lse_mode
-    rebuilt = PagedAttention(torch.device(p["device"]))
+    rebuilt = PagedAttention(torch.device(device))
     rebuilt.plan(**inputs["plan"])
     out, lse = rebuilt.run(**inputs["run"])
-    assert out.shape == (40, 8, 128)
-    assert (lse is None) == (lse_mode == "none")
-
     ctx = rebuilt._trace_context()
-    ref_fn = _exec(defn["reference"])["_paged_attention_reference"]
     ref_out, ref_lse = ref_fn(
         inputs["run"]["q"],
         *inputs["run"]["kv_cache"],
@@ -428,15 +424,104 @@ def test_exported_init_and_reference_rebuild_the_traced_plan(form, layout, lse_m
         lse_mode=const["lse_mode"],
     )
     torch.testing.assert_close(out.float(), ref_out.float(), **OUT_TOL)
-    if lse_mode != "none":
+    if const["lse_mode"]:
         torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+    else:
+        assert lse is None
+    # the Var axes of the definition are honoured by the bundle
+    q, (k_cache, v_cache) = inputs["run"]["q"], inputs["run"]["kv_cache"]
+    batch = axes.get("batch_size") or axes["len_indptr"] - 1
+    assert q.shape[0] == axes["total_q"] == int(ctx["qo_indptr_cpu"][-1])
+    assert ctx["qo_indptr"].shape[0] == batch + 1 == ctx["kv_seq_lens"].shape[0] + 1
+    if "num_pages" in axes:
+        assert k_cache.shape[0] == v_cache.shape[0] == axes["num_pages"]
+    if "max_pages" in axes:
+        assert ctx["block_tables"].shape == (batch, axes["max_pages"])
+    if "num_kv_indices" in axes:
+        assert ctx["kv_page_indices"].shape == (axes["num_kv_indices"],)
+    _assert_constraints_hold(defn, _kwargs_from_context(ctx, q, k_cache, v_cache))
     # partial last pages and scattered pages really are in the bundle
     assert int((ctx["kv_seq_lens_cpu"] % ctx["page_size"] != 0).sum()) >= 1
+    return inputs, rebuilt
+
+
+def _kwargs_from_context(ctx, q, k_cache, v_cache):
+    return dict(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        qo_indptr=ctx["qo_indptr"],
+        kv_seq_lens=ctx["kv_seq_lens"],
+        block_tables=ctx["block_tables"],
+        kv_page_indices=ctx["kv_page_indices"],
+        page_size=ctx["page_size"],
+    )
+
+
+def _assert_constraints_hold(defn, kw):
+    """Evaluate every constraint string of ``defn`` on concrete trace kwargs."""
+    const = {k: v["value"] for k, v in defn["axes"].items() if v["type"] == "const"}
+    qo_indptr = kw["qo_indptr"].cpu()
+    kv_seq_lens = kw["kv_seq_lens"].cpu()
+    names = dict(
+        const,
+        total_q=int(kw["q"].shape[0]),
+        batch_size=int(kv_seq_lens.shape[0]),
+        len_indptr=int(qo_indptr.shape[0]),
+        num_pages=int(kw["k_cache"].shape[0]),
+        qo_indptr=qo_indptr,
+        kv_seq_lens=kv_seq_lens,
+        min=min,
+        max=max,
+    )
+    if kw.get("block_tables") is not None:
+        names["max_pages"] = int(kw["block_tables"].shape[1])
+    if kw.get("kv_page_indices") is not None:
+        names["num_kv_indices"] = int(kw["kv_page_indices"].shape[0])
+    for constraint in defn["constraints"]:
+        assert bool(eval(constraint, {"__builtins__": {}}, names)), constraint  # noqa: S307
+
+
+@cuda_only
+@pytest.mark.parametrize("axes", list(INIT_AXES))
+@pytest.mark.parametrize("lse_mode", ["none", "basee"])
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("form", list(FORMS))
+def test_exported_init_and_reference_rebuild_the_traced_plan(
+    form, layout, lse_mode, axes
+):
+    """init from the JSON builds a valid planned instance of the traced
+    variant for the requested Var axes (including a workload larger than
+    the old fixed 4-page table); its run() matches the JSON's reference and
+    re-tracing it yields the same definition."""
+    p = _problem(19, form=form, layout=layout)
+    attn = _plan(p, "fa2", lse_mode=lse_mode)
+    defn = _trace(attn, p)
+    init_fn = _exec(defn["init"])["_paged_attention_init"]
+    ref_fn = _exec(defn["reference"])["_paged_attention_reference"]
+    inputs, rebuilt = _rebuild_and_check(
+        defn, init_fn, ref_fn, _init_axes(axes, form), form=form, device=p["device"]
+    )
+    assert inputs["plan"]["kv_layout"] == layout
+    assert inputs["plan"]["lse_mode"] == lse_mode
 
     again = fi_trace(rebuilt.run, **inputs["run"])
     assert again["name"] == defn["name"]
     assert again["axes"] == defn["axes"]
     assert again["inputs"] == defn["inputs"] and again["outputs"] == defn["outputs"]
+
+
+def test_init_rejects_axes_it_cannot_honour():
+    with pytest.raises(ValueError, match="len_indptr"):
+        _paged_attention_init(total_q=8, batch_size=2, len_indptr=4)
+    with pytest.raises(ValueError, match="max_pages"):
+        _paged_attention_init(total_q=65, batch_size=1, max_pages=4)
+    with pytest.raises(ValueError, match="num_kv_indices"):
+        _paged_attention_init(total_q=65, batch_size=1, csr=1, num_kv_indices=4)
+    with pytest.raises(ValueError, match="num_pages"):
+        _paged_attention_init(total_q=8, batch_size=1, max_pages=4, num_pages=3)
+    with pytest.raises(ValueError, match="total_q"):
+        _paged_attention_init(total_q=1, batch_size=2)
 
 
 @cuda_only
@@ -843,3 +928,20 @@ def test_committed_fixture_matches_current_template():
     assert inspect.signature(init_fn) == inspect.signature(_paged_attention_init)
     ref_fn = _exec(doc["reference"])["_paged_attention_reference"]
     assert inspect.signature(ref_fn) == inspect.signature(_paged_attention_reference)
+
+
+@cuda_only
+def test_committed_fixture_init_rebuilds_its_workload():
+    """The init embedded in the committed fixture rebuilds the fixture's own
+    workload (its Var axes: total_q 512, 4 requests, 128 pool pages, a 32-page
+    table) and runs it correctly on the GPU."""
+    doc = json.loads(FIXTURE.read_text())
+    init_fn = _exec(doc["init"])["_paged_attention_init"]
+    ref_fn = _exec(doc["reference"])["_paged_attention_reference"]
+    axes = dict(total_q=512, batch_size=0, len_indptr=5, num_pages=128, max_pages=32)
+    inputs, rebuilt = _rebuild_and_check(
+        doc, init_fn, ref_fn, axes, form="dense", device="cuda"
+    )
+    assert inputs["run"]["q"].shape == (512, 32, 128)
+    assert inputs["run"]["kv_cache"][0].shape == (128, 16, 8, 128)  # NHD
+    assert fi_trace(rebuilt.run, **inputs["run"])["name"] == doc["name"]
