@@ -35,66 +35,80 @@ _PACKED_LSE_SUPPORTED: Dict[torch.device, bool] = {}
 _CUDNN_WORKSPACE_ALLOWANCE = 1 << 20
 
 
-def _packed_lse_supported(device: torch.device, workspace: torch.Tensor) -> bool:
-    """Feature probe (once per device): build and run the paged SDPA graph
-    with ``batch_offsets_stats`` on a two-request toy problem.
+def _probe_packed_lse(device: torch.device, workspace: torch.Tensor) -> None:
+    """Build and run the paged SDPA graph with ``batch_offsets_stats`` on a
+    two-request toy problem (max_token_per_sequence 3 > 1: the s_qo == 1 case
+    is routed to the padded layout by plan() and is not what this probes).
 
-    A frontend without ragged stats offsets, or a backend that rejects them
-    for this engine configuration, fails at graph build/execute with an
-    exception; that selects the gather fallback.  The probe issues no host
-    sync (plan() stays zero-sync): the numerical agreement of the packed stats
+    No host sync and no blocking copy: the random inputs are generated on
+    the device and the five small int32 arrays travel in one pinned staging
+    tensor with an asynchronous upload (plan() stays zero-sync even the
+    first time it runs on a device).
+    """
+    from ....cudnn import cudnn_batch_prefill_with_kv_cache
+
+    h, d, page = 2, 128, 16
+    g = torch.Generator(device=device).manual_seed(0)
+    q = torch.randn(5, h, d, dtype=torch.bfloat16, device=device, generator=g)
+    k = torch.randn(2, h, page, d, dtype=torch.bfloat16, device=device, generator=g)
+    v = torch.randn(2, h, page, d, dtype=torch.bfloat16, device=device, generator=g)
+    # qo_indptr [0, 3, 5] | q_lens [3, 2] | kv_lens [5, 4] | block_tables [[0], [1]]
+    host = torch.tensor([0, 3, 5, 3, 2, 5, 4, 0, 1], dtype=torch.int32, pin_memory=True)
+    ints = host.to(device, non_blocking=True)
+    qo_indptr = ints[0:3]
+    lse = torch.empty(5, h, dtype=torch.float32, device=device)
+    cudnn_batch_prefill_with_kv_cache(
+        q,
+        k,
+        v,
+        1.0 / math.sqrt(d),
+        workspace,
+        max_token_per_sequence=3,
+        max_sequence_kv=5,
+        actual_seq_lens_q=ints[3:5].view(2, 1, 1, 1),
+        actual_seq_lens_kv=ints[5:7].view(2, 1, 1, 1),
+        block_tables=ints[7:9].view(2, 1),
+        causal=True,
+        return_lse=True,
+        lse_base="e",
+        batch_offsets_q=qo_indptr,
+        batch_offsets_stats=qo_indptr,
+        batch_offsets_units="tokens",
+        out=torch.empty_like(q),
+        lse=lse,
+    )
+
+
+def _packed_lse_supported(device: torch.device, workspace: torch.Tensor) -> bool:
+    """Feature probe (once per device): can this cuDNN write ragged (packed)
+    softmax stats on the paged path?  See :func:`_probe_packed_lse`.
+
+    The answer is the backend's: a graph it declines raises
+    ``cudnn.cudnnGraphNotSupportedError`` (the frontend's NOT_SUPPORTED
+    type) and selects the gather fallback for the process lifetime.  Any
+    other exception -- a CUDA failure, a bad handle, a sync-debug trip, a
+    bug in the probe itself -- is not an answer about the feature: it
+    propagates and nothing is cached, so a transient failure costs one
+    plan instead of silently routing every later LSE plan of this device to
+    the slower gather path.  The numerical agreement of the packed stats
     with the reference is pinned by tests/experimental on the supported
     versions, not re-checked here.
     """
     hit = _PACKED_LSE_SUPPORTED.get(device)
     if hit is not None:
         return hit
-    from ....cudnn import cudnn_batch_prefill_with_kv_cache
     from ....cudnn.prefill import _cudnn_supports_direct_seqlens
 
     ok = False
     # the ragged-offset multipliers this relies on belong to the direct
     # (cu_seq_len) path the library gates by version; probe only there
     if _cudnn_supports_direct_seqlens(torch.bfloat16, mixed=True):
+        import cudnn
+
         try:
-            # max_token_per_sequence 3 (> 1): the s_qo == 1 case is routed to
-            # the padded layout by plan() and is not what this probes
-            h, d, page = 2, 128, 16
-            g = torch.Generator(device=device).manual_seed(0)
-            q = torch.randn(5, h, d, dtype=torch.bfloat16, device=device, generator=g)
-            k = torch.randn(
-                2, h, page, d, dtype=torch.bfloat16, device=device, generator=g
-            )
-            v = torch.randn(
-                2, h, page, d, dtype=torch.bfloat16, device=device, generator=g
-            )
-            qo_indptr = torch.tensor([0, 3, 5], dtype=torch.int32, device=device)
-            q_lens = torch.tensor([3, 2], dtype=torch.int32, device=device)
-            kv_lens = torch.tensor([5, 4], dtype=torch.int32, device=device)
-            table = torch.tensor([[0], [1]], dtype=torch.int32, device=device)
-            lse = torch.empty(5, h, dtype=torch.float32, device=device)
-            cudnn_batch_prefill_with_kv_cache(
-                q,
-                k,
-                v,
-                1.0 / math.sqrt(d),
-                workspace,
-                max_token_per_sequence=3,
-                max_sequence_kv=5,
-                actual_seq_lens_q=q_lens.view(2, 1, 1, 1),
-                actual_seq_lens_kv=kv_lens.view(2, 1, 1, 1),
-                block_tables=table,
-                causal=True,
-                return_lse=True,
-                lse_base="e",
-                batch_offsets_q=qo_indptr,
-                batch_offsets_stats=qo_indptr,
-                batch_offsets_units="tokens",
-                out=torch.empty_like(q),
-                lse=lse,
-            )
+            _probe_packed_lse(device, workspace)
             ok = True
-        except Exception:  # noqa: BLE001 - any failure means "not supported here"
+        except cudnn.cudnnGraphNotSupportedError:
             ok = False
     _PACKED_LSE_SUPPORTED[device] = ok
     return ok
