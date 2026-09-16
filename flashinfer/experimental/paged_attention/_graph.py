@@ -54,13 +54,21 @@ class GraphCapacity:
     ``table_width=``.  ``PagedAttention(use_cuda_graph=True)`` infers the
     capacity from the first plan instead (:meth:`from_metadata`).
 
-    - ``batch_size``, ``kv_input_form`` and ``page_size`` hold exactly for
-      every later batch (each backend's grid and paging dialect follow from
-      them).
-    - ``total_q_tokens``, ``max_q_len``, ``max_kv_len`` are the shapes the
-      kernels are planned with.
-    - dense form: ``table_width`` is the caller's block-table width;
-      ``flat_capacity`` is ``batch_size * table_width`` (the derived CSR form).
+    Rules every later batch (``plan()`` / ``update()``) is checked against:
+
+    - ``batch_size``, ``kv_input_form`` and ``page_size`` hold exactly (each
+      backend's grid and paging dialect follow from them).
+    - ``total_q_tokens``, ``max_q_len`` and ``max_kv_len`` are upper bounds.
+      The kernels are planned with the capacity values and keep reading them
+      after capture (capacity substitution: in graph mode a backend sees the
+      capacity maxes, never a batch's own), so a batch may use less.  ``q``,
+      ``out`` and ``lse`` may carry up to ``total_q_tokens`` rows; rows past
+      the batch are neither read nor written.
+    - dense form: ``table_width`` is the caller's block-table width and must
+      equal ``ceil(max_kv_len / page_size)`` — cuDNN plans its paged gather
+      from both and rejects any other pairing — so pass
+      ``max_kv_len = table_width * page_size`` when the table is wider than
+      the longest context.  ``flat_capacity`` is ``batch_size * table_width``.
     - flat form: ``flat_capacity`` bounds the length of ``kv_page_indices``.
       A dense table is reserved at ``ceil(max_kv_len / page_size)`` only once
       a backend that needs one is chosen — never below
@@ -108,6 +116,15 @@ class GraphCapacity:
                 f"{self.page_size} = {self.table_width * self.page_size} is too "
                 f"narrow for max_kv_len {self.max_kv_len}",
             )
+            pages = _ceil_div(self.max_kv_len, self.page_size)
+            _expect(
+                self.table_width == pages,
+                f"GraphCapacity: table_width {self.table_width} must equal "
+                f"ceil(max_kv_len / page_size) = {pages}: cuDNN plans its paged "
+                "gather from both and rejects any other pairing "
+                "(CUDNN_STATUS_BAD_PARAM); pass max_kv_len = table_width * "
+                f"page_size = {self.table_width * self.page_size}",
+            )
             flat = self.batch_size * self.table_width
             if self.flat_capacity is None:
                 object.__setattr__(self, "flat_capacity", flat)
@@ -146,18 +163,29 @@ class GraphCapacity:
 
     @classmethod
     def from_metadata(cls, metadata: PagedAttentionMetadata) -> "GraphCapacity":
-        """The capacity ``use_cuda_graph=True`` infers from the first batch."""
+        """The capacity ``use_cuda_graph=True`` infers from the first batch.
+
+        Dense form: ``max_kv_len`` is widened to ``table_width * page_size``,
+        so the table's whole width stays usable by later batches and the
+        width rule above holds whatever the first batch's longest context.
+        """
         common = dict(
             batch_size=metadata.batch_size,
             total_q_tokens=metadata.total_q_tokens,
             max_q_len=metadata.max_q_len,
-            max_kv_len=metadata.max_kv_len,
             page_size=metadata.page_size,
             kv_input_form=metadata.kv_input_form,
         )
         if metadata.block_tables is not None:
-            return cls(**common, table_width=int(metadata.block_tables.shape[1]))
-        return cls(**common, flat_capacity=int(metadata.kv_page_indices.shape[0]))
+            width = int(metadata.block_tables.shape[1])
+            return cls(
+                **common, max_kv_len=width * metadata.page_size, table_width=width
+            )
+        return cls(
+            **common,
+            max_kv_len=metadata.max_kv_len,
+            flat_capacity=int(metadata.kv_page_indices.shape[0]),
+        )
 
 
 class GraphBuffers:
@@ -207,22 +235,37 @@ class GraphBuffers:
 
     # ---- checks ----
     def preflight(self, metadata: PagedAttentionMetadata) -> None:
-        """Reject before writing anything a captured kernel would misread."""
+        """Reject before writing anything a captured kernel would misread.
+
+        Exact: batch size, paging form, page size, dense table width (the
+        table is mirrored whole).  Bounded: total query tokens, host maxes,
+        flat page-id length — the kernels were planned with the capacity
+        values (see ``GraphCapacity``), so a batch may use less.
+        """
         cap = self.capacity
-        checks = (
+        exact = (
             ("batch_size", metadata.batch_size, cap.batch_size),
             ("kv_input_form", metadata.kv_input_form, cap.kv_input_form),
             ("page_size", metadata.page_size, cap.page_size),
-            ("max_q_len", metadata.max_q_len, cap.max_q_len),
-            ("max_kv_len", metadata.max_kv_len, cap.max_kv_len),
-            ("total_q_tokens", metadata.total_q_tokens, cap.total_q_tokens),
         )
-        for name, got, want in checks:
+        for name, got, want in exact:
             _expect(
                 got == want,
                 f"CUDA graph re-plan: {name} {got!r} differs from the captured "
                 f"{want!r}; a captured graph cannot change it — use one "
                 "PagedAttention graph instance per graph bucket",
+            )
+        bounded = (
+            ("total_q_tokens", metadata.total_q_tokens, cap.total_q_tokens),
+            ("max_q_len", metadata.max_q_len, cap.max_q_len),
+            ("max_kv_len", metadata.max_kv_len, cap.max_kv_len),
+        )
+        for name, got, limit in bounded:
+            _expect(
+                got <= limit,
+                f"CUDA graph re-plan: {name} {got} exceeds this instance's "
+                f"capacity {limit} (the captured kernels were planned with the "
+                "capacity value) — use a bucket with a larger GraphCapacity",
             )
         if metadata.block_tables is not None:
             _expect(

@@ -3,11 +3,13 @@
 Contract under test (``PagedAttention(use_cuda_graph=True)``):
 
 1. ``run()`` planned once can be captured into a ``torch.cuda.CUDAGraph``.
-2. A later ``plan()`` with a new batch of the SAME capture shapes (batch size,
-   table width, host maxes, total query tokens) re-fills the reserved storage;
-   replaying the captured graph then computes the new batch — no re-capture.
-3. A plan that would change a capture shape is rejected before anything is
-   written.
+2. A later ``plan()`` with a new batch that FITS the capacity re-fills the
+   reserved storage; replaying the captured graph then computes the new batch
+   — no re-capture.  Batch size, paging form, page size and dense table width
+   are exact; total query tokens, host maxes and flat page-id length are upper
+   bounds (the kernels were planned with the capacity values: capacity
+   substitution).
+3. A plan outside the capacity is rejected before anything is written.
 4. A plan that fails midway (here: the causal envelope) leaves the previously
    published plan runnable and the reserved buffers untouched — replay still
    produces the previous batch's answer.  This holds for a failure at ANY
@@ -33,7 +35,7 @@ import gc
 import pytest
 import torch
 
-from flashinfer.experimental.paged_attention._graph import Transaction
+from flashinfer.experimental.paged_attention._graph import GraphBuffers, Transaction
 from flashinfer.prefill import (
     GraphCapacity,
     PagedAttention,
@@ -65,20 +67,28 @@ _SHAPE = dict(
 )
 
 
-def _sibling_batch(p, seed):
+def _sibling_batch(p, seed, *, shrink=False):
     """A second batch with the SAME capture shapes as ``p`` (batch size, total
     query tokens, table width, maxes) but different per-request lengths, a
     different page permutation and fresh K/V/q contents — what a serving engine
-    replays into one graph bucket."""
+    replays into one graph bucket.  With ``shrink=True`` the sibling has FEWER
+    total query tokens and smaller actual maxes (the capacity-substitution
+    case); the table width is unchanged."""
     g = torch.Generator().manual_seed(seed)
     dev = torch.device(p["device"])
     b = p["kv_seq_lens_cpu"].shape[0]
     q_lens = p["qo_indptr_cpu"].diff()
-    q_lens = q_lens[torch.randperm(b, generator=g)]  # same multiset -> same total
+    if shrink:
+        q_lens = torch.clamp(q_lens // 2, min=1)
+        kv_cap = p["max_kv_len"] // 2
+    else:
+        q_lens = q_lens[torch.randperm(b, generator=g)]  # same multiset -> same total
+        kv_cap = p["max_kv_len"] - 1
     kv_lens = torch.minimum(
-        q_lens + torch.randint(0, p["max_kv_len"] - 1, (b,), generator=g),
-        torch.tensor(p["max_kv_len"], dtype=torch.int32),
+        q_lens + torch.randint(0, kv_cap, (b,), generator=g),
+        torch.tensor(kv_cap, dtype=torch.int32),
     ).to(torch.int32)
+    kv_lens = torch.maximum(kv_lens, q_lens)  # causal envelope
     qo_indptr_cpu = torch.cat(
         [torch.zeros(1, dtype=torch.int32), torch.cumsum(q_lens, 0, dtype=torch.int32)]
     )
@@ -94,7 +104,10 @@ def _sibling_batch(p, seed):
         n = int(pages[i])
         bt[i, :n] = perm[off : off + n]
         off += n
-    q = torch.randn_like(p["q"])
+    kv_page_indices = torch.cat([bt[i, : int(pages[i])] for i in range(b)])
+    q = torch.randn(
+        int(qo_indptr_cpu[-1]), *p["q"].shape[1:], dtype=p["q"].dtype, device=dev
+    )
     k = torch.randn_like(p["k_cache"])
     v = torch.randn_like(p["v_cache"])
     return dict(
@@ -109,6 +122,9 @@ def _sibling_batch(p, seed):
         kv_seq_lens=kv_lens.to(dev),
         kv_seq_lens_cpu=kv_lens,
         block_tables=bt.to(dev),
+        kv_page_indices=kv_page_indices.to(torch.int32).to(dev),
+        max_q_len=int(q_lens.max()) if shrink else p["max_q_len"],
+        max_kv_len=int(kv_lens.max()) if shrink else p["max_kv_len"],
     )
 
 
@@ -139,15 +155,18 @@ def _plan_with(attn, p, **overrides):
     attn.plan(make_metadata(p), **kwargs)
 
 
-def _graph_capacity_of(p):
-    """Explicit capacity matching one make_problem() batch (dense form)."""
+def _graph_capacity_of(p, *, extra_rows=0, extra_q=0):
+    """Explicit capacity for one make_problem() batch (dense form), optionally
+    with headroom; ``max_kv_len`` is the table's full extent, as the width
+    rule requires."""
+    width = int(p["block_tables"].shape[1])
     return GraphCapacity(
         batch_size=int(p["kv_seq_lens_cpu"].shape[0]),
-        total_q_tokens=int(p["qo_indptr_cpu"][-1]),
-        max_q_len=p["max_q_len"],
-        max_kv_len=p["max_kv_len"],
+        total_q_tokens=int(p["qo_indptr_cpu"][-1]) + extra_rows,
+        max_q_len=p["max_q_len"] + extra_q,
+        max_kv_len=width * p["page_size"],
         page_size=p["page_size"],
-        table_width=int(p["block_tables"].shape[1]),
+        table_width=width,
     )
 
 
@@ -526,6 +545,9 @@ def test_graph_capacity_validation():
         GraphCapacity(**dense)
     with pytest.raises(ValueError, match="too narrow"):
         GraphCapacity(**dict(dense, max_kv_len=65), table_width=4)
+    with pytest.raises(ValueError, match="CUDNN_STATUS_BAD_PARAM"):
+        GraphCapacity(**dense, table_width=5)  # wider than ceil(64 / 16)
+    assert GraphCapacity(**dict(dense, max_kv_len=49), table_width=4).max_kv_len == 49
     with pytest.raises(ValueError, match="leave it unset"):
         GraphCapacity(**dense, table_width=4, flat_capacity=9)
     with pytest.raises(ValueError, match="page_size"):
@@ -684,3 +706,240 @@ def test_csr_page_size_1_graph_instance_reserves_no_dense_table():
         f"{growth / 2**20:.1f} MiB; the dense (batch, max_kv) table it must not "
         f"reserve is {dense_bytes / 2**20:.0f} MiB"
     )
+
+
+def test_inferred_dense_capacity_widens_max_kv_to_the_table():
+    """use_cuda_graph=True: the inferred dense capacity spans the whole table
+    (max_kv_len = width * page_size), so later batches may use any context
+    the table can address and cuDNN's width rule holds."""
+    p = make_problem(seed=61, **_SHAPE)
+    md = make_metadata(p)
+    cap = GraphCapacity.from_metadata(md)
+    width = int(p["block_tables"].shape[1])
+    assert cap.table_width == width
+    assert cap.max_kv_len == width * p["page_size"] >= p["max_kv_len"]
+    assert (cap.total_q_tokens, cap.max_q_len) == (md.total_q_tokens, p["max_q_len"])
+    csr = GraphCapacity.from_metadata(make_metadata(dict(p, input_form="page_indices")))
+    assert csr.max_kv_len == p["max_kv_len"] and csr.table_width is None
+    assert csr.flat_capacity == int(p["kv_page_indices"].shape[0])
+
+
+def test_replan_capacity_bounds():
+    """Preflight rules: exact batch size / form / page size / dense width;
+    total tokens, maxes and flat length bounded by the capacity."""
+    dev = torch.device("cuda:0")
+    page = 16
+
+    def dense_md(q_lens, kv_lens, max_q, max_kv, width=4):
+        q_lens = torch.tensor(q_lens, dtype=torch.int32)
+        kv_lens = torch.tensor(kv_lens, dtype=torch.int32)
+        qo = torch.cat([torch.zeros(1, dtype=torch.int32), q_lens.cumsum(0).int()])
+        bt = torch.arange(len(kv_lens) * width, dtype=torch.int32).view(-1, width)
+        return PagedAttentionMetadata.dense(
+            qo.to(dev),
+            kv_lens.to(dev),
+            bt.to(dev),
+            page_size=page,
+            max_q_len=max_q,
+            max_kv_len=max_kv,
+            qo_indptr_cpu=qo,
+            kv_seq_lens_cpu=kv_lens,
+        )
+
+    cap = GraphCapacity(
+        batch_size=2,
+        total_q_tokens=8,
+        max_q_len=4,
+        max_kv_len=64,
+        page_size=page,
+        table_width=4,
+    )
+    gb = GraphBuffers(cap, dev)
+    gb.preflight(dense_md([4, 4], [64, 64], 4, 64))  # exactly the capacity
+    gb.preflight(dense_md([1, 2], [10, 20], 2, 20))  # under it in every bound
+    with pytest.raises(ValueError, match="total_q_tokens 9 exceeds"):
+        gb.preflight(dense_md([4, 5], [64, 64], 5, 64))
+    with pytest.raises(ValueError, match="max_q_len 5 exceeds"):
+        gb.preflight(dense_md([3, 3], [64, 64], 5, 64))  # over-claimed max
+    with pytest.raises(ValueError, match="block_tables width 5"):
+        gb.preflight(dense_md([1, 1], [10, 10], 1, 10, width=5))
+    with pytest.raises(ValueError, match="batch_size 3 differs"):
+        gb.preflight(dense_md([1, 1, 1], [10, 10, 10], 1, 10))
+
+    def csr_md(kv_lens, max_kv, n_ids):
+        kv_lens = torch.tensor(kv_lens, dtype=torch.int32)
+        qo = torch.arange(len(kv_lens) + 1, dtype=torch.int32)
+        return PagedAttentionMetadata.csr(
+            qo.to(dev),
+            kv_lens.to(dev),
+            torch.arange(n_ids, dtype=torch.int32, device=dev),
+            page_size=page,
+            max_q_len=1,
+            max_kv_len=max_kv,
+            qo_indptr_cpu=qo,
+            kv_seq_lens_cpu=kv_lens,
+        )
+
+    flat = GraphCapacity(
+        batch_size=2,
+        total_q_tokens=8,
+        max_q_len=4,
+        max_kv_len=64,
+        page_size=page,
+        kv_input_form="page_indices",
+        flat_capacity=8,
+    )
+    gb = GraphBuffers(flat, dev)
+    assert gb.block_tables is None
+    gb.preflight(csr_md([64, 64], 64, 8))
+    gb.preflight(csr_md([10, 20], 20, 3))  # fewer page ids than reserved
+    with pytest.raises(ValueError, match="max_kv_len 65 exceeds"):
+        gb.preflight(csr_md([10, 20], 65, 8))
+    with pytest.raises(ValueError, match="kv_page_indices has 9 entries"):
+        gb.preflight(csr_md([64, 64], 64, 9))
+    with pytest.raises(ValueError, match="kv_input_form"):
+        gb.preflight(dense_md([1, 1], [10, 10], 1, 10))
+
+
+@pytest.mark.parametrize("input_form", ["block_tables", "page_indices"])
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_capture_replan_smaller_batch_replay(backend, input_form):
+    """Capacity semantics: a re-plan may use fewer total query tokens and
+    smaller actual maxes than the capture.  Backends keep seeing the capacity
+    maxes (capacity substitution), so the captured kernels read consistent
+    parameters and replay matches the oracle on the batch's rows."""
+    p1 = make_problem(seed=57, **dict(_SHAPE, input_form=input_form))
+    _resolve_or_skip(p1, backend)
+    p2 = _sibling_batch(p1, seed=58, shrink=True)
+    total1, total2 = int(p1["qo_indptr_cpu"][-1]), int(p2["qo_indptr_cpu"][-1])
+    assert total2 < total1
+    assert p2["max_q_len"] < p1["max_q_len"] and p2["max_kv_len"] < p1["max_kv_len"]
+    dev = torch.device(p1["device"])
+
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    q, k, v = p1["q"].clone(), p1["k_cache"].clone(), p1["v_cache"].clone()
+    out = torch.empty(
+        total1, p1["num_qo_heads"], p1["head_dim_vo"], dtype=q.dtype, device=dev
+    )
+    lse = torch.empty(total1, p1["num_qo_heads"], dtype=torch.float32, device=dev)
+    _plan(attn, p1, backend)
+    cap = attn._impl._graph.capacity
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            attn.run(q, (k, v), out=out, lse=lse)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        attn.run(q, (k, v), out=out, lse=lse)
+    g.replay()
+    torch.cuda.synchronize()
+    ref_out, ref_lse = _reference(p1)
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+    q[:total2].copy_(p2["q"])
+    k.copy_(p2["k_cache"])
+    v.copy_(p2["v_cache"])
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        _plan(attn, p2, backend)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    meta = attn._impl._meta
+    assert (meta.max_q_len, meta.max_kv_len) == (cap.max_q_len, cap.max_kv_len)
+    assert meta.total_q_tokens == total2
+    g.replay()
+    torch.cuda.synchronize()
+    ref_out2, ref_lse2 = _reference(p2)
+    torch.testing.assert_close(out[:total2].float(), ref_out2, **OUT_TOL)
+    torch.testing.assert_close(lse[:total2], ref_lse2, **LSE_TOL)
+
+    # an eager run on the capacity-sized buffers is accepted; too few rows are not
+    out.zero_()
+    attn.run(q, (k, v), out=out, lse=lse)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out[:total2].float(), ref_out2, **OUT_TOL)
+    with pytest.raises(ValueError, match="tokens"):
+        attn.run(q[: total2 - 1], (k, v))
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_explicit_capacity_headroom_replay(backend):
+    """An explicit GraphCapacity larger than the first batch: capture buffers
+    are sized to the capacity, the first and the re-planned batch both use
+    less, and a batch outside the capacity is rejected before anything is
+    written."""
+    p1 = make_problem(seed=59, **_SHAPE)
+    _resolve_or_skip(p1, backend)
+    p2 = _sibling_batch(p1, seed=60, shrink=True)
+    total1, total2 = int(p1["qo_indptr_cpu"][-1]), int(p2["qo_indptr_cpu"][-1])
+    dev = torch.device(p1["device"])
+    cap = _graph_capacity_of(p1, extra_rows=16, extra_q=8)
+    attn = PagedAttention(dev, graph_capacity=cap)
+
+    rows = cap.total_q_tokens
+    q = torch.zeros(
+        rows, p1["num_qo_heads"], p1["head_dim_qk"], dtype=p1["dtype"], device=dev
+    )
+    q[:total1] = p1["q"]
+    k, v = p1["k_cache"].clone(), p1["v_cache"].clone()
+    out = torch.empty(
+        rows, p1["num_qo_heads"], p1["head_dim_vo"], dtype=q.dtype, device=dev
+    )
+    lse = torch.empty(rows, p1["num_qo_heads"], dtype=torch.float32, device=dev)
+    _plan(attn, p1, backend)
+    meta = attn._impl._meta
+    assert (meta.max_q_len, meta.max_kv_len) == (cap.max_q_len, cap.max_kv_len)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            attn.run(q, (k, v), out=out, lse=lse)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        attn.run(q, (k, v), out=out, lse=lse)
+    g.replay()
+    torch.cuda.synchronize()
+    ref_out, ref_lse = _reference(p1)
+    torch.testing.assert_close(out[:total1].float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse[:total1], ref_lse, **LSE_TOL)
+
+    q[:total2].copy_(p2["q"])
+    k.copy_(p2["k_cache"])
+    v.copy_(p2["v_cache"])
+    _plan(attn, p2, backend)
+    g.replay()
+    torch.cuda.synchronize()
+    ref_out2, ref_lse2 = _reference(p2)
+    torch.testing.assert_close(out[:total2].float(), ref_out2, **OUT_TOL)
+    torch.testing.assert_close(lse[:total2], ref_lse2, **LSE_TOL)
+
+    md = make_metadata(p1)
+    over = PagedAttentionMetadata.dense(
+        md.qo_indptr,
+        md.kv_seq_lens,
+        md.block_tables,
+        page_size=md.page_size,
+        max_q_len=cap.max_q_len + 1,  # over-claimed beyond the capacity
+        max_kv_len=md.max_kv_len,
+        qo_indptr_cpu=md.qo_indptr_cpu,
+        kv_seq_lens_cpu=md.kv_seq_lens_cpu,
+    )
+    with pytest.raises(ValueError, match="max_q_len .* exceeds"):
+        attn.plan(
+            over,
+            num_qo_heads=p1["num_qo_heads"],
+            num_kv_heads=p1["num_kv_heads"],
+            head_dim_qk=p1["head_dim_qk"],
+            q_dtype=p1["dtype"],
+            causal=True,
+            lse_mode="base2",
+            backend=backend,
+        )
+    g.replay()  # the rejected plan left the p2 plan in place
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out[:total2].float(), ref_out2, **OUT_TOL)

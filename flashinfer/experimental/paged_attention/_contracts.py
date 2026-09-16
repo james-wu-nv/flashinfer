@@ -146,7 +146,7 @@ class PagedAttentionMetadata:
     kv_page_indices: Optional[torch.Tensor] = None  # flat CSR page ids
     qo_indptr_cpu: Optional[torch.Tensor] = None
     kv_seq_lens_cpu: Optional[torch.Tensor] = None
-    _derived: Dict[bool, Any] = field(default_factory=dict, repr=False)
+    _derived: Dict[Any, Any] = field(default_factory=dict, repr=False)
 
     # ---- constructors ----
     @classmethod
@@ -265,11 +265,20 @@ class PagedAttentionMetadata:
         assert self.qo_indptr_cpu is not None
         return int(self.qo_indptr_cpu[-1])
 
-    def derived(self, *, needs_dense: bool):
-        """Backend-neutral derived forms, computed once per (object, needs_dense)."""
+    def derived(self, *, needs_dense: bool, max_kv_len: Optional[int] = None):
+        """Backend-neutral derived forms, computed once per (object, needs_dense,
+        max_kv_len).
+
+        ``max_kv_len`` widens a dense table derived from flat page ids to
+        ``ceil(max_kv_len / page_size)`` columns (CUDA-graph mode derives at
+        the capacity so the table fits its reserved storage); ``None`` uses
+        the batch's own max.
+        """
         from ._planning import derive
 
-        key = bool(needs_dense) or self.block_tables is not None
+        dense = bool(needs_dense) or self.block_tables is not None
+        width_max = self.max_kv_len if max_kv_len is None else max_kv_len
+        key = (dense, width_max)
         d = self._derived.get(key)
         if d is None:
             d = derive(
@@ -278,8 +287,8 @@ class PagedAttentionMetadata:
                 self.block_tables,
                 self.kv_page_indices,
                 self.page_size,
-                self.max_kv_len,
-                needs_dense=key,
+                width_max,
+                needs_dense=dense,
             )
             self._derived[key] = d
         return d
