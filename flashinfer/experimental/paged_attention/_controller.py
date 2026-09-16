@@ -393,6 +393,7 @@ class PagedAttentionController:
                 logits_soft_cap,
                 custom_mask is not None,
                 use_sinks,
+                backend.max_q_len,  # the hint is the Resolution's own; checked per batch below
                 *self._device_binding(),
             )
             _expect(
@@ -462,6 +463,22 @@ class PagedAttentionController:
             max_q_len, max_kv_len = gb.capacity.max_q_len, gb.capacity.max_kv_len
         else:
             max_q_len, max_kv_len = metadata.max_q_len, metadata.max_kv_len
+        if resolution.max_q_len is not None:
+            # The Resolution's candidate order was chosen for batches with at
+            # most ``max_q_len`` query tokens per request (the caller's hint);
+            # a batch — in graph mode the capacity the kernels are planned
+            # with — above it breaks that promise, so it is refused here,
+            # before any reserved-storage write, rather than run in the
+            # wrong order.
+            _expect(
+                max_q_len <= resolution.max_q_len,
+                f"max_q_len {max_q_len} of this "
+                f"{'graph capacity' if gb is not None else 'batch'} exceeds the "
+                f"pinned Resolution's hint max_q_len={resolution.max_q_len} (its "
+                "candidate order is for batches with at most that many query "
+                "tokens per request) — resolve_paged_attention() without the "
+                "hint, or with a larger one, for these batches",
+            )
 
         trace: List[Tuple[str, str, str]] = []
         chosen = None
