@@ -66,6 +66,9 @@ class PagedAttentionCapabilities:
     # requires the unit inner stride for everyone).  Measured per backend by
     # tests/experimental/test_paged_attention_strides.py (NATIVE_Q_OUTCOME).
     requires_contiguous_q: bool
+    # sliding window together with non-causal attention (trtllm-gen ships no
+    # such context kernel; irrelevant where either axis is already False)
+    supports_window_noncausal: bool = True
     # KV-cache dtypes; fp8 entries mean "fp8 KV with a fp16/bf16 q" (per-tensor
     # k_scale/v_scale at run()). fp8 q is a separate, undeclared axis.
     kv_dtypes: frozenset = frozenset({torch.float16, torch.bfloat16})
@@ -128,6 +131,8 @@ class PagedAttentionCapabilities:
             return "LSE output not supported"
         if window_left >= 0 and not self.supports_window:
             return "sliding window (window_left >= 0) not supported"
+        if window_left >= 0 and not causal and not self.supports_window_noncausal:
+            return "sliding window with non-causal attention not supported"
         if logits_soft_cap is not None and not self.supports_logits_soft_cap:
             return "logits soft cap not supported"
         if use_custom_mask and not self.supports_custom_mask:
@@ -237,9 +242,14 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         page_sizes=frozenset({16, 32, 64}),
         kv_layouts=frozenset({"HND", "NHD"}),
         supports_lse=True,
-        # vLLM routes non-causal away from trtllm; unverified here, so False.
-        supports_noncausal=False,
+        # Measured on B200 (2026-09-16) against the oracle with causal=False:
+        # the four conformance shapes in bf16 and fp16, decode shape, NHD,
+        # CSR page indices, base-e LSE and a q_len > kv_len row all match
+        # (max out err 5e-3, LSE err < 1e-4); non-causal + sliding window
+        # has no kernel, see supports_window_noncausal.
+        supports_noncausal=True,
         supports_window=True,
+        supports_window_noncausal=False,
         # The launcher passes q's token and head strides; a fused-QKV head
         # slice, a padded head stride and a storage offset all match the
         # oracle (native probe, B200).  Only the unit inner stride is a TMA

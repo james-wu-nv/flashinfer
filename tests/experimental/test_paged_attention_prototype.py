@@ -394,7 +394,7 @@ def test_paged_attention_headdim_192_128(backend, dtype):
     check(p, backend)
 
 
-@pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn"])
+@pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn", "trtllm-gen"])
 def test_paged_attention_noncausal(backend):
     p = make_problem(
         seed=11,

@@ -309,3 +309,20 @@ def test_logits_soft_cap_is_normalized_and_validated():
     for bad in (-1.0, float("nan"), float("inf"), "30"):
         with pytest.raises(ValueError, match="logits_soft_cap"):
             resolve_paged_attention(cc_major=10, logits_soft_cap=bad, **_CFG)
+
+
+def test_trtllm_gen_noncausal_is_declared_but_not_with_a_window():
+    """supports_noncausal=True is measured (see the capability comment); the
+    one non-causal configuration the kernel lacks - a sliding window - is
+    excluded at resolve rather than failing at plan."""
+    res = resolve_paged_attention(cc_major=10, **dict(_CFG, causal=False))
+    assert "trtllm-gen" in res.backends
+    res = resolve_paged_attention(
+        cc_major=10, **dict(_CFG, causal=False, window_left=16)
+    )
+    assert (
+        res.excluded["trtllm-gen"]
+        == "sliding window with non-causal attention not supported"
+    )
+    assert "cudnn" in res.excluded  # no window at all
+    assert res.backends == ("fa2",)
