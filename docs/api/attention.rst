@@ -265,9 +265,11 @@ decode, ``--kv_input_form csr`` for flat page indices,
 ``--random_actual_seq_len`` for variable lengths and ``--pa_legacy`` to add
 rows for the same inputs through the legacy public API of the same kernel
 (``api_variant=legacy``). Rows for unsupported,
-failing or incorrect backends are kept with a ``status`` column, and ``auto``
-rows record the resolved backend (``auto`` is a static selection, not
-autotuning). The benchmark generates fp16/bf16 Q and KV; see
+failing or incorrect backends are kept with a ``status`` column;
+``static_backend`` records the facade's static choice and
+``resolved_backend`` the backend the plan actually ran, which differ when
+the static choice declined the batch at plan time (``auto`` is a static
+selection, not autotuning). The benchmark generates fp16/bf16 Q and KV; see
 ``benchmarks/README.md`` for the columns.
 
 Tracing the unified API
