@@ -125,6 +125,9 @@ GDN prefill files require SM90+ (Hopper) GPU.
 MSA (msa_*) files require SM120/SM121 (consumer Blackwell) GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
+Experimental APIs are opt-in: FLASHINFER_TRACE_EXAMPLE_EXPERIMENTAL=1 additionally
+emits (unified PagedAttention, fa2, dense block table, NHD, causal, base-2 LSE):
+paged_attention_dense_h32_kv8_dqk128_dvo128_ps16_layout1_causal1_wl-1_lse1.json
 """
 
 import contextlib
@@ -140,6 +143,12 @@ os.environ.setdefault(
 os.environ.setdefault("FLASHINFER_TRACE_DUMP", "1")
 
 SAVE_DIR = Path(os.environ["FLASHINFER_TRACE_DUMP_DIR"])
+# Experimental APIs are not part of the stable example set (the stable trace
+# tests filter them); opt in explicitly to emit their definitions too.
+EXPERIMENTAL = os.environ.get("FLASHINFER_TRACE_EXAMPLE_EXPERIMENTAL", "0") not in (
+    "0",
+    "",
+)
 
 import torch
 
@@ -675,6 +684,34 @@ vc_pf = torch.randn(
     total_pf, page_size, num_kv, head_dim, dtype=torch.bfloat16, device=device
 )
 pf.run(q_pf, (kc_pf, vc_pf))
+
+# ── Experimental unified PagedAttention (opt-in), same NHD tensors ──────────
+# Full pages, dense block table, causal, base-2 LSE on fa2: the trace reads
+# the plan-owned metadata from the planned instance (plan() then run()).
+if EXPERIMENTAL:
+    from flashinfer.prefill import PagedAttention, PagedAttentionMetadata
+
+    unified = PagedAttention(torch.device(device))
+    unified_metadata = PagedAttentionMetadata.dense(
+        qo_indptr,
+        torch.full((n_req,), np_pf * page_size, dtype=torch.int32, device=device),
+        kv_idx_p.view(n_req, np_pf),
+        page_size=page_size,
+        max_q_len=128,
+        max_kv_len=np_pf * page_size,
+    )
+    unified.plan(
+        unified_metadata,
+        num_qo_heads=num_qo,
+        num_kv_heads=num_kv,
+        head_dim_qk=head_dim,
+        q_dtype=q_pf.dtype,
+        kv_layout="NHD",
+        causal=True,
+        lse_mode="base2",
+        backend="fa2",
+    )
+    unified.run(q_pf, (kc_pf, vc_pf))
 
 # ── GQA ragged prefill (Llama-3.1-8B) ────────────────────────────────────────
 qo_indptr_r = torch.tensor([0, 64, 128, 192, 256], dtype=torch.int32, device=device)
