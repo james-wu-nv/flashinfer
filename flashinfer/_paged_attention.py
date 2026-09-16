@@ -99,7 +99,7 @@ Paging metadata comes in exactly one of two forms (never both):
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -464,3 +464,11 @@ class PagedAttention:
         """Chosen backend, the plan-time trace (every candidate tried and why
         it was accepted or declined) and the resolve-time exclusion reasons."""
         return self._impl.explain()
+
+    def _trace_context(self) -> Dict[str, Any]:
+        """Read-only facts of the last successful ``plan()`` for ``fi_trace``.
+
+        Private: consumed by the trace template bound to :meth:`run`.  Raises
+        ``ValueError`` before the first successful plan; never syncs.
+        """
+        return self._impl.trace_context()

@@ -739,5 +739,66 @@ def _expect_not_capturing(what: str) -> None:
             "capture, replay inside it"
         )
 
+    # --------------------------- read-only trace -----------------------
+
+    def trace_context(self) -> Dict[str, Any]:
+        """Facts of the LAST SUCCESSFUL plan that a trace (``fi_trace``) needs.
+
+        Read-only: no device-to-host copy, no kernel launch, no change to the
+        selection or the published plan.  The tensors are the ones the planned
+        kernels read — in CUDA-graph mode the reserved storage — so a trace
+        taken between re-plans describes what a replay computes, and a failed
+        re-plan leaves the previous successful plan visible here.
+
+        Exactly one paging form is present, matching the plan's input form:
+        ``block_tables`` for the dense form (the caller's table, or its copy
+        in reserved storage), ``kv_page_indices`` for the flat form (the live
+        prefix of the flat page-id list, its length computed from the host
+        mirrors).  ``backend`` / ``excluded_backends`` / ``graph_capacity``
+        are provenance, not part of a trace's mathematical identity.
+        """
+        _expect(
+            self._planned,
+            "trace_context() called before plan() — trace a planned instance "
+            "(call plan() first)",
+        )
+        m, d, res = self._meta, self._derived, self._resolution
+        assert m is not None and d is not None and res is not None
+        page = m.page_size
+        block_tables = kv_page_indices = None
+        if m.kv_input_form == "block_tables":
+            block_tables = m.block_tables
+        else:
+            live = int(torch.sum((m.kv_seq_lens_cpu + page - 1) // page))
+            kv_page_indices = d.kv_page_indices[:live]
+        return {
+            "qo_indptr": m.qo_indptr,
+            "kv_seq_lens": m.kv_seq_lens,
+            "block_tables": block_tables,
+            "kv_page_indices": kv_page_indices,
+            "kv_input_form": m.kv_input_form,
+            "page_size": page,
+            "kv_layout": m.kv_layout,
+            "num_qo_heads": m.num_qo_heads,
+            "num_kv_heads": m.num_kv_heads,
+            "head_dim_qk": m.head_dim_qk,
+            "head_dim_vo": m.head_dim_vo,
+            "q_dtype": m.q_dtype,
+            "kv_dtype": m.kv_dtype,
+            "causal": m.causal,
+            "window_left": m.window_left,
+            "lse_mode": m.lse_mode,
+            "max_q_len": m.max_q_len,
+            "max_kv_len": m.max_kv_len,
+            "batch_size": m.batch_size,
+            "total_q_tokens": m.total_q_tokens,
+            "qo_indptr_cpu": m.qo_indptr_cpu,
+            "kv_seq_lens_cpu": m.kv_seq_lens_cpu,
+            # provenance — not identity
+            "backend": self._backend_name,
+            "excluded_backends": dict(res.excluded),
+            "graph_capacity": self._graph.capacity if self._graph is not None else None,
+        }
+
 
 __all__ = ["PagedAttentionController"]
