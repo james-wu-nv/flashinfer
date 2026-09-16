@@ -179,7 +179,13 @@ def run_unified(
     with_mirrors=True,
     sm_scale=None,
     window_left=-1,
+    logits_soft_cap=None,
+    custom_mask=None,
+    sinks=None,
 ):
+    """Plan and run one batch; the feature axes (``logits_soft_cap``, a
+    flattened ``custom_mask``, per-head ``sinks``) are forwarded to plan()
+    (``use_sinks`` follows ``sinks is not None``) and run()."""
     attn = PagedAttention(torch.device(p["device"]))
     md = make_metadata(p, with_mirrors=with_mirrors)
     attn.plan(
@@ -194,8 +200,14 @@ def run_unified(
         causal=causal,
         window_left=window_left,
         lse_mode=lse_mode,
+        logits_soft_cap=logits_soft_cap,
+        custom_mask=custom_mask,
+        use_sinks=sinks is not None,
         backend=backend,
     )
+    run_kwargs = {}
+    if sinks is not None:
+        run_kwargs["sinks"] = sinks
     out, lse = attn.run(
         p["q"],
         (p["k_cache"], p["v_cache"]),
@@ -204,6 +216,7 @@ def run_unified(
         sm_scale=sm_scale,
         k_scale=p.get("k_scale"),
         v_scale=p.get("v_scale"),
+        **run_kwargs,
     )
     return attn, out, lse
 
