@@ -7,9 +7,10 @@ from); the only derivations are cum_kv_seq_lens and the bmm scale fold
 (bmm1 = sm_scale for unquantized, bmm2 = 1.0).  Attention sinks are a native
 run-time argument.
 
-Buffers: the 128 MB workspace is ordinary softmax-stats/scratch and is the
-shared one every backend runs on (the legacy wrapper's trtllm-gen branch uses
-its shared float workspace the same way).  The kernel's multi-CTA KV
+Buffers: the controller's scratch workspace (the 128 MiB per-device default
+or the caller's buffer) is ordinary softmax-stats/scratch and is the shared
+one every backend runs on (the legacy wrapper's trtllm-gen branch uses its
+shared float workspace the same way).  The kernel's multi-CTA KV
 *counters* are the only thing that must be zero-initialized; they live in a
 separate KB-sized buffer this backend owns and passes explicitly, sized at
 plan time from (batch, heads, SM count).  The kernel self-resets the counters

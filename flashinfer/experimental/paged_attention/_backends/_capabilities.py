@@ -8,9 +8,9 @@ choosing).
 
 Capability honesty rule: ``CAPABILITIES`` declares ONLY what the conformance
 matrix and fuzzer actually exercise on hardware. Production entries are wider
-(fa2 head_dim 64/256, trtllm large pages with GQA, NHD layouts, ...); here an
-admitted config is a machine-checked config, so under-claiming is the only
-honest default.
+(trtllm-gen pages of 128 and above, cuDNN head dims beyond 128 / (192, 128),
+compute capability 11, ...); here an admitted config is a machine-checked
+config, so under-claiming is the only honest default.
 """
 
 from __future__ import annotations
@@ -75,9 +75,12 @@ class PagedAttentionCapabilities:
     # True if the backend consumes the dense block table (derivation from the
     # flat-indices input form is forbidden below page_size 8 — table blowup)
     needs_dense: bool = False
-    # native LSE format, normalized by the backend:
-    #   "base2_tokens_h"   — already the contract
-    #   "base2_padded_bsh" — base-2 padded (b, max_q, h); backend gathers
+    # native LSE format (descriptive; the backend normalizes to the contract):
+    #   "base2_tokens_h"   — packed (tokens, h) in base 2: the contract already
+    #   "base2_padded_bsh" — padded (b, max_q, h) native stats in the base the
+    #                        backend requests; the backend writes them packed
+    #                        where the library supports ragged stats offsets
+    #                        and gathers otherwise (cudnn_backend.py)
     lse_native: str = "base2_tokens_h"
     # Explicit-False feature axes: a backend that cannot apply a requested
     # feature is EXCLUDED here so `auto` never drops the feature silently.
@@ -161,9 +164,10 @@ def _is_fp8(dtype: torch.dtype) -> bool:
 
 
 # Per the capability-honesty rule: these sets mirror exactly what
-# tests/experimental/test_paged_attention_{prototype,fuzzer}.py exercise.
-# Production sets are wider (fa2 64/256 head dims, trtllm pages up to 1024
-# with GQA per tests/attention/test_trtllm_gen_attention_prefill.py, NHD...).
+# tests/experimental/test_paged_attention_{prototype,fuzzer,coverage}.py
+# exercise.  Production sets are wider (trtllm pages up to 1024 with GQA per
+# tests/attention/test_trtllm_gen_attention_prefill.py, cuDNN head dims
+# beyond those listed, ...).
 CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
     "fa2": PagedAttentionCapabilities(
         name="fa2",
