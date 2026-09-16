@@ -421,3 +421,141 @@ def test_trtllm_fused_qkv_engine_shape():
     q = q_fused_qkv_head_slice(p)
     assert tuple(q.stride()) == (48 * 128, 128, 1)
     _check_unified(attn, p, q)
+
+
+# ---------------------------------------------------------------------------
+# Page-table strides (dense backends) and flat page-id storage (FA).
+# ---------------------------------------------------------------------------
+
+
+def _with_capacity_table(p, extra_cols=3):
+    """Engine-style table: wider than ceil(max_kv/page) by ``extra_cols``,
+    the extra columns holding valid (unused) pool page ids."""
+    p = dict(p)
+    bt = p["block_tables"]
+    b, w = bt.shape
+    pool = p["k_cache"].shape[0]
+    wide = torch.zeros(b, w + extra_cols, dtype=bt.dtype, device=bt.device)
+    wide[:, :w] = bt
+    wide[:, w:] = torch.arange(extra_cols, device=bt.device, dtype=bt.dtype) % pool
+    p["block_tables"] = wide
+    return p, w
+
+
+DENSE_BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen"]
+
+
+@pytest.mark.parametrize("backend", DENSE_BACKENDS)
+def test_capacity_width_block_table(backend):
+    """A contiguous table wider than ceil(max_kv_len/page) with the ACTUAL max
+    (vLLM hands over its capacity-width table) runs everywhere: cuDNN takes
+    the width-exact view internally (it demands width == ceil(max_kv/page)),
+    trtllm-gen and the FA path ignore the extra columns."""
+    p, _ = _with_capacity_table(_problem(seed=103))
+    attn = _plan(p, backend)
+    _check_unified(attn, p, p["q"])
+
+
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("backend", DENSE_BACKENDS)
+def test_block_table_row_stride_view(backend, batch_size):
+    """block_tables[:, :w] of a wider table (row stride > width): trtllm-gen
+    walks the table as a packed array and must REJECT at plan (the sibling
+    probe measured 31.9% wrong elements); cuDNN's stride-driven graph and the
+    FA derivation address it correctly.  With one row the view IS contiguous
+    (a size-1 dim has no effective stride) and every backend accepts it."""
+    p, w = _with_capacity_table(_problem(seed=104, batch_size=batch_size))
+    view = p["block_tables"][:, :w]
+    assert view.stride(0) == w + 3 and view.is_contiguous() == (batch_size == 1)
+    p["block_tables"] = view
+    if backend == "trtllm-gen" and not view.is_contiguous():
+        _skip_unless_runnable(p, backend)
+        with pytest.raises(ValueError, match=r"contiguous.*block_tables"):
+            _plan(p, backend)
+        # the hinted fix is accepted and correct
+        p["block_tables"] = view.contiguous()
+        _check_unified(_plan(p, backend), p, p["q"])
+        return
+    attn = _plan(p, backend)
+    _check_unified(attn, p, p["q"])
+
+
+@pytest.mark.parametrize("backend", DENSE_BACKENDS)
+def test_csr_noncontiguous_page_indices(backend):
+    """A strided view as the flat kv_page_indices: the FA kernels walk the
+    list as a raw pointer and must reject at plan; dense-needing backends
+    derive their table by a gather and stay correct."""
+    from flashinfer.experimental.paged_attention import CAPABILITIES
+
+    p = dict(_problem(seed=105), input_form="page_indices")
+    live = p["kv_page_indices"]
+    inter = torch.stack([live, torch.full_like(live, -7)], dim=1).flatten()
+    p["kv_page_indices"] = inter[::2]
+    assert p["kv_page_indices"].stride(0) == 2 and torch.equal(
+        p["kv_page_indices"], live
+    )
+    if not CAPABILITIES[backend].needs_dense:
+        _skip_unless_runnable(p, backend)
+        with pytest.raises(ValueError, match="contiguous kv_page_indices"):
+            _plan(p, backend)
+        return
+    attn = _plan(p, backend)
+    out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]))
+    ref_out, ref_lse = reference_paged_prefill(
+        p["q"],
+        p["k_ref"],
+        p["v_ref"],
+        p["qo_indptr_cpu"],
+        p["kv_seq_lens_cpu"],
+        None,
+        p["page_size"],
+        True,
+        kv_page_indices=live,
+    )
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+
+@pytest.mark.parametrize("backend", DENSE_BACKENDS)
+def test_capacity_width_block_table_graph_mode(backend):
+    """Graph mode with an engine-style capacity-width table: the backends see
+    the reserved (b, capacity) buffer, cuDNN's width-exact view of it is as
+    pointer-stable as the buffer, and a re-plan into the same storage keeps
+    the captured graph correct."""
+    from flashinfer.prefill import PagedAttention
+
+    from .test_paged_attention_prototype import make_metadata
+
+    p, _ = _with_capacity_table(_problem(seed=106))
+    _skip_unless_runnable(p, backend)
+    dev = torch.device(p["device"])
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    plan_kw = dict(
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim_qk"],
+        q_dtype=p["dtype"],
+        lse_mode="base2",
+        backend=backend,
+    )
+    attn.plan(make_metadata(p), **plan_kw)
+    q, k, v = p["q"].clone(), p["k_cache"].clone(), p["v_cache"].clone()
+    out = torch.empty_like(q)
+    lse = torch.empty(q.shape[0], q.shape[1], dtype=torch.float32, device=dev)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            attn.run(q, (k, v), out=out, lse=lse)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        attn.run(q, (k, v), out=out, lse=lse)
+    ref_out, ref_lse = _oracle(p)
+    for _ in range(2):  # replay, re-plan into the reserved storage, replay
+        out.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+        torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+        attn.plan(make_metadata(p), **plan_kw)

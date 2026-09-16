@@ -53,6 +53,17 @@ class _FaBackend:
         self._head_dim_vo = 0
 
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
+        # The kernel walks kv_page_indices as a raw int32 pointer bounded by
+        # the page indptr; a strided view would be silently misread.  In graph
+        # mode this is the reserved (contiguous) buffer, so only the eager CSR
+        # form can fail here — reject before the wrapper's plan moves state.
+        idx = derived.kv_page_indices
+        if not idx.is_contiguous():
+            raise ValueError(
+                f"{self.name} requires a contiguous kv_page_indices, got strides "
+                f"{tuple(idx.stride())}: the kernel walks the flat page-id list as a "
+                "packed int32 array — pass kv_page_indices.contiguous()"
+            )
         qo_host = meta.qo_indptr_cpu.to(torch.int32)
         kv_lens_host = meta.kv_seq_lens_cpu.to(torch.int32)
         page = meta.page_size

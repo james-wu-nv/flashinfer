@@ -44,6 +44,22 @@ class _TrtllmGenBackend:
             get_trtllm_gen_multi_ctas_kv_counter_bytes,
         )
 
+        # Page-table ABI: the launcher takes the row stride from
+        # block_tables.size(-1) and the kernel walks a raw int32 pointer, so a
+        # narrow VIEW of a wider table (row stride != width) is read as a
+        # packed (b, width) array — accepted and silently wrong (31.9% of
+        # elements off in the sibling probe).  Reject before any state moves.
+        bt = meta.block_tables
+        assert bt is not None  # needs_dense contract
+        if not bt.is_contiguous():  # row stride == width, unit inner stride
+            raise ValueError(
+                "trtllm-gen requires a contiguous (batch, width) block_tables, got "
+                f"shape {tuple(bt.shape)} with strides {tuple(bt.stride())}: the "
+                "kernel walks it as a packed int32 array with row stride == width, "
+                "so a narrow view of a wider table is silently misread — pass "
+                "block_tables[:, :width].contiguous() (or the full-width table; "
+                "extra columns past max_kv_len are fine)"
+            )
         if self._sm_count is None:
             self._sm_count = get_device_sm_count(self._device)
         need = get_trtllm_gen_multi_ctas_kv_counter_bytes(

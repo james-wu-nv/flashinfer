@@ -31,6 +31,7 @@ class _CudnnBackend:
         self._workspace = workspace.view(torch.int8)
         self._meta: Optional[PlanMetadata] = None
         self._derived: Optional[Derived] = None
+        self._block_tables: Optional[torch.Tensor] = None  # width-exact view
         self._native_lse: Optional[torch.Tensor] = None
         self._batch_ids: Optional[torch.Tensor] = None
         self._pos: Optional[torch.Tensor] = None
@@ -52,6 +53,29 @@ class _CudnnBackend:
         return t
 
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
+        # Page-table ABI: cuDNN requires the table's page dimension to equal
+        # ceil(max_sequence_kv / page_size) exactly (CUDNN_STATUS_BAD_PARAM
+        # otherwise), while engines hand over capacity-width tables.  The
+        # graph is stride-driven, so a narrow VIEW keeping the caller's row
+        # stride is correct (sibling probe) — take it here, never copy.  In
+        # graph mode the view is of the reserved buffer, so its pointer is as
+        # stable as the buffer's.
+        bt = meta.block_tables
+        assert bt is not None  # needs_dense contract
+        width = (meta.max_kv_len + meta.page_size - 1) // meta.page_size
+        if bt.shape[1] > 1 and bt.stride(1) != 1:
+            raise ValueError(
+                "cudnn requires block_tables rows to be unit-stride along the page "
+                f"dimension, got strides {tuple(bt.stride())} for shape "
+                f"{tuple(bt.shape)} — pass a row-major (batch, width) table (a "
+                "column slice [:, :w] of a wider row-major table is fine)"
+            )
+        if bt.shape[1] < width:
+            raise ValueError(
+                f"block_tables has {bt.shape[1]} page columns but max_kv_len "
+                f"{meta.max_kv_len} at page_size {meta.page_size} needs {width}"
+            )
+        block_tables = bt[:, :width] if bt.shape[1] != width else bt
         # The LSE-gather indices and the native stats buffer are static per
         # plan (qo_indptr and batch size are fixed here) — precompute them so
         # run() stays a single indexed lookup on the hot path.
@@ -82,6 +106,7 @@ class _CudnnBackend:
                 native_lse = torch.empty(*lse_shape, device=dev, dtype=torch.float32)
         # publish only after every allocation above succeeded
         self._meta, self._derived = meta, derived
+        self._block_tables = block_tables
         self._native_lse, self._batch_ids, self._pos = native_lse, batch_ids, pos
 
     def run(
@@ -100,7 +125,7 @@ class _CudnnBackend:
 
         meta, derived = self._meta, self._derived
         assert meta is not None and derived is not None
-        assert meta.block_tables is not None  # needs_dense contract
+        assert self._block_tables is not None  # needs_dense contract
         b = meta.batch_size
         if self._permute_kv:
             k_cache = k_cache.permute(0, 2, 1, 3)
@@ -115,7 +140,7 @@ class _CudnnBackend:
             max_sequence_kv=meta.max_kv_len,
             actual_seq_lens_q=derived.q_seq_lens.view(b, 1, 1, 1),
             actual_seq_lens_kv=meta.kv_seq_lens.view(b, 1, 1, 1),
-            block_tables=meta.block_tables,
+            block_tables=self._block_tables,  # width == ceil(max_kv / page)
             causal=meta.causal,
             k_scale=self._scale_tensor(k_scale),
             v_scale=self._scale_tensor(v_scale),
