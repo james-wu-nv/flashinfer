@@ -50,7 +50,10 @@ Prototype simplifications (documented, not hidden):
   it (fa2).  fp8 Q and nvfp4 are undeclared axes.
 - Heuristic order is a static per-arch placeholder, to be seeded from the
   benchmark suite (proposal §5.2).  Autotune hook (§5.4) is not wired.
-- ``sinks`` / custom masks / soft-cap are absent capability axes.
+- ``logits_soft_cap`` / ``custom_mask`` / ``use_sinks`` are explicit
+  capability axes (fa2: all three; fa3: soft cap + sinks; trtllm-gen: sinks;
+  cuDNN: none) — a backend lacking a requested feature is excluded, never
+  silently bypassed.  Custom masks under CUDA-graph mode are follow-up work.
 
 CUDA-graph lifecycle — three stages (``experimental/paged_attention/_graph.py``):
 
@@ -306,6 +309,9 @@ class PagedAttention:
         causal: bool = True,
         window_left: int = -1,
         lse_mode: str = "none",
+        logits_soft_cap: Optional[float] = None,
+        custom_mask: Optional[torch.Tensor] = None,
+        use_sinks: bool = False,
         backend: Union[str, "Resolution"] = "auto",
     ) -> "PagedAttention":
         """Plan one batch.
@@ -325,9 +331,25 @@ class PagedAttention:
         - ``lse_mode``: ``"none"``, ``"base2"`` or ``"basee"`` — the base of
           the LSE ``run()`` returns, delivered natively where the backend can
           and with one fold otherwise.
+        - ``logits_soft_cap``: softmax logits soft cap ``cap * tanh(score /
+          cap)`` applied to the scaled scores (Gemma-2 / Grok style);
+          ``None`` or ``0`` = off.  Plan-time because it selects a compiled
+          kernel variant.
+        - ``custom_mask``: flattened boolean attention mask, the per-request
+          ``(q_len_i, kv_len_i)`` masks flattened row-major and concatenated
+          in request order (``sum(q_len_i * kv_len_i)`` elements, ``True`` =
+          may attend), on this instance's device.  It is ANDed into the
+          causal / sliding-window envelope, so ``causal=True`` plus a mask
+          never widens the envelope.  Not yet supported together with
+          ``use_cuda_graph=True``.
+        - ``use_sinks``: declare that ``run()`` will pass per-head attention
+          sinks (the backend plans its sink-aware kernel variant); ``run()``
+          then requires ``sinks=``.
         - ``backend``: a backend name, ``"auto"``, or a ``Resolution`` from
           :func:`resolve_paged_attention` — the latter pins the candidate set
-          decided at engine init (plan() verifies the config matches).
+          decided at engine init (plan() verifies the config, including the
+          three feature flags, matches).  Backends that cannot apply a
+          requested feature are excluded with a reason, never silently.
 
         Publication is transactional: a failing ``plan()`` leaves the previous
         plan runnable (see ``experimental/paged_attention/_controller.py`` for
@@ -348,6 +370,9 @@ class PagedAttention:
             causal=causal,
             window_left=window_left,
             lse_mode=lse_mode,
+            logits_soft_cap=logits_soft_cap,
+            custom_mask=custom_mask,
+            use_sinks=use_sinks,
             backend=backend,
         )
         return self
