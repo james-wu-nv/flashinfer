@@ -1,0 +1,314 @@
+"""Query and page-table stride contract for the unified paged-prefill API.
+
+Two layers, one oracle:
+
+1. Native probe (facts).  For each backend's *native* entry point (the legacy
+   ``BatchPrefillWithPagedKVCacheWrapper``, ``cudnn_batch_prefill_with_kv_cache``,
+   ``trtllm_batch_context_with_kv_cache``) run the SAME query values through
+   different storage layouts and classify the outcome against the fp32 oracle:
+   ``pass`` (correct), ``wrong`` (accepted, silently wrong numbers) or
+   ``reject`` (the native raised).  ``NATIVE_Q_OUTCOME`` is the measured table
+   (B200 / SM100, see reports/unified-prefill-implementation-20260916/wp-b.md);
+   the controller's query ABI checks are derived from it.  A ``wrong`` entry
+   that starts passing means a binding changed — relax the matching check.
+
+2. Unified contract.  The controller and backends must reject exactly what the
+   natives misread, and accept (correctly) what they handle: no ``.contiguous()``
+   copy hides a layout the kernel cannot address.
+"""
+
+import pytest
+import torch
+
+from flashinfer.prefill import resolve_paged_attention
+
+from .paged_attention_reference import reference_paged_prefill
+from .test_paged_attention_prototype import make_problem
+
+OUT_TOL = dict(atol=2e-2, rtol=2e-2)
+LSE_TOL = dict(atol=3e-2, rtol=2e-2)
+
+# fa3 is not in the native probe: no SM90 in the verification pool (the
+# capability-honesty rule forbids encoding an unmeasured outcome).
+NATIVE_BACKENDS = ["fa2", "cudnn", "trtllm-gen"]
+
+
+def _problem(seed=101, **overrides):
+    kw = dict(
+        batch_size=3,
+        max_q=32,
+        max_kv=128,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=16,
+        dtype=torch.bfloat16,
+    )
+    kw.update(overrides)
+    return make_problem(seed=seed, **kw)
+
+
+def _skip_unless_runnable(p, backend):
+    try:
+        resolve_paged_attention(
+            device=torch.device(p["device"]),
+            num_qo_heads=p["num_qo_heads"],
+            num_kv_heads=p["num_kv_heads"],
+            head_dim_qk=p["head_dim_qk"],
+            q_dtype=p["dtype"],
+            page_size=p["page_size"],
+            causal=True,
+            need_lse=True,
+            backend=backend,
+        )
+    except ValueError as e:
+        pytest.skip(f"backend {backend} not runnable here: {e}")
+
+
+def _oracle(p, q=None, **kw):
+    return reference_paged_prefill(
+        p["q"] if q is None else q,
+        p["k_ref"],
+        p["v_ref"],
+        p["qo_indptr_cpu"],
+        p["kv_seq_lens_cpu"],
+        p["block_tables"],
+        p["page_size"],
+        True,
+        **kw,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Query storage layouts.  Each builder returns a (T, H, D) view holding the
+# SAME values as p["q"], so the oracle answer is unchanged.
+# ---------------------------------------------------------------------------
+
+
+def q_contiguous(p):
+    return p["q"]
+
+
+def q_fused_qkv_head_slice(p):
+    """q = qkv[:, :Hq] of a fused (T, Hq+2Hkv, D) projection buffer:
+    inner stride 1, head stride D, token stride (Hq+2Hkv)*D."""
+    q = p["q"]
+    t, h, d = q.shape
+    fused = torch.randn(t, h + 2 * p["num_kv_heads"], d, dtype=q.dtype, device=q.device)
+    fused[:, :h] = q
+    return fused[:, :h]
+
+
+def q_fused_qkv_mid_slice(p):
+    """q in the MIDDLE of a fused buffer: strided AND a non-zero storage offset."""
+    q = p["q"]
+    t, h, d = q.shape
+    hk = p["num_kv_heads"]
+    fused = torch.randn(t, h + 2 * hk, d, dtype=q.dtype, device=q.device)
+    fused[:, hk : hk + h] = q
+    return fused[:, hk : hk + h]
+
+
+def q_inner_stride_2(p):
+    """buf[..., ::2] of a (T, H, 2D) buffer: head_dim interleaved (stride 2)."""
+    q = p["q"]
+    t, h, d = q.shape
+    buf = torch.randn(t, h, 2 * d, dtype=q.dtype, device=q.device)
+    buf[..., ::2] = q
+    return buf[..., ::2]
+
+
+def q_head_stride_padded(p):
+    """buf[..., :D] of a (T, H, D+8) buffer: inner stride 1, head stride D+8."""
+    q = p["q"]
+    t, h, d = q.shape
+    buf = torch.randn(t, h, d + 8, dtype=q.dtype, device=q.device)
+    buf[..., :d] = q
+    return buf[..., :d]
+
+
+def q_storage_offset(p):
+    """buf[1:] of a (T+1, H, D) buffer: contiguous, storage_offset = H*D."""
+    q = p["q"]
+    buf = torch.randn(q.shape[0] + 1, *q.shape[1:], dtype=q.dtype, device=q.device)
+    buf[1:] = q
+    return buf[1:]
+
+
+Q_LAYOUTS = {
+    "contiguous": q_contiguous,
+    "fused_qkv_head_slice": q_fused_qkv_head_slice,
+    "fused_qkv_mid_slice": q_fused_qkv_mid_slice,
+    "inner_stride_2": q_inner_stride_2,
+    "head_stride_padded": q_head_stride_padded,
+    "storage_offset": q_storage_offset,
+}
+
+# Measured native outcomes (B200 / SM100, bf16, GQA 8/2, D=128, page 16).
+#   fa2 and trtllm-gen pass token and head strides to the kernel and assume a
+#   dense head_dim: any unit-inner-stride view is correct, inner stride 2 is
+#   silently wrong (max abs error ~1.5 / ~1.3 against ~0.0025).
+#   cuDNN builds its graph from q.stride() but scales the token-unit ragged
+#   offsets by Hq*D: only packed THD (any storage offset) is correct; every
+#   other layout is silently wrong except inner stride 2, which it rejects.
+NATIVE_Q_OUTCOME = {
+    "fa2": {
+        "contiguous": "pass",
+        "fused_qkv_head_slice": "pass",
+        "fused_qkv_mid_slice": "pass",
+        "inner_stride_2": "wrong",
+        "head_stride_padded": "pass",
+        "storage_offset": "pass",
+    },
+    "cudnn": {
+        "contiguous": "pass",
+        "fused_qkv_head_slice": "wrong",
+        "fused_qkv_mid_slice": "wrong",
+        "inner_stride_2": "reject",
+        "head_stride_padded": "wrong",
+        "storage_offset": "pass",
+    },
+    "trtllm-gen": {
+        "contiguous": "pass",
+        "fused_qkv_head_slice": "pass",
+        "fused_qkv_mid_slice": "pass",
+        "inner_stride_2": "wrong",
+        "head_stride_padded": "pass",
+        "storage_offset": "pass",
+    },
+}
+
+
+@pytest.fixture(scope="module")
+def workspace():
+    return torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+
+
+def _native_runner(backend, p, workspace):
+    """The backend's native call, closed over the problem's metadata, as a
+    ``q -> (out, packed_lse)`` function (mirrors what the backend modules do)."""
+    dev = p["q"].device
+    page = p["page_size"]
+    hq, hk, d = p["num_qo_heads"], p["num_kv_heads"], p["head_dim_qk"]
+    b = int(p["kv_seq_lens_cpu"].shape[0])
+    sm_scale = 1.0 / d**0.5
+    if backend == "fa2":
+        from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
+
+        w = BatchPrefillWithPagedKVCacheWrapper(workspace, "HND", backend="fa2")
+        kv_lens = p["kv_seq_lens_cpu"].to(torch.int32)
+        pages = (kv_lens + page - 1) // page
+        kv_indptr = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32),
+                torch.cumsum(pages, 0, dtype=torch.int32),
+            ]
+        )
+        last = ((kv_lens - 1) % page + 1).to(torch.int32)
+        w.plan(
+            p["qo_indptr_cpu"].to(torch.int32),
+            kv_indptr,
+            p["kv_page_indices"],
+            last,
+            hq,
+            hk,
+            d,
+            page,
+            causal=True,
+            q_data_type=p["dtype"],
+            kv_data_type=p["dtype"],
+        )
+        return lambda q: w.run(q, (p["k_cache"], p["v_cache"]), return_lse=True)
+    if backend == "cudnn":
+        from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
+
+        tok = torch.arange(p["q"].shape[0], device=dev)
+        bid = torch.searchsorted(p["qo_indptr"][1:].long(), tok, right=True)
+        pos = tok - p["qo_indptr"].long()[bid]
+
+        def run(q):
+            out, lse = cudnn_batch_prefill_with_kv_cache(
+                q,
+                p["k_cache"],
+                p["v_cache"],
+                sm_scale,
+                workspace.view(torch.int8),
+                max_token_per_sequence=p["max_q_len"],
+                max_sequence_kv=p["max_kv_len"],
+                actual_seq_lens_q=p["qo_indptr"].diff().view(b, 1, 1, 1),
+                actual_seq_lens_kv=p["kv_seq_lens"].view(b, 1, 1, 1),
+                block_tables=p["block_tables"],
+                causal=True,
+                return_lse=True,
+                lse_base="2",
+                batch_offsets_q=p["qo_indptr"],
+                batch_offsets_units="tokens",
+            )
+            return out, lse[bid, pos, :]  # padded (b, max_q, h) -> packed
+
+        return run
+    if backend == "trtllm-gen":
+        from flashinfer.prefill import trtllm_batch_context_with_kv_cache
+
+        cum_kv = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=dev),
+                torch.cumsum(p["kv_seq_lens"], 0, dtype=torch.int32),
+            ]
+        )
+        return lambda q: trtllm_batch_context_with_kv_cache(
+            q,
+            (p["k_cache"], p["v_cache"]),
+            workspace,
+            p["block_tables"],
+            p["kv_seq_lens"],
+            p["max_q_len"],
+            p["max_kv_len"],
+            sm_scale,
+            1.0,
+            b,
+            p["qo_indptr"],
+            cum_kv,
+            window_left=-1,
+            kv_layout="HND",
+            causal=True,
+            return_lse=True,
+        )
+    raise AssertionError(backend)
+
+
+@pytest.mark.parametrize("layout", list(Q_LAYOUTS))
+@pytest.mark.parametrize("backend", NATIVE_BACKENDS)
+def test_native_query_stride_probe(backend, layout, workspace):
+    """Pin the measured native behaviour per query layout (see NATIVE_Q_OUTCOME).
+
+    ``wrong`` asserts the native REALLY returns wrong numbers: if this starts
+    failing, the binding learned the layout and the unified contract can be
+    relaxed for that backend."""
+    p = _problem()
+    _skip_unless_runnable(p, backend)
+    q = Q_LAYOUTS[layout](p)
+    assert torch.equal(q, p["q"])  # same values, different storage
+    run = _native_runner(backend, p, workspace)
+    expected = NATIVE_Q_OUTCOME[backend][layout]
+    if expected == "reject":
+        # cuDNN's graph builder: "stride for the last dimension ... should be 1"
+        with pytest.raises(Exception, match="stride"):
+            out, _ = run(q)
+            torch.cuda.synchronize()
+        return
+    out, lse = run(q)
+    torch.cuda.synchronize()
+    ref_out, ref_lse = _oracle(p)
+    out_ok = torch.allclose(out.float(), ref_out, **OUT_TOL)
+    lse_ok = torch.allclose(lse.float(), ref_lse, **LSE_TOL)
+    if expected == "pass":
+        assert out_ok and lse_ok, (
+            f"{backend} native misread q layout {layout!r} strides {tuple(q.stride())}"
+        )
+    else:
+        assert not (out_ok and lse_ok), (
+            f"{backend} native now handles q layout {layout!r} (strides "
+            f"{tuple(q.stride())}) correctly — update NATIVE_Q_OUTCOME and relax "
+            "the matching controller/capability check"
+        )
