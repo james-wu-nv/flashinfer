@@ -199,46 +199,105 @@ def _paged_attention_init(
     """Build ``{"plan": {...}, "run": {...}}`` for ``flashinfer.prefill.PagedAttention``.
 
     ``attn = PagedAttention(device); attn.plan(**inputs["plan"]);
-    attn.run(**inputs["run"])`` is a valid planned execution.  Var axes are
-    keyword-only; the Const axes of the traced definition (heads, dims,
-    page_size, and the encoded ``kv_layout`` 0/1 = HND/NHD, ``causal`` 0/1,
-    ``window_left`` -1/N, ``lse_mode`` 0/1/2 = none/base2/basee, ``csr`` 0/1
-    = dense block table / flat page ids) are accepted as kwargs so a consumer
-    can rebuild exactly the traced variant.  ``total_q`` is split evenly over
-    ``batch_size`` requests (``total_q >= batch_size``); every request owns
-    ``num_pages_per_seq`` scattered pages and uses a partially filled last
-    page.  Q/K/V are bf16.  Requires CUDA (the metadata contract is
+    attn.run(**inputs["run"])`` is a valid planned execution of the traced
+    workload.  The Const axes of the definition (heads, dims, page_size, and
+    the encoded ``kv_layout`` 0/1 = HND/NHD, ``causal`` 0/1, ``window_left``
+    -1/N, ``lse_mode`` 0/1/2 = none/base2/basee, ``csr`` 0/1 = dense block
+    table / flat page ids) select the variant; the Var axes size the workload
+    and are honoured when given (0 = unspecified):
+
+    - ``total_q`` is split evenly over ``batch_size`` requests (or
+      ``len_indptr - 1`` when ``len_indptr`` is given); ``total_q >=
+      batch_size``.
+    - dense form: the block table is ``(batch_size, max_pages)`` and every
+      request uses ``max_pages`` pages (default ``num_pages_per_seq``), the
+      last one partially.
+    - flat form: the live page-id list has exactly ``num_kv_indices``
+      entries, spread over the requests (default ``num_pages_per_seq`` per
+      request), each request's last page partially used.
+    - ``num_pages`` is the K/V pool size (default: one physical page per
+      referenced page).  Page ids are a random permutation of the pool; a
+      pool smaller than the pages the batch references makes requests share
+      pages (legal: a shared prefix), but a single request never repeats one.
+
+    Per-request KV lengths never fall below the request's query length, so
+    the bundle satisfies the definition's constraints for the causal variant
+    too.  Q/K/V are bf16.  Requires CUDA (the metadata contract is
     device-resident).
     """
-    del len_indptr, num_pages, max_pages, num_kv_indices, unused
+    del unused
     # The experimental package is imported only when init runs.
     from flashinfer.prefill import PagedAttentionMetadata
 
+    if len_indptr:
+        if batch_size and batch_size != len_indptr - 1:
+            raise ValueError(
+                f"len_indptr ({len_indptr}) must equal batch_size + 1 "
+                f"({batch_size + 1})"
+            )
+        batch_size = len_indptr - 1
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
     if total_q < batch_size:
         raise ValueError(
             f"total_q ({total_q}) must be >= batch_size ({batch_size}): every "
             "request needs at least one query token"
         )
     torch.manual_seed(seed)
-    q_lens = torch.full((batch_size,), total_q // batch_size, dtype=torch.int32)
+    q_lens = torch.full((batch_size,), total_q // batch_size, dtype=torch.int64)
     q_lens[: total_q % batch_size] += 1
-    qo_indptr_cpu = torch.cat(
-        [torch.zeros(1, dtype=torch.int32), torch.cumsum(q_lens, 0, dtype=torch.int32)]
+    min_pages = (q_lens + page_size - 1) // page_size  # kv_len >= q_len
+
+    # pages per request from the Var axes of the traced form
+    if csr:
+        if num_kv_indices:
+            if num_kv_indices < int(min_pages.sum()):
+                raise ValueError(
+                    f"num_kv_indices ({num_kv_indices}) cannot hold one page per "
+                    f"query token: the {batch_size} requests of {total_q} tokens "
+                    f"need at least {int(min_pages.sum())} pages"
+                )
+            pages = min_pages.clone()
+            spare = num_kv_indices - int(pages.sum())
+            pages += spare // batch_size
+            pages[: spare % batch_size] += 1
+        else:
+            pages = torch.maximum(min_pages, torch.tensor(num_pages_per_seq))
+        table_width = int(pages.max())
+    else:
+        table_width = max_pages or max(num_pages_per_seq, int(min_pages.max()))
+        if table_width < int(min_pages.max()):
+            raise ValueError(
+                f"max_pages ({max_pages}) x page_size ({page_size}) cannot hold "
+                f"the longest request's {int(q_lens.max())} query tokens"
+            )
+        pages = torch.full((batch_size,), table_width, dtype=torch.int64)
+
+    # partial last pages (request i leaves i % page_size slots unused), never
+    # shorter than the request's own query length
+    kv_lens = torch.maximum(
+        pages * page_size - (torch.arange(batch_size) % page_size), q_lens
     )
-    full_len = num_pages_per_seq * page_size
-    # partial last pages, never shorter than the request's own query length
-    kv_lens_cpu = torch.maximum(
-        torch.full((batch_size,), full_len, dtype=torch.int32)
-        - (torch.arange(batch_size, dtype=torch.int32) % page_size),
-        q_lens,
-    ).to(torch.int32)
-    pages = (kv_lens_cpu + page_size - 1) // page_size
-    pool_pages = batch_size * num_pages_per_seq
-    perm = torch.randperm(pool_pages).to(torch.int32)  # scattered page ids
-    block_tables_cpu = perm.view(batch_size, num_pages_per_seq).clone()
+    assert bool(((kv_lens + page_size - 1) // page_size == pages).all())
+
+    pool_pages = num_pages or int(pages.sum())
+    if pool_pages < int(pages.max()):
+        raise ValueError(
+            f"num_pages ({pool_pages}) is smaller than the {int(pages.max())} "
+            "pages the longest request references"
+        )
+    perm = torch.randperm(pool_pages)  # scattered page ids
+    # request-ordered pages (wrapping around a small pool); unused dense slots
+    # hold valid pool pages that belong to nobody
+    slots = torch.arange(batch_size * table_width).view(batch_size, table_width)
+    block_tables_cpu = perm[slots % pool_pages].to(torch.int32)
     kv_page_indices_cpu = torch.cat(
         [block_tables_cpu[i, : int(pages[i])] for i in range(batch_size)]
     )
+    qo_indptr_cpu = torch.cat(
+        [torch.zeros(1, dtype=torch.int32), torch.cumsum(q_lens, 0).to(torch.int32)]
+    )
+    kv_lens_cpu = kv_lens.to(torch.int32)
     common = dict(
         page_size=page_size,
         max_q_len=int(q_lens.max()),
