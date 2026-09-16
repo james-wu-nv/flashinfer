@@ -196,7 +196,16 @@ class _CudnnBackend:
         path = "gather"
         if meta.need_lse:
             if meta.max_q_len == 1:
-                path = "view"  # padded (b, 1, h) is the packed (b, h) buffer
+                # padded (b, 1, h) is the packed (b, h) buffer only while every
+                # request has exactly one token: a q_len 0 row (vLLM's padded
+                # query_start_loc tail) shifts the packed rows after it, and
+                # in graph mode a later re-plan may introduce one while the
+                # captured graph keeps the layout it was captured with -- so
+                # the view is eager-only and needs total tokens == batch size.
+                # The direct path is not an option here (cuDNN 9.25 writes no
+                # stats at max_q_len 1 with a ragged stats offset); gather it is.
+                if self._rows is None and meta.total_q_tokens == meta.batch_size:
+                    path = "view"
             elif _packed_lse_supported(self._device, self._workspace):
                 # plan() is never inside a graph capture, so the one-time
                 # probe (a graph build + execute on a toy problem) belongs here
