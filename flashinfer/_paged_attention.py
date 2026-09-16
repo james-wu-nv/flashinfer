@@ -104,6 +104,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple, Union
 import torch
 
 from .api_logging import flashinfer_experimental_api
+from .trace.templates.paged_attention import paged_attention_trace_dispatch
 
 if TYPE_CHECKING:  # pragma: no cover — types only; the package is imported lazily
     from .experimental.paged_attention import (
@@ -404,7 +405,7 @@ class PagedAttention:
         self._impl.update(metadata)
         return self
 
-    @flashinfer_experimental_api(feature=_FEATURE)
+    @flashinfer_experimental_api(feature=_FEATURE, trace=paged_attention_trace_dispatch)
     def run(
         self,
         q: torch.Tensor,
@@ -448,6 +449,12 @@ class PagedAttention:
         Rows of padding requests (``kv_len == 0``) are finite but unspecified
         in both ``out`` and ``lse`` (every current backend writes zeros and
         -inf); exclude them when consuming the LSE.
+
+        Tracing: ``flashinfer.fi_trace(attn.run, q=q, kv_cache=(k, v))`` on a
+        planned instance (or ``FLASHINFER_TRACE_DUMP=1`` during ``run()``)
+        exports a flashinfer-bench definition whose identity is the plan's
+        paging form, KV layout, causal / window / LSE settings and geometry,
+        with the plan-owned metadata read from the last successful ``plan()``.
         """
         return self._impl.run(
             q,
