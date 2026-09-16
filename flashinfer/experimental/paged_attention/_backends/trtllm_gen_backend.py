@@ -74,6 +74,16 @@ class _TrtllmGenBackend:
                 f"{self.name} has no non-causal sliding-window context kernel "
                 "(window_left >= 0 requires causal=True)"
             )
+        if self.name == "cake" and int(meta.kv_seq_lens_cpu.min()) == 0:
+            # Measured on B200 (cake_fmha context, bf16, page 16): a request
+            # with kv_len == 0 never returns — the device hangs (ledger M19).
+            # Padding rows are legal input, so cake declines the batch and
+            # backend="auto" moves on to trtllm-gen / cuDNN / fa2.
+            raise _BackendPlanUnsupportedError(
+                "cake cannot run a batch with a kv_len == 0 request (the kernel "
+                "hangs on an empty KV range); padding rows need trtllm-gen, "
+                "cudnn or fa2"
+            )
         # Page-table ABI: the launcher takes the row stride from
         # block_tables.size(-1) and the kernel walks a raw int32 pointer, so a
         # narrow VIEW of a wider table (row stride != width) is read as a

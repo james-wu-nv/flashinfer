@@ -656,6 +656,32 @@ def test_tc09_zero_kv_row():
     torch.testing.assert_close(lse[keep], ref_lse, **LSE_TOL)
 
 
+def test_tc09_zero_kv_row_cake_declines():
+    """ledger M19: the cake kernel hangs on a kv_len == 0 request, so cake
+    declines padding rows with the typed signal — auto never lands on it and
+    an explicit pin gets a ValueError instead of a hung device."""
+    p = _legal(seed=902)
+    kv0 = p["kv_seq_lens_cpu"].clone()
+    kv0[1] = 0
+    p0 = _with_kv_lens(p, kv0)
+    md = make_metadata(p0)
+    kw = dict(
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        q_dtype=torch.bfloat16,
+        causal=True,
+        lse_mode="base2",
+    )
+    _resolve_or_skip(p0, "cake")
+    with pytest.raises(ValueError, match="kv_len == 0"):
+        PagedAttention(torch.device(DEVICE)).plan(md, backend="cake", **kw)
+    attn = PagedAttention(torch.device(DEVICE)).plan(md, backend="auto", **kw)
+    assert attn.backend != "cake"
+    out, _ = run(attn, p0)
+    assert torch.isfinite(out).all()
+
+
 _PLAN_ROWS = [
     ("unknown_backend", dict(backend="fa9"), "unknown backend"),
     ("unknown_lse_mode", dict(lse_mode="base10"), "lse_mode must be one of"),

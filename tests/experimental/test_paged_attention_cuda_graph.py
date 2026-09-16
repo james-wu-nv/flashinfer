@@ -1131,7 +1131,14 @@ def test_replan_toggles_padding_rows(backend, input_form):
         torch.testing.assert_close(out.float()[m], ref_out[m], **OUT_TOL)
         torch.testing.assert_close(lse[m], ref_lse[m], **LSE_TOL)
 
+    if backend == "cake":
+        # ledger M19: the cake kernel hangs on a kv_len == 0 request, so the
+        # backend declines padding rows (an explicit pin surfaces it)
+        with pytest.raises(ValueError, match="kv_len == 0"):
+            plan(a)
+        return
     plan(a)
+    assert attn.backend != "cake"
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
