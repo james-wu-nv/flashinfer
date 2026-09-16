@@ -75,9 +75,15 @@ CUDA-graph lifecycle — three stages (``experimental/paged_attention/_graph.py`
     Capacity substitution: backends are planned with, and the captured
     kernels keep reading, the CAPACITY ``max_q_len`` / ``max_kv_len``; a
     batch's own maxes are only validated against them.  ``q`` / ``out`` /
-    ``lse`` are the capture buffers, sized to the capacity's rows; rows past
-    the batch are neither read nor written.  ``plan()`` and ``update()`` are
-    rejected while the current stream is capturing.  ``sm_scale`` /
+    ``lse`` are the capture buffers, at most the capacity's rows; the
+    smallest row count a ``run()`` sees bounds every later batch (a graph
+    captured on those buffers cannot reach past them).  Rows past the batch
+    are not read, ``out`` rows past it are not written, ``lse`` rows past it
+    may be overwritten by some backends.  ``plan()`` and ``update()`` are
+    rejected while the current stream is capturing, and after the first
+    graph-mode plan they must run on that plan's stream — the stream the
+    graph is replayed on, so the staging copies precede the replay.
+    ``sm_scale`` /
     ``k_scale`` / ``v_scale`` are launch scalars: a captured graph keeps the
     values it was captured with.
 

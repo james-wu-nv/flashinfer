@@ -444,6 +444,14 @@ class PagedAttentionController:
                 gb = GraphBuffers(GraphCapacity.from_metadata(metadata), self.device)
             else:
                 gb = self._graph
+                stream = torch.cuda.current_stream(self.device)
+                _expect(
+                    gb.stream is None or stream == gb.stream,
+                    "CUDA graph re-plan on a different stream than the first "
+                    "graph-mode plan: the staging copies must be ordered before "
+                    "the replay — plan()/update() and graph.replay() on one "
+                    "stream (the stream of the first graph-mode plan)",
+                )
             gb.preflight(metadata)
             # Capacity substitution: the captured kernels were planned with
             # the capacity maxes and keep reading them, so backends see those
@@ -455,7 +463,20 @@ class PagedAttentionController:
 
         trace: List[Tuple[str, str, str]] = []
         chosen = None
+        frozen_backend = self._frozen["backend"] if self._frozen is not None else None
+        if frozen_backend is not None and frozen_backend not in resolution.backends:
+            _check_frozen_contract(
+                {"backend": frozen_backend}, {"backend": resolution.backends[0]}
+            )
         for name in resolution.backends:
+            if frozen_backend is not None and name != frozen_backend:
+                # a captured graph launches the frozen backend's kernels; skip
+                # every other candidate before constructing or reserving
+                # anything for it
+                trace.append(
+                    (name, "frozen", "not the backend the first graph-mode plan froze")
+                )
+                continue
             # derive exactly the forms this candidate declared it reads (cached
             # on the metadata per need set and width; in graph mode the dense
             # table derived from flat page ids is sized to the reserved one)
@@ -568,12 +589,28 @@ class PagedAttentionController:
         # publish — nothing above mutated the published state (the backend
         # cache holds constructed objects, not plan state)
         if gb is not None:
+            if gb.stream is None:
+                gb.stream = torch.cuda.current_stream(self.device)
             self._graph = gb
             self._frozen = contract
             self._frozen_plan_kwargs = {
                 k: v for k, v in contract.items() if k in _PLAN_PARAMS
             }
-            self._frozen_plan_kwargs["backend"] = name
+            # update() re-plans within the pinned resolution narrowed to the
+            # frozen backend: no level-1 re-resolution per step, and explain()
+            # keeps the resolve-time exclusion reasons
+            self._frozen_plan_kwargs["backend"] = dataclasses.replace(
+                resolution,
+                backends=(name,),
+                excluded={
+                    **resolution.excluded,
+                    **{
+                        other: "not the backend the first graph-mode plan froze"
+                        for other in resolution.backends
+                        if other != name
+                    },
+                },
+            )
         self._backends[key] = candidate
         self._active = candidate
         self._backend_name = name
@@ -695,8 +732,10 @@ class PagedAttentionController:
         _expect(q.dtype == m.q_dtype, f"q dtype {q.dtype} != planned {m.q_dtype}")
         total = m.total_q_tokens
         if self._graph is not None:
-            # graph mode: q/out/lse are the capture buffers, sized to the
-            # capacity; rows past this batch are neither read nor written
+            # graph mode: q/out/lse are the capture buffers, at most the
+            # capacity's rows; the smallest row count seen bounds later
+            # batches (GraphBuffers.preflight), since a graph captured on
+            # these buffers cannot reach past them
             rows = self._graph.capacity.total_q_tokens
             _expect(
                 total <= q.shape[0] <= rows,
@@ -801,6 +840,9 @@ class PagedAttentionController:
                 "sinks= passed but the plan did not declare use_sinks=True — "
                 "plan(use_sinks=True) selects the sink-aware kernel variant",
             )
+        if self._graph is not None:
+            gb = self._graph
+            gb.rows = q.shape[0] if gb.rows is None else min(gb.rows, q.shape[0])
         return self._active.run(
             q,
             k_cache,

@@ -70,8 +70,12 @@ class GraphCapacity:
       The kernels are planned with the capacity values and keep reading them
       after capture (capacity substitution: in graph mode a backend sees the
       capacity maxes, never a batch's own), so a batch may use less.  ``q``,
-      ``out`` and ``lse`` may carry up to ``total_q_tokens`` rows; rows past
-      the batch are neither read nor written.
+      ``out`` and ``lse`` may carry up to ``total_q_tokens`` rows; the
+      smallest row count any ``run()`` of the instance sees becomes a bound
+      every later batch must fit (a graph captured on those buffers cannot
+      reach past them).  Rows past the batch are not read and ``out`` rows
+      past it are not written; ``lse`` rows past it may be overwritten by
+      some backends (cuDNN's base conversion, trtllm-gen's ``-inf`` fill).
     - dense form: ``table_width`` is the caller's block-table width and must
       equal ``ceil(max_kv_len / page_size)`` — cuDNN plans its paged gather
       from both and rejects any other pairing — so pass
@@ -155,11 +159,14 @@ class GraphCapacity:
                 "(the reserved length of kv_page_indices)",
             )
             _expect_positive_int("flat_capacity", self.flat_capacity)
-            need = max(self.batch_size, self.dense_table_width)
+            # one request of max_kv_len must fit; NOT one page per request —
+            # padding rows (kv_len == 0) own no page, so a legal first batch
+            # can have fewer page ids than requests
+            need = self.dense_table_width
             _expect(
                 self.flat_capacity >= need,
                 f"GraphCapacity.flat_capacity ({self.flat_capacity}) cannot hold "
-                f"one page per request and one request of max_kv_len (needs >= {need})",
+                f"one request of max_kv_len (needs >= {need})",
             )
 
     @property
@@ -202,6 +209,12 @@ class GraphBuffers:
     def __init__(self, capacity: GraphCapacity, device: torch.device):
         self.capacity = capacity
         self._device = device
+        # bound by use: the smallest q/out/lse row count any run() has seen
+        # (a graph captured on those buffers cannot reach past them), and the
+        # stream the first graph-mode plan staged on (re-plans and replays
+        # must stay on it, or a replay could overtake the staging copies)
+        self.rows: Optional[int] = None
+        self.stream: Optional[torch.cuda.Stream] = None
         b = capacity.batch_size
         i32 = dict(dtype=torch.int32, device=device)
         # the caller-facing canonical metadata, mirrored into stable storage
@@ -274,6 +287,15 @@ class GraphBuffers:
                 f"CUDA graph re-plan: {name} {got} exceeds this instance's "
                 f"capacity {limit} (the captured kernels were planned with the "
                 "capacity value) — use a bucket with a larger GraphCapacity",
+            )
+        if self.rows is not None:
+            _expect(
+                metadata.total_q_tokens <= self.rows,
+                f"CUDA graph re-plan: total_q_tokens {metadata.total_q_tokens} "
+                f"exceeds the {self.rows} rows of the q/out/lse buffers a run() "
+                "of this instance was given (a graph captured on them cannot "
+                "reach past them) — size the capture buffers to the capacity's "
+                f"total_q_tokens ({cap.total_q_tokens})",
             )
         if metadata.block_tables is not None:
             _expect(
