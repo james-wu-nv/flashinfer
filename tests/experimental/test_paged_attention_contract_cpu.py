@@ -49,6 +49,11 @@ from flashinfer.experimental.paged_attention._controller import (
 from flashinfer.experimental.paged_attention._graph import Transaction
 from flashinfer.experimental.paged_attention._planning import (
     Derived,
+    FORM_BLOCK_TABLES,
+    FORM_CUM_KV_SEQ_LENS,
+    FORM_KV_PAGE_INDICES,
+    FORM_KV_PAGE_INDPTR,
+    FORM_Q_SEQ_LENS,
     validate_causal_envelope,
     validate_values,
 )
@@ -59,7 +64,7 @@ from flashinfer.prefill import PagedAttention
 def no_probes(monkeypatch):
     """Selection without touching CUDA: every environment probe reports 'available'."""
     monkeypatch.setattr(
-        _selection, "PROBES", {name: (lambda: None) for name in CAPABILITIES}
+        _selection, "PROBES", {name: (lambda device: None) for name in CAPABILITIES}
     )
 
 
@@ -94,6 +99,12 @@ KEY_KW = dict(
     need_lse=True,
     window_left=-1,
     kv_input_form="block_tables",
+    logits_soft_cap=None,
+    custom_mask=False,
+    sinks=False,
+    cc_major=9,
+    cc_minor=None,
+    device_index=None,
 )
 KEY_DRIFT = dict(
     num_qo_heads=16,
@@ -108,6 +119,12 @@ KEY_DRIFT = dict(
     need_lse=False,
     window_left=0,
     kv_input_form="page_indices",
+    logits_soft_cap=30.0,
+    custom_mask=True,
+    sinks=True,
+    cc_major=10,
+    cc_minor=0,
+    device_index=1,
 )
 
 
@@ -127,6 +144,10 @@ def test_resolve_config_key_layout_is_pinned():
         True,
         -1,
         "block_tables",
+        None,  # logits_soft_cap
+        False,  # custom mask
+        False,  # sinks
+        (9, None, None),  # device binding: (cc_major, cc_minor, device_index)
     )
 
 
@@ -141,9 +162,8 @@ def test_resolve_config_key_detects_single_field_drift(field):
 def test_every_semantic_plan_kwarg_is_part_of_the_key():
     """A plan() kwarg (soft-cap, sinks, ...) that is not in the key would let
     a pinned Resolution silently accept a different configuration."""
-    renamed = {
-        "lse_mode": "need_lse"
-    }  # plan() speaks lse_mode; the key stores need_lse
+    # plan() speaks lse_mode / use_sinks; the key stores need_lse / sinks
+    renamed = {"lse_mode": "need_lse", "use_sinks": "sinks"}
     key_params = set(inspect.signature(resolve_config_key).parameters)
     for plan in (PagedAttentionController.plan, PagedAttention.plan):
         plan_params = set(inspect.signature(plan).parameters) - {
@@ -158,10 +178,11 @@ def test_every_semantic_plan_kwarg_is_part_of_the_key():
         )
     # the two metadata-derived facts the key must carry
     assert {"page_size", "kv_input_form"} <= key_params
-    # resolve() accepts exactly the key fields plus its own routing arguments
+    # resolve() accepts exactly the key fields plus its own routing arguments;
+    # the device binding's minor/index are derived from ``device``, not passed
     resolve_params = set(inspect.signature(resolve_paged_attention).parameters)
     assert resolve_params - key_params <= {"device", "cc_major", "backend"}
-    assert key_params <= resolve_params
+    assert key_params - resolve_params <= {"cc_minor", "device_index"}
 
 
 def test_resolution_is_frozen_and_config_matches_key(no_probes):
@@ -179,6 +200,12 @@ def test_resolution_is_frozen_and_config_matches_key(no_probes):
         True,
         -1,
         "block_tables",
+        None,
+        False,
+        False,
+        9,
+        None,
+        None,
     )
     assert res.chosen == res.backends[0]
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -188,12 +215,6 @@ def test_resolution_is_frozen_and_config_matches_key(no_probes):
     assert all(name in text for name in res.excluded)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="WP-E (mla-alignment F6): Resolution.config must carry the resolved "
-    "(cc_major, cc_minor, device index) so a Resolution taken on another GPU "
-    "fails plan()'s drift check instead of pinning the wrong candidate set",
-)
 def test_resolution_config_carries_device_identity(no_probes):
     assert _resolve(9).config != _resolve(10).config
 
@@ -286,8 +307,14 @@ def _capability_rows():
         ("trtllm-gen", "page128", dict(page_size=128), "unsupported page_size"),
         ("trtllm-gen", "page32", dict(page_size=32), None),
         ("trtllm-gen", "page64", dict(page_size=64), None),
-        ("trtllm-gen", "noncausal", dict(causal=False), "non-causal"),
+        ("trtllm-gen", "noncausal", dict(causal=False), None),  # measured on B200
         ("trtllm-gen", "window0", dict(window_left=0), None),
+        (
+            "trtllm-gen",
+            "noncausal-window",
+            dict(causal=False, window_left=16),
+            "non-causal",
+        ),
         ("trtllm-gen", "d64", dict(head_dim_qk=64, head_dim_vo=64), "head dims"),
         (
             "trtllm-gen",
@@ -301,6 +328,19 @@ def _capability_rows():
             dict(kv_input_form="page_indices", page_size=16),
             None,
         ),
+        # feature axes: a backend lacking a requested feature is excluded with
+        # a reason, never silently bypassed
+        ("fa2", "softcap", dict(logits_soft_cap=30.0), None),
+        ("fa3", "softcap", dict(logits_soft_cap=30.0), None),
+        ("cudnn", "softcap", dict(logits_soft_cap=30.0), "logits soft cap"),
+        ("trtllm-gen", "softcap", dict(logits_soft_cap=30.0), "logits soft cap"),
+        ("fa2", "custom-mask", dict(use_custom_mask=True), None),
+        ("fa3", "custom-mask", dict(use_custom_mask=True), "custom attention mask"),
+        ("cudnn", "custom-mask", dict(use_custom_mask=True), "custom attention mask"),
+        ("fa2", "sinks", dict(use_sinks=True), None),
+        ("trtllm-gen", "sinks", dict(use_sinks=True), None),
+        ("cake", "sinks", dict(use_sinks=True), None),
+        ("cudnn", "sinks", dict(use_sinks=True), "attention sinks"),
     ]
     return rows
 
@@ -358,20 +398,20 @@ def test_no_runnable_backend_lists_every_reason(no_probes):
 
 
 def test_probe_failure_becomes_an_exclusion_reason(monkeypatch):
-    probes = {name: (lambda: None) for name in CAPABILITIES}
-    probes["cudnn"] = lambda: "cudnn-frontend python package not importable"
+    probes = {name: (lambda device: None) for name in CAPABILITIES}
+    probes["cudnn"] = lambda device: "cudnn-frontend python package not importable"
     monkeypatch.setattr(_selection, "PROBES", probes)
     res = _resolve(10)
     assert "cudnn" not in res.backends
     assert res.excluded["cudnn"] == "cudnn-frontend python package not importable"
-    assert res.backends == ("trtllm-gen", "fa2")
+    assert res.backends == ("trtllm-gen", "cake", "fa2")  # cudnn probed out
 
 
 def test_probes_run_only_for_capability_admitted_backends(monkeypatch):
     calls = []
 
     def probe_for(name):
-        def probe():
+        def probe(device):
             calls.append(name)
             return None
 
@@ -496,7 +536,7 @@ def _validate(case):
         bt = torch.zeros(len(case["kv"]), case["width"], dtype=torch.int32)
     else:
         idx = torch.zeros(case["csr"], dtype=torch.int32)
-    validate_values(
+    host = validate_values(
         qo,
         kv,
         bt,
@@ -506,8 +546,10 @@ def _validate(case):
         case["max_kv_len"],
         qo,
         kv,
-        causal=case["causal"],
     )
+    if case["causal"]:
+        validate_causal_envelope(host)
+    return host
 
 
 _HOST_ROWS = [
@@ -518,8 +560,9 @@ _HOST_ROWS = [
     ("indptr-not-increasing", dict(qo=[0, 4, 4, 9]), "strictly increasing"),
     ("indptr-not-from-zero", dict(qo=[1, 4, 6, 9]), r"qo_indptr\[0\] must be 0"),
     ("max-q-underclaim", dict(max_q_len=2), r"max_q_len \(2\) is smaller"),
-    ("kv-zero", dict(kv=[10, 0, 9]), ">= 1"),
-    ("kv-negative", dict(kv=[10, -1, 9]), ">= 1"),
+    ("kv-zero-padding-row", dict(kv=[10, 0, 9]), None),  # legal padding row
+    ("kv-zero-padding-row-causal", dict(kv=[10, 0, 9], causal=True), None),
+    ("kv-negative", dict(kv=[10, -1, 9]), "kv_seq_lens"),
     ("causal-q-gt-kv", dict(kv=[10, 1, 9], causal=True), "q_len_i <= kv_len_i"),
     ("noncausal-q-gt-kv-ok", dict(kv=[10, 1, 9], causal=False), None),
     ("max-kv-underclaim", dict(max_kv_len=9), r"max_kv_len \(9\) is smaller"),
@@ -546,16 +589,22 @@ def test_validate_values_rejects_mismatched_mirrors():
     kv = torch.tensor([10, 6, 9], dtype=torch.int32)
     bt = torch.zeros(3, 3, dtype=torch.int32)
     with pytest.raises(ValueError, match="qo_indptr_cpu must be a CPU mirror"):
-        validate_values(qo, kv, bt, None, 4, 3, 10, qo[:-1], kv, causal=False)
+        validate_values(qo, kv, bt, None, 4, 3, 10, qo[:-1], kv)
     with pytest.raises(ValueError, match="kv_seq_lens_cpu must be a CPU mirror"):
-        validate_values(qo, kv, bt, None, 4, 3, 10, qo, kv[:-1], causal=False)
+        validate_values(qo, kv, bt, None, 4, 3, 10, qo, kv[:-1])
 
 
 def test_causal_envelope_names_the_offending_request():
     qo = torch.tensor([0, 2, 7, 9], dtype=torch.int32)
-    validate_causal_envelope(qo, torch.tensor([2, 5, 2], dtype=torch.int32))
+    bt = torch.zeros(3, 3, dtype=torch.int32)  # capacity 3 x 4 = 12
+
+    def host(kv):
+        kv = torch.tensor(kv, dtype=torch.int32)
+        return validate_values(qo, kv, bt, None, 4, 5, int(kv.max()), qo, kv)
+
+    validate_causal_envelope(host([2, 5, 2]))
     with pytest.raises(ValueError, match="request 1 has q_len 5 > kv_len 4"):
-        validate_causal_envelope(qo, torch.tensor([2, 4, 2], dtype=torch.int32))
+        validate_causal_envelope(host([2, 4, 2]))
 
 
 def test_metadata_constructor_rejects_cpu_tensors_and_paging_form_errors():
@@ -656,16 +705,7 @@ def test_transaction_without_commit_restores():
         assert torch.equal(d, o)
 
 
-_M2 = pytest.mark.xfail(
-    strict=True,
-    reason="ledger M2; WP-A: Transaction.__enter__ raises before __exit__ can run, "
-    "so destinations copied before the failing pair keep the new values",
-)
-
-
-@pytest.mark.parametrize(
-    "fail_at", [0, pytest.param(1, marks=_M2), pytest.param(2, marks=_M2)]
-)
+@pytest.mark.parametrize("fail_at", [0, 1, 2])
 def test_transaction_failing_copy_in_enter_restores_earlier_destinations(fail_at):
     """Every copy position may fail (mla-alignment F2 acceptance); the
     destinations written before it must be back at their previous values."""
@@ -697,14 +737,15 @@ CAP_CSR = GraphCapacity(
     max_q_len=32,
     max_kv_len=256,
     total_q_tokens=64,
-    table_width=256,
-    flat_capacity=700,
+    flat_capacity=700,  # the flat form derives its dense width (256) on demand
 )
 
 
 def _buffers(cap):
     gb = GraphBuffers.__new__(GraphBuffers)  # __init__ would allocate CUDA storage
     gb.capacity = cap
+    gb._device = torch.device("cpu")
+    gb.block_tables = None  # reserved on demand by reserve_dense_table()
     return gb
 
 
@@ -787,6 +828,11 @@ _PREFLIGHT_ACCEPT = [
     ("dense-same", CAP_DENSE, {}),
     ("csr-same", CAP_CSR, {}),
     ("csr-shorter", CAP_CSR, dict(kv_page_indices=torch.zeros(300, dtype=torch.int32))),
+    # the maxes and the total token count are upper bounds (capacity
+    # substitution): a smaller live batch fits the captured bucket
+    ("dense-max_q-under", CAP_DENSE, dict(max_q_len=16)),
+    ("dense-max_kv-under", CAP_DENSE, dict(max_kv_len=128)),
+    ("dense-total_q-under", CAP_DENSE, dict(total_q_tokens=48)),
 ]
 
 
@@ -797,34 +843,13 @@ def test_preflight_accepts_a_batch_that_fits(label, cap, over):
     _buffers(cap).preflight(_meta(cap, **over))
 
 
-_FIXED_CAPACITY_ROWS = [
-    ("max_q-under", dict(max_q_len=16), "max_q_len"),
-    ("max_kv-under", dict(max_kv_len=128), "max_kv_len"),
-    ("total_q-under", dict(total_q_tokens=48), "total_q_tokens"),
-]
-
-
-@pytest.mark.parametrize(
-    "label,over,match", _FIXED_CAPACITY_ROWS, ids=[r[0] for r in _FIXED_CAPACITY_ROWS]
-)
-def test_preflight_fixed_capacity_contract_rejects_smaller_batches(label, over, match):
-    """TODAY's contract: the capture shapes must match exactly.  WP-A's capacity
-    substitution (ledger M10) turns these rows into accepted '<=' cases; when it
-    lands, move them into ``_PREFLIGHT_ACCEPT``."""
-    with pytest.raises(ValueError, match=match) as ei:
-        _buffers(CAP_DENSE).preflight(_meta(CAP_DENSE, **over))
-    assert "one PagedAttention(use_cuda_graph=True) instance per graph bucket" in str(
-        ei.value
-    )
-
-
 def _cpu_reserved(cap):
     gb = _buffers(cap)
     b = cap.batch_size
     i32 = dict(dtype=torch.int32)
     gb.qo_indptr = torch.zeros(b + 1, **i32)
     gb.kv_seq_lens = torch.zeros(b, **i32)
-    gb.block_tables = torch.zeros(b, cap.table_width, **i32)
+    gb.block_tables = torch.zeros(b, cap.dense_table_width, **i32)
     gb.kv_page_indices = torch.zeros(cap.flat_capacity, **i32)
     gb.q_seq_lens = torch.zeros(b, **i32)
     gb.cum_kv_seq_lens = torch.zeros(b + 1, **i32)
@@ -832,14 +857,21 @@ def _cpu_reserved(cap):
     return gb
 
 
+_DEVICE_FORMS = frozenset(
+    {FORM_Q_SEQ_LENS, FORM_CUM_KV_SEQ_LENS, FORM_KV_PAGE_INDPTR, FORM_KV_PAGE_INDICES}
+)
+
+
 def _fresh(cap, n_flat, dense):
     b = cap.batch_size
+    needs = _DEVICE_FORMS | ({FORM_BLOCK_TABLES} if dense else frozenset())
     return Derived(
+        needs=needs,
         q_seq_lens=torch.ones(b, dtype=torch.int32),
         cum_kv_seq_lens=torch.arange(b + 1, dtype=torch.int32),
         kv_page_indptr=torch.arange(b + 1, dtype=torch.int32),
         kv_page_indices=torch.arange(n_flat, dtype=torch.int32),
-        block_tables=torch.ones(b, cap.table_width, dtype=torch.int32)
+        block_tables=torch.ones(b, cap.dense_table_width, dtype=torch.int32)
         if dense
         else None,
     )
@@ -881,13 +913,24 @@ def test_dense_staging_covers_the_whole_table_and_flat_buffer():
 
 def test_derived_view_exposes_reserved_storage_by_identity():
     gb = _cpu_reserved(CAP_DENSE)
-    view = gb.derived_view(needs_dense=False)
+    view = gb.derived_view(
+        needs=_DEVICE_FORMS, fresh=_fresh(CAP_DENSE, 64, dense=False)
+    )
     assert view.block_tables is None
     assert view.kv_page_indices is gb.kv_page_indices
     assert view.q_seq_lens is gb.q_seq_lens
     assert view.cum_kv_seq_lens is gb.cum_kv_seq_lens
     assert view.kv_page_indptr is gb.kv_page_indptr
-    assert gb.derived_view(needs_dense=True).block_tables is gb.block_tables
+    dense_view = gb.derived_view(
+        needs=_DEVICE_FORMS | {FORM_BLOCK_TABLES},
+        fresh=_fresh(CAP_DENSE, 64, dense=True),
+    )
+    assert dense_view.block_tables is gb.block_tables
+    # unrequested forms are None, never a stale reserved buffer
+    narrow = gb.derived_view(
+        needs={FORM_Q_SEQ_LENS}, fresh=_fresh(CAP_DENSE, 64, dense=False)
+    )
+    assert narrow.q_seq_lens is gb.q_seq_lens and narrow.kv_page_indices is None
 
 
 # ---------------------------------------------------------------------------
