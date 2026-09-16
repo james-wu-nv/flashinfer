@@ -581,6 +581,21 @@ def test_plan_features_outside_the_definition_refuse_to_trace():
 
 
 @cuda_only
+def test_padding_rows_refuse_to_trace():
+    """kv_len == 0 rows are legal padding for plan(), but the definition's
+    constraints require kv_seq_lens >= 1: refuse rather than emit a trace
+    that violates its own constraints."""
+    p = _problem(55)
+    kv0 = p["kv_seq_lens_cpu"].clone()
+    kv0[1] = 0
+    p0 = dict(p, kv_seq_lens_cpu=kv0, kv_seq_lens=kv0.to(p["kv_seq_lens"].device))
+    attn = _plan(p0, "fa2")
+    assert int(attn._trace_context()["kv_seq_lens_cpu"].min()) == 0
+    with pytest.raises(ValueError, match="padding rows"):
+        fi_trace(attn.run, q=p["q"], kv_cache=(p["k_cache"], p["v_cache"]))
+
+
+@cuda_only
 def test_unbound_trace_raises_instead_of_guessing():
     p = _problem(37)
     with pytest.raises(ValueError, match=r"flashinfer\.fi_trace\(attn\.run"):

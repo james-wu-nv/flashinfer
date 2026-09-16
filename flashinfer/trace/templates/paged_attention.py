@@ -323,6 +323,16 @@ def _identity_from_context(ctx: Dict[str, Any]) -> Dict[str, int]:
             + ", which the paged_attention trace definition does not encode yet; "
             "trace a plan without these features"
         )
+    # The definition's constraints require kv_seq_lens >= 1 (its reference
+    # has no padding-row convention), while plan() accepts kv_len == 0 padding
+    # rows; a trace of such a batch would violate its own constraints.
+    kv_cpu = ctx.get("kv_seq_lens_cpu")
+    if kv_cpu is not None and kv_cpu.numel() and int(kv_cpu.min()) == 0:
+        raise ValueError(
+            "Tracing PagedAttention.run: the planned batch contains padding rows "
+            "(kv_len == 0), which the paged_attention trace definition excludes "
+            "(min(kv_seq_lens) >= 1); trace a batch without padding rows"
+        )
     return dict(
         csr=int(ctx["kv_input_form"] == "page_indices"),
         kv_layout=_LAYOUTS.index(ctx["kv_layout"]),
