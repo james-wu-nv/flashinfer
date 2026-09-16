@@ -46,6 +46,10 @@ class PagedAttentionCapabilities:
     supports_lse: bool
     supports_noncausal: bool
     supports_window: bool
+    # True if the backend addresses q as packed THD (token stride == H*D);
+    # False if any view with q.stride(-1) == 1 is addressable (the controller
+    # requires the unit inner stride for everyone).  Measured per backend by
+    # tests/experimental/test_paged_attention_strides.py (NATIVE_Q_OUTCOME).
     requires_contiguous_q: bool
     # KV-cache dtypes; fp8 entries mean "fp8 KV with a fp16/bf16 q" (per-tensor
     # k_scale/v_scale at run()). fp8 q is a separate, undeclared axis.
@@ -165,7 +169,11 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         supports_lse=True,
         supports_noncausal=True,  # bottom_right mask off + padding mask: verified H100
         supports_window=False,  # no sliding window in the cuDNN SDPA graph path
-        requires_contiguous_q=True,  # token-unit offsets assume packed THD
+        # cuDNN builds its graph from q.stride() but scales the token-unit
+        # ragged offsets by num_qo_heads*head_dim, so only packed THD is
+        # addressed correctly: a fused-QKV head slice or a padded head stride
+        # is silently wrong (native probe, B200); a storage offset is fine.
+        requires_contiguous_q=True,
         needs_dense=True,
         lse_native="base2_padded_bsh",
     ),
@@ -182,7 +190,11 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         # vLLM routes non-causal away from trtllm; unverified here, so False.
         supports_noncausal=False,
         supports_window=True,
-        requires_contiguous_q=True,  # TMA: last dim stride 1; keep strict here
+        # The launcher passes q's token and head strides; a fused-QKV head
+        # slice, a padded head stride and a storage offset all match the
+        # oracle (native probe, B200).  Only the unit inner stride is a TMA
+        # requirement, and the controller enforces that for every backend.
+        requires_contiguous_q=False,
         needs_dense=True,
     ),
 }

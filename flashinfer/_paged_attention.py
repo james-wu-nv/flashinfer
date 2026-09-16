@@ -374,8 +374,11 @@ class PagedAttention:
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run the planned batch.
 
-        - ``q``: packed ``(total_q_tokens, num_qo_heads, head_dim_qk)``,
-          dtype as planned.
+        - ``q``: ``(total_q_tokens, num_qo_heads, head_dim_qk)``, dtype as
+          planned, dense along ``head_dim`` (``q.stride(-1) == 1``).  fa2/fa3
+          and trtllm-gen address any such view (e.g. the head slice
+          ``qkv[:, :num_qo_heads]`` of a fused QKV projection); cuDNN needs
+          packed storage and rejects other layouts.  Nothing is copied here.
         - ``kv_cache``: ``(k_cache, v_cache)`` pair, each paged in the planned
           layout — HND ``(pages, num_kv_heads, page_size, head_dim)`` or NHD
           ``(pages, page_size, num_kv_heads, head_dim)``.

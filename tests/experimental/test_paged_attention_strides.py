@@ -382,3 +382,42 @@ def test_run_rejects_foreign_device(backend, which):
             out=tensors["out"],
             lse=tensors["lse"],
         )
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        "fused_qkv_head_slice",
+        "fused_qkv_mid_slice",
+        "head_stride_padded",
+        "storage_offset",
+    ],
+)
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_unified_query_layouts(backend, layout):
+    """Unit-inner-stride views: backends whose capability says any such view
+    is addressable must match the oracle on it (no hidden copy); a backend
+    that needs packed q must reject, not misread (cuDNN, fused-QKV slices)."""
+    from flashinfer.experimental.paged_attention import CAPABILITIES
+
+    p = _problem()
+    attn = _plan(p, backend)
+    q = Q_LAYOUTS[layout](p)
+    assert q.stride(-1) == 1 and torch.equal(q, p["q"])
+    if CAPABILITIES[backend].requires_contiguous_q and not q.is_contiguous():
+        with pytest.raises(ValueError, match="requires packed q"):
+            attn.run(q, (p["k_cache"], p["v_cache"]))
+        return
+    _check_unified(attn, p, q)
+
+
+def test_trtllm_fused_qkv_engine_shape():
+    """The vLLM-style shape the sibling probe measured (32/8 heads, fused QKV):
+    trtllm-gen through the unified API on the strided slice, no copy."""
+    p = _problem(
+        seed=7, batch_size=4, max_q=64, max_kv=512, num_qo_heads=32, num_kv_heads=8
+    )
+    attn = _plan(p, "trtllm-gen")
+    q = q_fused_qkv_head_slice(p)
+    assert tuple(q.stride()) == (48 * 128, 128, 1)
+    _check_unified(attn, p, q)
