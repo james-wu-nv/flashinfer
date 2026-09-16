@@ -13,9 +13,15 @@ and the mask-divergence class from the #3921 review.  A unified API is
 only trustworthy if this property is machine-checked, not promised.
 
 Mechanics:
-- VALID trials: random configs inside the declared capability envelope.
-  The run must succeed AND match the oracle (a capability matrix that
-  admits configs it cannot run fails here — capability honesty).
+- VALID trials: random configs inside the declared capability envelope —
+  every semantic axis is drawn: causal / non-causal, sliding window, LSE
+  base, KV layout, paging form (dense table or flat page ids), fp8 KV, and
+  one optional feature (logits soft cap, custom mask or attention sinks;
+  the FA kernels do not combine sinks with the other two or with fp8 KV, so
+  the sampler never does).  ``resolve_paged_attention`` filters each trial
+  per backend (the capability matrix is the only filter).  The run must
+  succeed AND match the oracle (a capability matrix that admits configs it
+  cannot run fails here — capability honesty).
 - CORRUPTED trials: one mutation applied to a valid config.
     * ``comparable=True`` mutations leave the ground truth well-defined
       (e.g. an under-claimed max): the call may either raise or still
@@ -66,8 +72,19 @@ LSE_TOL = dict(atol=3e-2, rtol=2e-2)
 CLEAN = (ValueError, NotImplementedError, TypeError)
 
 
+# One optional feature per trial: the FA AttentionSink kernel variant has no
+# soft-cap hook and its combination with a custom mask or fp8 KV is not
+# verified, so the facade declines those pairs at plan time; sampling them
+# would make the valid-config test flag a documented exclusion.
+FEATURES = (None, None, None, "soft_cap", "custom_mask", "sinks")
+
+
 def _sample_config(rng: random.Random):
     input_form = rng.choice(["block_tables", "block_tables", "page_indices"])
+    kv_dtype = rng.choice([None, None, torch.float8_e4m3fn])
+    feature = rng.choice(FEATURES)
+    if feature == "sinks" and kv_dtype is not None:
+        feature = None
     return dict(
         batch_size=rng.randint(1, 8),
         max_q=rng.choice([1, 8, 33, 64]),
@@ -77,18 +94,44 @@ def _sample_config(rng: random.Random):
         page_size=rng.choice(
             [16, 32, 64] + ([1] if input_form == "page_indices" else [])
         ),
-        causal=True,
+        causal=rng.choice([True, True, False]),
         dtype=rng.choice([torch.bfloat16, torch.bfloat16, torch.float16]),
         kv_layout=rng.choice(["HND", "HND", "NHD"]),
         window_left=rng.choice([-1, -1, -1, 16]),
         input_form=input_form,
         lse_mode=rng.choice(["base2", "base2", "basee"]),
-        kv_dtype=rng.choice([None, None, torch.float8_e4m3fn]),
+        kv_dtype=kv_dtype,
+        logits_soft_cap=30.0 if feature == "soft_cap" else None,
+        custom_mask=feature == "custom_mask",
+        sinks=feature == "sinks",
+    )
+
+
+def _random_custom_mask(p, seed):
+    """Flattened per-request masks (the legacy layout) with the bottom-right
+    diagonal kept allowed, so no query row is fully masked (a fully masked
+    row has backend-divergent LSE semantics and nothing to compare)."""
+    g = torch.Generator().manual_seed(seed)
+    parts = []
+    for i in range(p["kv_seq_lens_cpu"].shape[0]):
+        lq = int(p["qo_indptr_cpu"][i + 1] - p["qo_indptr_cpu"][i])
+        lkv = int(p["kv_seq_lens_cpu"][i])
+        m = torch.rand(lq, lkv, generator=g) < 0.7
+        qpos = torch.arange(lq).unsqueeze(1) + (lkv - lq)
+        m |= torch.arange(lkv).unsqueeze(0) == qpos
+        parts.append(m.flatten())
+    return torch.cat(parts).to(p["device"])
+
+
+def _sinks(p, seed):
+    g = torch.Generator().manual_seed(seed)
+    return (torch.rand(p["num_qo_heads"], generator=g) * 5).to(
+        device=p["device"], dtype=torch.float32
     )
 
 
 def _build(seed, cfg):
-    return make_problem(
+    p = make_problem(
         seed=seed,
         batch_size=cfg["batch_size"],
         max_q=cfg["max_q"],
@@ -102,22 +145,40 @@ def _build(seed, cfg):
         input_form=cfg["input_form"],
         kv_dtype=cfg.get("kv_dtype"),
     )
+    if cfg.get("logits_soft_cap") is not None:
+        p["q"] = p["q"] * 4  # push the scores toward the cap so the tanh matters
+    p["custom_mask"] = _random_custom_mask(p, seed) if cfg.get("custom_mask") else None
+    p["sinks"] = _sinks(p, seed) if cfg.get("sinks") else None
+    return p
 
 
-def _backend_runnable(p, backend, causal, window_left=-1):
+def _features(p, cfg):
+    return dict(
+        logits_soft_cap=cfg.get("logits_soft_cap"),
+        custom_mask=p.get("custom_mask"),
+        sinks=p.get("sinks"),
+    )
+
+
+def _backend_runnable(p, backend, cfg, window_left=None):
+    """The capability matrix's verdict for this trial (resolve-time filter)."""
     try:
         resolve_paged_attention(
             device=torch.device(p["device"]),
             num_qo_heads=p["num_qo_heads"],
             num_kv_heads=p["num_kv_heads"],
             head_dim_qk=p["head_dim_qk"],
+            head_dim_vo=p["head_dim_vo"],
             q_dtype=p["dtype"],
             kv_dtype=p.get("kv_dtype"),
             page_size=p["page_size"],
             kv_layout=p.get("kv_layout", "HND"),
-            causal=causal,
+            causal=cfg["causal"],
             need_lse=True,
-            window_left=window_left,
+            window_left=cfg["window_left"] if window_left is None else window_left,
+            logits_soft_cap=cfg.get("logits_soft_cap"),
+            custom_mask=bool(cfg.get("custom_mask")),
+            sinks=bool(cfg.get("sinks")),
             kv_input_form=(
                 "page_indices"
                 if p.get("input_form") == "page_indices"
@@ -377,12 +438,34 @@ MUTATIONS = [
 # documented trusted inputs: expected to fail reject-or-correct today
 KNOWN_GAP_MUTATIONS = {"block_tables_negative"}
 
+# mutations that corrupt the dense table itself: the call must READ that
+# table, so these trials are pinned to the dense form (page_size >= 8)
+DENSE_TABLE_MUTATIONS = {
+    "kv_lens_exceed_capacity",
+    "block_tables_1d",
+    "block_tables_negative",
+    "block_tables_row_stride_view",
+}
 
-def _run_and_check(p, backend, causal, repro, window_left=-1, lse_mode="base2"):
-    """Run one call and enforce reject-or-correct against the TRUE oracle."""
+
+def _run_and_check(p, backend, cfg, repro, window_left=None):
+    """Run one call and enforce reject-or-correct against the TRUE oracle.
+
+    ``cfg`` carries the sampled semantics (causal, window, LSE base, feature);
+    ``window_left`` overrides the sampled window (mutation).
+    """
+    causal, lse_mode = cfg["causal"], cfg.get("lse_mode", "base2")
+    if window_left is None:
+        window_left = cfg["window_left"]
+    features = _features(p, cfg)
     try:
         _, out, lse = run_unified(
-            p, backend, causal=causal, window_left=window_left, lse_mode=lse_mode
+            p,
+            backend,
+            causal=causal,
+            window_left=window_left,
+            lse_mode=lse_mode,
+            **features,
         )
     except CLEAN as e:
         assert str(e), f"empty error message is not a clean rejection [{repro}]"
@@ -400,6 +483,7 @@ def _run_and_check(p, backend, causal, repro, window_left=-1, lse_mode="base2"):
         kv_layout=p.get("kv_layout", "HND"),
         kv_page_indices=p.get("kv_page_indices"),
         lse_base="e" if lse_mode == "basee" else "2",
+        **features,
     )
     torch.testing.assert_close(
         out.float(),
@@ -426,18 +510,11 @@ def test_fuzz_valid_configs(backend):
         rng = random.Random(seed)
         cfg = _sample_config(rng)
         p = _build(seed, cfg)
-        if not _backend_runnable(p, backend, cfg["causal"], cfg["window_left"]):
+        if not _backend_runnable(p, backend, cfg):
             filtered += 1
             continue
         repro = f"backend={backend} seed={seed} cfg={cfg}"
-        outcome, _ = _run_and_check(
-            p,
-            backend,
-            cfg["causal"],
-            repro,
-            window_left=cfg["window_left"],
-            lse_mode=cfg.get("lse_mode", "base2"),
-        )
+        outcome, _ = _run_and_check(p, backend, cfg, repro)
         assert outcome == "correct", (
             f"valid config was rejected — capability matrix admits a config "
             f"the backend cannot run [{repro}]"
@@ -467,20 +544,17 @@ def test_fuzz_reject_or_correct(backend, mutation):
     for trial in range(n_trials):
         seed = 20_000 + trial
         rng = random.Random(seed)
-        cfg = _sample_config(rng)
+        cfg = _sample_config(rng)  # layout, form, causal, window, LSE, feature
         cfg["batch_size"] = max(cfg["batch_size"], 3)
-        cfg["kv_layout"], cfg["input_form"], cfg["window_left"] = (
-            "HND",
-            "block_tables",
-            -1,
-        )
-        cfg["page_size"] = max(cfg["page_size"], 16)
+        if name in DENSE_TABLE_MUTATIONS:
+            cfg["input_form"] = "block_tables"
+            cfg["page_size"] = max(cfg["page_size"], 16)
         p = _build(seed, cfg)
-        if not _backend_runnable(p, backend, cfg["causal"]):
+        if not _backend_runnable(p, backend, cfg):
             filtered += 1
             continue
         mutated = mutate(p)
-        wl = mutated.get("_window_left_override", -1)
+        wl = mutated.get("_window_left_override", cfg["window_left"])
         repro = f"backend={backend} seed={seed} mutation={name} cfg={cfg}"
         if comparable:
             # ground truth is still the TRUE problem `p`; hand the oracle the
@@ -492,14 +566,19 @@ def test_fuzz_reject_or_correct(backend, mutation):
                 if mutation != "q_noncontig"
                 else mutated["kv_seq_lens_cpu"]
             )
-            outcome, _ = _run_and_check(
-                merged, backend, cfg["causal"], repro, window_left=wl
-            )
+            outcome, _ = _run_and_check(merged, backend, cfg, repro, window_left=wl)
             assert outcome in ("rejected", "correct")
             outcomes[outcome] += 1
         else:
             try:
-                run_unified(mutated, backend, causal=cfg["causal"], window_left=wl)
+                run_unified(
+                    mutated,
+                    backend,
+                    causal=cfg["causal"],
+                    window_left=wl,
+                    lse_mode=cfg["lse_mode"],
+                    **_features(mutated, cfg),
+                )
             except CLEAN as e:
                 assert str(e), f"empty error message [{repro}]"
                 outcomes["rejected"] += 1
@@ -520,3 +599,39 @@ def test_fuzz_reject_or_correct(backend, mutation):
     )
     if checked == 0:
         pytest.skip(f"no runnable trial for backend {backend}")
+
+
+# ---------------------------------------------------------------------------
+# Deterministic oracle test for the declared fa2 row the sampler cannot
+# guarantee to draw: non-causal attention with a sliding window (trtllm-gen
+# and cake declare no kernel for it and must be filtered, not run).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("input_form", ["block_tables", "page_indices"])
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+def test_fa2_noncausal_sliding_window_matches_oracle(kv_layout, input_form):
+    cfg = dict(
+        batch_size=4,
+        max_q=33,
+        max_kv=300,
+        heads=(8, 2),
+        page_size=16,
+        causal=False,
+        dtype=torch.bfloat16,
+        kv_layout=kv_layout,
+        window_left=16,
+        input_form=input_form,
+        lse_mode="basee",
+    )
+    p = _build(31_000, cfg)
+    if not _backend_runnable(p, "fa2", cfg):
+        pytest.skip("fa2 non-causal + sliding window not runnable on this GPU")
+    repro = f"backend=fa2 seed=31000 cfg={cfg}"
+    outcome, detail = _run_and_check(p, "fa2", cfg, repro)
+    assert outcome == "correct", f"fa2 rejected a declared row: {detail} [{repro}]"
+    for backend in ("trtllm-gen", "cake"):
+        assert not _backend_runnable(p, backend, cfg), (
+            f"{backend} declares supports_window_noncausal=False but resolve() "
+            "admits non-causal + sliding window"
+        )
