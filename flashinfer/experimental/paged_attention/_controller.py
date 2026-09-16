@@ -434,8 +434,10 @@ class PagedAttentionController:
         # (total_q_tokens, max_kv_len).
         explicit = isinstance(backend, str) and backend != "auto"
         gb: Optional[GraphBuffers] = None
+        # no instance plans under capture: an eager plan would bake this
+        # batch's uploads and a fresh backend plan into the caller's graph
+        _expect_not_capturing("plan()")
         if self._use_cuda_graph:
-            _expect_not_capturing("plan()")
             # Graph mode: backends only ever see the reserved storage, so the
             # pointers a captured graph baked in stay valid across re-plans.
             # The buffers stay a local until publication below: a first plan
@@ -721,6 +723,15 @@ class PagedAttentionController:
                 t.dtype == m.kv_dtype,
                 f"{name} dtype {t.dtype} != planned {m.kv_dtype}",
             )
+            # Same ABI as q below: the bindings pass page/head/token strides
+            # only, so a non-unit head_dim stride would be silently misread.
+            _expect(
+                t.stride(-1) == 1,
+                f"{name} must be dense along head_dim (stride(-1) == 1), got "
+                f"strides {tuple(t.stride())} — the kernels address the KV pool "
+                "by page/head/token stride only; pass a view whose last dim is "
+                "unit-stride or a packed copy",
+            )
         _expect(
             q.dim() == 3, "q must be packed (total_q_tokens, num_qo_heads, head_dim)"
         )
@@ -761,13 +772,15 @@ class PagedAttentionController:
         )
         cap = CAPABILITIES[self._backend_name]
         if cap.requires_contiguous_q and not q.is_contiguous():
+            strided = [
+                n for n, c in CAPABILITIES.items() if not c.requires_contiguous_q
+            ]
             raise ValueError(
                 f"backend {self._backend_name!r} requires packed q, got strides "
-                f"{tuple(q.stride())}: it addresses each request by token-unit "
-                "ragged offsets scaled by num_qo_heads*head_dim, so a head slice "
-                "of a fused QKV buffer (token stride > H*D) is misaddressed — "
-                "pass a packed (T, H, D) copy or pin a strided-capable backend "
-                "(fa2/fa3/trtllm-gen)"
+                f"{tuple(q.stride())}: its kernel reads q as a packed (T, H, D) "
+                "array, so a head slice of a fused QKV buffer (token stride > H*D) "
+                "is misaddressed — pass a packed copy or pin a strided-capable "
+                f"backend ({'/'.join(strided)})"
             )
         if out is not None:
             _expect(

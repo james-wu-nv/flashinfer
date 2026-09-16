@@ -443,8 +443,9 @@ class PagedAttention:
           for padding rows (``kv_len_i == 0``, see
           :class:`PagedAttentionMetadata`): those are legal, read no KV page,
           and produce a finite output row; the row's output values and its
-          LSE are unspecified by contract (every current backend writes a
-          zero row and an LSE of -inf).
+          LSE are unspecified by contract (fa2/fa3, cuDNN and trtllm-gen
+          write a zero row and an LSE of -inf; cake declines such batches
+          with the typed signal because its kernel hangs on an empty KV range).
         - ``window_left``: sliding-window size (-1 = unlimited); backends
           without window support are capability-excluded.  Plan-time because
           it selects a compiled kernel variant on the FA backends.
@@ -568,8 +569,9 @@ class PagedAttention:
         num_qo_heads)`` fp32 in the planned base — identical for every backend
         (``None`` when ``lse_mode="none"``).  Rows of padding requests
         (``kv_len == 0``) hold a finite output row; their output values and
-        their LSE are unspecified by contract (every current backend writes a
-        zero row and an LSE of -inf); exclude them when consuming the LSE.
+        their LSE are unspecified by contract (fa2/fa3, cuDNN and trtllm-gen
+        write a zero row and an LSE of -inf; cake declines such batches at
+        plan time); exclude them when consuming the LSE.
 
         Tracing: ``flashinfer.fi_trace(attn.run, q=q, kv_cache=(k, v))`` on a
         planned instance (or ``FLASHINFER_TRACE_DUMP=1`` during ``run()``)
