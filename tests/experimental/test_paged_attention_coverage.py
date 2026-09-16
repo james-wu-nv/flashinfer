@@ -477,10 +477,11 @@ def test_tc02_graph_bakes_the_captured_sm_scale(backend):
 # TC09 — contract rejections (field-level ValueError before launch)
 # ---------------------------------------------------------------------------
 
-# Flip to True when WP-C lands the zero-row contract (ledger M11): a request
-# with kv_len == 0 then becomes a legal padding row whose output is finite and
-# whose neighbours are unaffected (see test_tc09_zero_kv_row).
-ZERO_KV_ROWS_ARE_LEGAL = False
+# The zero-row contract (ledger M11): a request with kv_len == 0 is a legal
+# padding row whose output is finite and whose neighbours are unaffected (see
+# test_tc09_zero_kv_row).  Kept as a switch so the pre-contract behaviour can
+# still be exercised against an older branch.
+ZERO_KV_ROWS_ARE_LEGAL = True
 
 
 def _legal(seed=900, **over):
@@ -614,8 +615,8 @@ def test_tc09_metadata_rejections(label, mutate, match):
 
 
 def test_tc09_zero_kv_row():
-    """kv_len == 0 rows: rejected under the v1 envelope today; WP-C (ledger
-    M11) makes them legal padding rows.  Flip ``ZERO_KV_ROWS_ARE_LEGAL``."""
+    """kv_len == 0 rows are legal padding rows (ledger M11): finite output,
+    neighbours unaffected."""
     p = _legal(seed=901)
     kv0 = p["kv_seq_lens_cpu"].clone()
     kv0[1] = 0
@@ -800,19 +801,7 @@ def test_tc09_legal_inputs_are_not_rejected(backend):
 _WIDE_TABLE_BACKENDS = [
     "fa2",
     "fa3",
-    pytest.param(
-        "cudnn",
-        marks=pytest.mark.xfail(
-            strict=True,
-            raises=(RuntimeError, AssertionError),
-            reason="ledger M8; WP-B: cuDNN requires block_tables width == "
-            "ceil(max_kv_len / page_size).  A wider (persistent, vLLM-style) "
-            "table fails with CUDNN_STATUS_BAD_PARAM when the graph is built "
-            "fresh, and returns WRONG NUMBERS when a cached graph built for the "
-            "narrow width is reused (the cache key omits the table width); the "
-            "backend must take the [:, :ceil(max_kv/page)] view internally",
-        ),
-    ),
+    "cudnn",
     "trtllm-gen",
     "auto",
 ]
@@ -1023,13 +1012,6 @@ def test_tc03_page_and_window_edges(backend, form, page, window):
         assert torch.equal(lse, lse_b), "dense vs CSR LSE differ"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="ledger M1; WP-A: graph mode reserves a dense (batch, ceil(max_kv/page)) "
-    "table for CSR input even when no candidate backend needs it (fa-only at "
-    "page_size 1), which blows up with the context length",
-)
 def test_tc03_graph_mode_csr_page1_reserves_no_dense_table():
     p = build_problem(
         [3, 5],
@@ -1241,14 +1223,6 @@ def _tc05_params():
                 backend,
                 "q_last_dim_stride2",
                 id=f"{backend}-q_last_dim_stride2",
-                marks=[
-                    _m8(
-                        "fa2/fa3 accept q.stride(-1) == 2 (the native binding only "
-                        "passes token/head strides) and compute wrong numbers"
-                    )
-                ]
-                if backend in ("fa2", "fa3")
-                else [],
             )
         )
         rows.append(
@@ -1256,22 +1230,6 @@ def _tc05_params():
                 backend,
                 "page_table_narrow_view",
                 id=f"{backend}-page_table_narrow_view",
-                marks=[
-                    _m8(
-                        "trtllm-gen reads a block_tables view whose row stride "
-                        "differs from its width and computes wrong numbers"
-                    )
-                ]
-                if backend == "trtllm-gen"
-                else [
-                    _m8(
-                        "the cuDNN graph cache key omits block_tables shape and "
-                        "strides, so a graph built for a contiguous table is "
-                        "replayed on the strided view and computes wrong numbers"
-                    )
-                ]
-                if backend == "cudnn"
-                else [],
             )
         )
         rows.append(
@@ -1279,7 +1237,6 @@ def _tc05_params():
                 backend,
                 "k_cache_on_cpu",
                 id=f"{backend}-k_cache_on_cpu",
-                marks=[_m8("the K/V device is not validated against the plan device")],
             )
         )
     return rows
@@ -1303,7 +1260,8 @@ def test_tc05_strided_inputs(backend, case):
     there; other backends may reject (ValueError) but must never return wrong
     numbers.  Storage offsets are legal everywhere.  Inner-dim stride 2, a
     narrow page-table view and a K cache on the wrong device must be
-    rejected-or-correct; the recorded xfails are where they are not."""
+    rejected-or-correct, at plan or at run; the recorded xfail is where a
+    backend is not."""
     p = build_problem(
         [6, 1, 19],
         [40, 9, 70],
@@ -1362,7 +1320,12 @@ def test_tc05_strided_inputs(backend, case):
         raise AssertionError(case)
 
     p2 = dict(p, q=q, k_cache=k, v_cache=v, k_ref=k.to(dev), v_ref=v, block_tables=bt)
-    attn = plan(PagedAttention(dev), p2, backend)
+    try:
+        attn = plan(PagedAttention(dev), p2, backend)
+    except ValueError as e:  # rejected at plan time (before any state moved)
+        assert not required, f"{backend} rejected a supported strided input: {e}"
+        assert str(e)
+        return
     if case == "k_cache_on_cpu":
         _blocking_spy(attn)
         with pytest.raises(ValueError):
