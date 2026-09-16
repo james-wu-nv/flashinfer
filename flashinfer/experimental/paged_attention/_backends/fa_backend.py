@@ -171,6 +171,8 @@ class _FaBackend:
         # wrappers are built on first use and kept alongside it.
         self._wrapper = self._make_wrapper(None)
         self._sink_wrappers: Dict[Tuple, Any] = {}
+        # per wrapper: the stream point after its last schedule upload (see plan)
+        self._upload_events: Dict[int, torch.cuda.Event] = {}
         self._active = self._wrapper
         self._lse_mode = "none"
         self._use_sinks = False
@@ -445,6 +447,17 @@ class _FaBackend:
                 self._sink_wrappers[key] = wrapper
         else:
             wrapper = self._wrapper
+        # The wrapper's C++ plan writes the kernel schedule into ONE pinned
+        # host buffer of its own and uploads it with an asynchronous copy on
+        # the current stream.  Rewriting that host buffer before the previous
+        # upload executed would hand the earlier enqueued — or captured and
+        # replayed — run the later batch's schedule (request/tile indices,
+        # merge offsets), silently.  Wait for the previous upload first: a
+        # query when the GPU has passed it (the common case), a bounded wait
+        # when the host runs more than one step ahead of the device.
+        upload = self._upload_events.get(id(wrapper))
+        if upload is not None and not upload.query():
+            upload.synchronize()
         # Host arrays: pinned views the derivation layer already computed, so
         # nothing is allocated or derived here and every upload the wrapper
         # issues from them is asynchronous.  seq_lens= and
@@ -471,6 +484,9 @@ class _FaBackend:
             seq_lens=derived.require("kv_seq_lens_host"),
             max_token_per_sequence=meta.max_q_len,
         )
+        if upload is None:
+            upload = self._upload_events[id(wrapper)] = torch.cuda.Event()
+        upload.record(torch.cuda.current_stream(self._device))
         # publish only after the wrapper's plan returned
         self._active = wrapper
         self._lse_mode = meta.lse_mode
