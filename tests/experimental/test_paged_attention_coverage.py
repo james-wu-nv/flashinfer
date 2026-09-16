@@ -1239,6 +1239,12 @@ def _tc05_params():
                 id=f"{backend}-k_cache_on_cpu",
             )
         )
+    # backend="auto" must route a narrow table view past trtllm-gen (which
+    # declines it with the typed signal) to a backend that walks the table by
+    # its strides, and the result must be correct
+    rows.append(
+        pytest.param("auto", "page_table_narrow_view", id="auto-page_table_narrow_view")
+    )
     return rows
 
 
@@ -1314,6 +1320,7 @@ def test_tc05_strided_inputs(backend, case):
         wide[:, :w] = bt
         bt = wide[:, :w]
         assert bt.stride(0) == 2 * w
+        required = backend == "auto"
     elif case == "k_cache_on_cpu":
         k = k.cpu()
     else:  # pragma: no cover
