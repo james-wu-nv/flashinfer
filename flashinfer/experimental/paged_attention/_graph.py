@@ -285,8 +285,13 @@ class GraphBuffers:
     def targets(
         self, metadata: PagedAttentionMetadata, fresh: Derived
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-        """(reserved destination, source) pairs for one re-plan."""
-        pairs = [
+        """(reserved destination, source) pairs for one re-plan.
+
+        A derived form the chosen backend did not ask for may be ``None`` in
+        ``fresh`` (derivation is per-backend demand); such a form is simply
+        not staged — its reserved buffer keeps stale contents nobody reads.
+        """
+        pairs: List[Tuple[torch.Tensor, Optional[torch.Tensor]]] = [
             (self.qo_indptr, metadata.qo_indptr),
             (self.kv_seq_lens, metadata.kv_seq_lens),
             (self.q_seq_lens, fresh.q_seq_lens),
@@ -302,7 +307,7 @@ class GraphBuffers:
             if fresh.block_tables is not None:
                 assert self.block_tables is not None  # reserve_dense_table() ran
                 pairs.append((self.block_tables, fresh.block_tables))
-        return pairs
+        return [(dst, src) for dst, src in pairs if src is not None]
 
     def derived_view(self, *, needs_dense: bool) -> Derived:
         return Derived(

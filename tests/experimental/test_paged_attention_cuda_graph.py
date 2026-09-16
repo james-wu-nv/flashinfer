@@ -1039,3 +1039,18 @@ def test_plan_and_update_during_capture_raise():
     ref_out, ref_lse = _reference(p)
     torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
     torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+
+def test_targets_skip_derived_forms_not_produced():
+    """Derivation is per-backend demand: a form the chosen backend did not
+    request may be None in the fresh Derived, and staging must skip it rather
+    than copy None into the reserved buffer."""
+    p = make_problem(seed=68, **_SHAPE)
+    md = make_metadata(p)
+    gb = GraphBuffers(GraphCapacity.from_metadata(md), torch.device(p["device"]))
+    fresh = md.derived(needs_dense=True, max_kv_len=gb.capacity.max_kv_len)
+    full = gb.targets(md, fresh)
+    partial = gb.targets(md, dataclasses.replace(fresh, q_seq_lens=None))
+    assert len(partial) == len(full) - 1
+    assert all(src is not None for _, src in partial)
+    assert not any(dst is gb.q_seq_lens for dst, _ in partial)
