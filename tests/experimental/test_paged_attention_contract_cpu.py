@@ -557,7 +557,11 @@ _HOST_ROWS = [
     ("valid-csr-exact", dict(csr=3 + 2 + 3), None),
     ("valid-csr-overallocated", dict(csr=300), None),
     ("csr-too-short", dict(csr=7), "kv_page_indices has 7 entries"),
-    ("indptr-not-increasing", dict(qo=[0, 4, 4, 9]), "strictly increasing"),
+    ("q-zero-padding-row", dict(qo=[0, 4, 4, 8]), None),  # legal (ledger M17)
+    ("q-zero-and-kv-zero-row", dict(qo=[0, 4, 4, 8], kv=[10, 0, 9]), None),
+    ("q-zero-row-causal", dict(qo=[0, 4, 4, 8], causal=True), None),
+    ("indptr-decreasing", dict(qo=[0, 5, 4, 9]), "non-decreasing"),
+    ("all-q-zero", dict(qo=[0, 0, 0, 0]), "at least one query token"),
     ("indptr-not-from-zero", dict(qo=[1, 4, 6, 9]), r"qo_indptr\[0\] must be 0"),
     ("max-q-underclaim", dict(max_q_len=2), r"max_q_len \(2\) is smaller"),
     ("kv-zero-padding-row", dict(kv=[10, 0, 9]), None),  # legal padding row

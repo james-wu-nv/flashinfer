@@ -593,8 +593,9 @@ has `batch_size + 1` entries; `block_tables` has `batch_size` rows; the page
 size respects the dense floor; `max_q_len` and `max_kv_len` are positive host
 ints; `max_kv_len` fits the table capacity.
 
-`validate_values` (always runs, from the mirrors): `q_len >= 1` for every
-request; `qo_indptr[0] == 0`; the longest query is at most `max_q_len`;
+`validate_values` (always runs, from the mirrors): `qo_indptr` is
+non-decreasing (`q_len == 0` is a padding row) and the batch holds at least
+one query token; `qo_indptr[0] == 0`; the longest query is at most `max_q_len`;
 `kv_seq_lens >= 0`; the longest KV is at most `max_kv_len` and the table
 capacity; the flat page-id list covers `sum(ceil(kv_len / page_size))`
 entries. `validate_causal_envelope` (only with `causal=True`) requires
@@ -670,8 +671,7 @@ with the constraint named.
 
 `kv_seq_lens[i] == 0` is legal and marks a padding row (vLLM's CUDA-graph
 padding fills `seq_lens` with 0 and the table row with its null block;
-SGLang's fill value 1 is an ordinary live row). The query length of a padding
-row must still be at least 1. The library guarantees that no page of that row
+SGLang's fill value 1 is an ordinary live row). The library guarantees that no page of that row
 is read, that the output row is finite, and that every other row is
 unchanged; the row's output values and LSE are unspecified by contract. Every
 current backend writes a zero output row and an LSE of `-inf`, measured on
@@ -684,8 +684,22 @@ a live in-pool id that no kernel reads for that row. Padding rows can be
 toggled live/padding across graph re-plans
 (`tests/experimental/test_paged_attention_cuda_graph.py::test_replan_toggles_padding_rows`).
 
-`q_len == 0` rows remain rejected at metadata construction (ledger M17; see
-Known limitations).
+`q_len == 0` rows (`qo_indptr[i] == qo_indptr[i + 1]`, vLLM's padded
+`query_start_loc` tail) are legal as well (ledger M17). Such a row owns no
+query token and no output row, so there is nothing unspecified about it; the
+contract is that every other row is unchanged. Measured on B200 with the
+native calls (`wp-n.md`): fa2 (CSR planner), cuDNN (`actual_seq_lens_q = 0`
+with a repeated `batch_offsets_q`), trtllm-gen and cake (a repeated
+`cum_seq_lens_q` value) all accept a q_len 0 row in the middle or at the tail,
+with `kv_len > 0` or `kv_len == 0`, and leave the other rows exact; cake's
+`kv_len == 0` hang (M19) is the only exception and its preflight declines
+that batch. `qo_indptr` must be non-decreasing and the batch must hold at
+least one query token. One backend-side consequence: cuDNN's `max_q_len == 1`
+LSE shortcut (the padded `(b, 1, h)` stats read as the packed `(b, h)`
+buffer) holds only while every request has exactly one token, so it is taken
+in eager mode only and only when `total_q_tokens == batch_size`; graph-mode
+decode buckets use the gather path
+(`tests/experimental/test_paged_attention_cuda_graph.py::test_decode_bucket_replan_with_zero_q_tail_rows`).
 
 ## Output and LSE contract
 
@@ -840,7 +854,6 @@ because the controller, not the backend, owns the reserved storage.
 | M14 | The 128 MiB shared default workspace overflows the fa2 split-KV planner on a single 2048-token request with 32 heads. | WP-I adds `workspace_requirements()`; pass the engine's buffer meanwhile. |
 | M15 | `flashinfer/cudnn/decode.py` keeps the older graph-cache key and decorator order that the prefill path fixed. | Out of this package; recorded. |
 | M16 | trtllm-gen and cake compute silently wrong results when the V cache's page stride differs from the K cache's (independently allocated pools); cuDNN and fa2 are correct. | Rejected at `run()` in the trtllm-gen backend (a `ValueError` naming the stride constraint); `tests/experimental/test_paged_attention_coverage.py::test_tc05_strided_inputs[trtllm-gen-kv_independent_strides]` pins it. |
-| M17 | `q_len == 0` rows are rejected at metadata construction, while vLLM's decode-graph padding produces them. | Needs a per-backend native probe before the contract is relaxed. |
 | M18 | Cake raises "prewarm each Cake FMHA tensor/layout binding before CUDA Graph capture" when a new tensor binding first appears inside capture (the benchmark's cold-L2 rotating buffers). | Needs a prewarm at plan or first run, or a capability entry. |
 | — | `auto` is a static order. On SM100 it picks trtllm-gen for a decode-shaped batch (B=32, q=1, kv=4096) that fa2 runs about five times faster in the benchmark smoke run. | Shape-bucket order table is wave-2 work; the benchmark's `resolved_backend` column shows the regret. |
 | — | `custom_mask` with graph mode raises `ValueError`: the FA wrapper's packed-mask storage is not part of `GraphCapacity`. | Follow-up. |

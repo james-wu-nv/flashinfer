@@ -522,9 +522,17 @@ def _md_rows():
             "batch size must be >= 1",
         ),
         (
-            "q_len0",
-            lambda p: _with_indptr(p, torch.tensor([0, 4, 4, 14], dtype=torch.int32)),
-            "strictly increasing",
+            "indptr_decreasing",
+            lambda p: _with_indptr(p, torch.tensor([0, 5, 4, 14], dtype=torch.int32)),
+            "non-decreasing",
+        ),
+        (
+            "all_q_len0",
+            lambda p: dict(
+                _with_indptr(p, torch.zeros(4, dtype=torch.int32)),
+                q=p["q"][:0],
+            ),
+            "at least one query token",
         ),
         (
             "indptr_not_from_zero",
@@ -656,6 +664,79 @@ def test_tc09_zero_kv_row():
     torch.testing.assert_close(lse[keep], ref_lse, **LSE_TOL)
 
 
+def _drop_query_rows(p, request, *, kv_zero):
+    """Request ``request`` of a build_problem() batch becomes a q_len 0 row
+    (its query tokens are removed from ``q``; ``kv_zero`` also zeroes its KV
+    length, vLLM's padded tail row).  Returns the problem and the compacted
+    problem without that request, the oracle for the remaining rows."""
+    qo = p["qo_indptr_cpu"]
+    s, e = int(qo[request]), int(qo[request + 1])
+    keep = torch.cat([torch.arange(0, s), torch.arange(e, int(qo[-1]))])
+    q_lens = qo.diff().clone()
+    q_lens[request] = 0
+    new_qo = torch.cat(
+        [torch.zeros(1, dtype=torch.int32), torch.cumsum(q_lens, 0, dtype=torch.int32)]
+    )
+    kv = p["kv_seq_lens_cpu"].clone()
+    if kv_zero:
+        kv[request] = 0
+    p0 = dict(
+        _with_kv_lens(_with_indptr(p, new_qo), kv),
+        q=p["q"][keep.to(p["device"])],
+        max_q_len=int(q_lens.max()),
+    )
+    others = [i for i in range(qo.shape[0] - 1) if i != request]
+    kept_lens = q_lens[others]
+    compact = dict(
+        p,
+        q=p0["q"],
+        qo_indptr_cpu=torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32),
+                torch.cumsum(kept_lens, 0, dtype=torch.int32),
+            ]
+        ),
+        kv_seq_lens_cpu=p["kv_seq_lens_cpu"][others],
+        block_tables=p["block_tables"][others],
+        max_q_len=int(kept_lens.max()),
+    )
+    compact["qo_indptr"] = compact["qo_indptr_cpu"].to(p["device"])
+    compact["kv_seq_lens"] = compact["kv_seq_lens_cpu"].to(p["device"])
+    return p0, compact
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("kv_zero", [False, True], ids=["kv_live", "kv_zero"])
+def test_tc09_zero_q_row(backend, kv_zero):
+    """q_len == 0 rows are legal (ledger M17): request 1 owns no query token
+    (``kv_zero``: and no KV either, vLLM's padded query_start_loc tail).  The
+    remaining rows equal the same batch without request 1.  Measured
+    natively on B200 for fa2, cuDNN, trtllm-gen and cake before the contract
+    was relaxed; cake declines the kv_len 0 batch (M19) and auto moves on."""
+    p0, compact = _drop_query_rows(_legal(seed=903), 1, kv_zero=kv_zero)
+    assert int(p0["qo_indptr_cpu"][1]) == int(p0["qo_indptr_cpu"][2])
+    _resolve_or_skip(p0, backend)
+    md = make_metadata(p0)
+    kw = dict(
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        q_dtype=torch.bfloat16,
+        causal=True,
+        lse_mode="base2",
+    )
+    if backend == "cake" and kv_zero:
+        with pytest.raises(ValueError, match="kv_len == 0"):
+            PagedAttention(torch.device(DEVICE)).plan(md, backend=backend, **kw)
+        return
+    attn = PagedAttention(torch.device(DEVICE)).plan(md, backend=backend, **kw)
+    out, lse = run(attn, p0)
+    ref_out, ref_lse = reference(compact, causal=True)
+    assert out.shape[0] == ref_out.shape[0] == int(p0["qo_indptr_cpu"][-1])
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+
 def test_tc09_zero_kv_row_cake_declines():
     """ledger M19: the cake kernel hangs on a kv_len == 0 request, so cake
     declines padding rows with the typed signal — auto never lands on it and
@@ -679,7 +760,12 @@ def test_tc09_zero_kv_row_cake_declines():
     attn = PagedAttention(torch.device(DEVICE)).plan(md, backend="auto", **kw)
     assert attn.backend != "cake"
     out, _ = run(attn, p0)
-    assert torch.isfinite(out).all()
+    # The padding row's output is not asserted finite here: on SM100 auto
+    # lands on trtllm-gen, which leaves a kv_len 0 row's output rows
+    # unwritten (measured on B200 with a NaN-poisoned allocation; fa2 and
+    # cuDNN write zeros), so that assertion held by allocator luck only.
+    # The live rows are pinned by test_tc09_zero_kv_row.
+    assert out.shape[0] == int(p0["qo_indptr_cpu"][-1])
 
 
 _PLAN_ROWS = [

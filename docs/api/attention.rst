@@ -213,7 +213,8 @@ One :class:`~flashinfer.prefill.PagedAttentionMetadata` object per scheduler
 step (token-unit ``qo_indptr``, per-request ``kv_seq_lens``, a dense block
 table via ``.dense(...)`` or flat page ids via ``.csr(...)``, required host
 maxes, optional CPU mirrors for a zero-sync plan; a ``kv_seq_lens`` entry of 0
-marks a padding row); :func:`resolve_paged_attention` answers at engine init
+marks a padding row, and a request with ``q_len == 0`` is legal too);
+:func:`resolve_paged_attention` answers at engine init
 which backends can run a configuration and why the others cannot; ``plan()``
 declares the LSE base (``lse_mode``) and the feature axes (``window_left``,
 ``logits_soft_cap``, ``custom_mask``, ``use_sinks``), each capability-checked
