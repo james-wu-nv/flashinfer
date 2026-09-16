@@ -804,8 +804,11 @@ ones the planned kernels read (the reserved storage in graph mode), and the
 flat form traces the live prefix of the plan's own page-id list even when
 the chosen backend read a derived dense table. A plan that uses
 `logits_soft_cap`, a custom mask or sinks refuses to trace, because the
-definition does not encode them yet. Tracing before the first successful
-plan or through the unbound `PagedAttention.run.fi_trace(...)` raises.
+definition does not encode them yet; so does a planned batch that contains
+padding rows (`kv_len == 0`), because the definition constrains
+`min(kv_seq_lens) >= 1` and its reference has no padding-row convention.
+Tracing before the first successful plan or through the unbound
+`PagedAttention.run.fi_trace(...)` raises.
 
 ## Correspondence to the Batch MLA package
 
@@ -845,5 +848,5 @@ because the controller, not the backend, owns the reserved storage.
 | — | `update()` has no stream binding. | Call it on the replay stream. |
 | — | `cake` keeps `requires_contiguous_q=True`; only the trtllm-gen kernel was probed for strided q. | Probe pending. |
 | — | fa3 rows are compiled-checked only; the verification pool has no SM90 device. | Needs one H100 run. |
-| — | The trace template's constraints still state `min(kv_seq_lens) >= 1`, older than the zero-row contract. | Relax when the fixture is regenerated. |
+| — | The trace definition constrains `min(kv_seq_lens) >= 1`, older than the zero-row contract; a batch with padding rows refuses to trace rather than export a self-violating workload. | Give the reference a padding-row convention, relax the constraint and regenerate the fixture. |
 | — | Capacity substitution plans kernels for the capacity maxes; its performance effect on short batches is unmeasured. | Benchmark item. |
