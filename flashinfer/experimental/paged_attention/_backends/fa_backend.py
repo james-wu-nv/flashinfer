@@ -33,28 +33,29 @@ from ._capabilities import _BackendPlanUnsupportedError, _workspace_too_small
 def _envelope_mask(custom_mask: torch.Tensor, meta: PlanMetadata) -> torch.Tensor:
     """AND the caller's flattened mask with the causal / window envelope.
 
-    Pure device ops sized from the host mirrors (``repeat_interleave`` gets
-    its ``output_size``), so no sync.  Positions follow the oracle: query
-    ``p`` of a request sits at absolute KV position ``kv_len - q_len + p``.
+    Device ops only, from the device metadata the plan already holds: no
+    host-to-device copy (the mirrors are never uploaded here) and no sync
+    (``repeat_interleave`` gets its ``output_size`` from the mask, whose
+    length the contract pinned to ``sum(q_len_i * kv_len_i)``).  Positions
+    follow the oracle: query ``p`` of a request sits at absolute KV position
+    ``kv_len - q_len + p``.
     """
     if not meta.causal and meta.window_left < 0:
         return custom_mask
     dev = custom_mask.device
-    q_lens = meta.qo_indptr_cpu.diff().to(torch.int64)
-    kv_lens = meta.kv_seq_lens_cpu.to(torch.int64)
+    total = custom_mask.numel()
+    q_lens = meta.qo_indptr.diff().to(torch.int64)
+    kv_lens = meta.kv_seq_lens.to(torch.int64)
     sizes = q_lens * kv_lens
-    total = int(sizes.sum())
     starts = torch.cumsum(sizes, 0) - sizes
     req = torch.repeat_interleave(
-        torch.arange(meta.batch_size, device=dev),
-        sizes.to(dev),
-        output_size=total,
+        torch.arange(meta.batch_size, device=dev), sizes, output_size=total
     )
-    off = torch.arange(total, device=dev) - starts.to(dev)[req]
-    kv_len = kv_lens.to(dev)[req]
+    off = torch.arange(total, device=dev) - starts[req]
+    kv_len = kv_lens[req]
     q_pos = torch.div(off, kv_len, rounding_mode="floor")
     kv_pos = off - q_pos * kv_len
-    diag = kv_len - q_lens.to(dev)[req] + q_pos
+    diag = kv_len - q_lens[req] + q_pos
     allowed = custom_mask
     if meta.causal:
         allowed = allowed & (kv_pos <= diag)

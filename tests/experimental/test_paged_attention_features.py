@@ -299,6 +299,32 @@ def test_custom_mask_is_anded_with_the_envelope():
     _assert_matches(out_n, lse_n, *tri)
 
 
+def test_custom_mask_plan_is_sync_free():
+    """A custom-mask plan on fa2 issues no blocking copy and no host sync:
+    the envelope is computed from the device metadata and the wrapper packs
+    the mask from host-computed indptrs (ledger M6; the plan() contract)."""
+    p = make_problem(seed=107, **_SHAPE)
+    _skip_unless_runnable(p, "fa2", custom_mask=True, window_left=16)
+    dev = torch.device(p["device"])
+    q_lens = p["qo_indptr_cpu"].diff().to(torch.int64)
+    numel = int((q_lens * p["kv_seq_lens_cpu"].to(torch.int64)).sum())
+    g = torch.Generator(device=dev).manual_seed(107)
+    mask = torch.rand(numel, device=dev, generator=g) < 0.7
+    attn = PagedAttention(dev)
+    md = make_metadata(p)
+    kw = _plan_kw(p, custom_mask=mask, window_left=16)
+    attn.plan(md, backend="fa2", **kw)  # warm-up: JIT modules, allocator
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        attn.plan(md, backend="fa2", **kw)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]))
+    ref_out, ref_lse = _reference(p, window_left=16, custom_mask=mask)
+    _assert_matches(out, lse, ref_out, ref_lse)
+
+
 def test_custom_mask_contract():
     p = make_problem(seed=103, **_SHAPE)
     _skip_unless_runnable(p, "fa2", custom_mask=True)
