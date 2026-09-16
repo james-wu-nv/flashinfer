@@ -18,10 +18,16 @@ from .._planning import Derived
 class _CudnnBackend:
     name = "cudnn"
 
-    def __init__(self, device, kv_layout, workspace):
+    def __init__(self, device, kv_layout, workspace, graph_capacity=None):
         # The cuDNN graph is built from k/v_cache.stride(), so NHD storage is
         # presented as a zero-copy permuted view with HND logical dim order.
         self._permute_kv = kv_layout == "NHD"
+        # CUDA-graph mode: the LSE gather indices keep the capacity's row
+        # count, so the captured gather reads stable storage when a smaller
+        # batch is re-planned (rows past the batch gather a valid, unused entry)
+        self._rows: Optional[int] = (
+            graph_capacity.total_q_tokens if graph_capacity is not None else None
+        )
         self._workspace = workspace.view(torch.int8)
         self._meta: Optional[PlanMetadata] = None
         self._derived: Optional[Derived] = None
@@ -52,10 +58,17 @@ class _CudnnBackend:
         native_lse = batch_ids = pos = None
         if meta.need_lse:
             dev = meta.qo_indptr.device
-            token = torch.arange(meta.total_q_tokens, device=dev, dtype=torch.int64)
+            rows = meta.total_q_tokens if self._rows is None else self._rows
+            token = torch.arange(rows, device=dev, dtype=torch.int64)
             bounds = meta.qo_indptr[1:].to(torch.int64)
-            new_batch_ids = torch.searchsorted(bounds, token, right=True)
-            new_pos = token - meta.qo_indptr.to(torch.int64)[new_batch_ids]
+            # rows past the batch (graph mode) clamp to the last request's
+            # first padded slot: in range, never read by callers
+            new_batch_ids = torch.searchsorted(bounds, token, right=True).clamp_(
+                max=meta.batch_size - 1
+            )
+            new_pos = (token - meta.qo_indptr.to(torch.int64)[new_batch_ids]).clamp_(
+                0, meta.max_q_len - 1
+            )
             # Keep the storage stable when the shapes repeat (CUDA-graph
             # re-plan): refill in place instead of rebinding new tensors.
             batch_ids, pos, native_lse = self._batch_ids, self._pos, self._native_lse
@@ -118,7 +131,8 @@ class _CudnnBackend:
             return out_t, None
         # padded (b, max_q, h) -> packed (tokens, h), using the plan-time
         # precomputed gather indices (zero sync). The base was selected above.
-        packed = lse_t[self._batch_ids, self._pos, :]
+        # Graph mode gathers capacity rows; q's rows are what the caller sees.
+        packed = lse_t[self._batch_ids, self._pos, :][: q.shape[0]]
         if lse is not None:
             lse.copy_(packed)
             packed = lse

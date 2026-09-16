@@ -285,7 +285,6 @@ class PagedAttentionController:
         name = resolution.chosen
         needs_dense = CAPABILITIES[name].needs_dense
 
-        fresh = metadata.derived(needs_dense=needs_dense)
         if self._use_cuda_graph:
             # Graph mode: backends only ever see the reserved storage, so the
             # pointers a captured graph baked in stay valid across re-plans.
@@ -295,11 +294,18 @@ class PagedAttentionController:
                 gb = GraphBuffers(GraphCapacity.from_metadata(metadata), self.device)
             else:
                 gb = self._graph
-                gb.preflight(metadata)
+            gb.preflight(metadata)
+            cap = gb.capacity
             if needs_dense:
                 # flat form: only a backend that reads the dense table pays
                 # for it, and only once (no-op in the dense form)
                 gb.reserve_dense_table()
+            # Capacity substitution: the captured kernels were planned with
+            # the capacity maxes and keep reading them, so backends see those
+            # rather than this batch's own (validated <= in preflight); the
+            # derived dense table is sized to the reserved one likewise.
+            max_q_len, max_kv_len = cap.max_q_len, cap.max_kv_len
+            fresh = metadata.derived(needs_dense=needs_dense, max_kv_len=cap.max_kv_len)
             transaction = Transaction(gb.targets(metadata, fresh))
             derived = gb.derived_view(needs_dense=needs_dense)
             qo_indptr, kv_seq_lens = gb.qo_indptr, gb.kv_seq_lens
@@ -310,6 +316,8 @@ class PagedAttentionController:
             )
         else:
             gb = None
+            max_q_len, max_kv_len = metadata.max_q_len, metadata.max_kv_len
+            fresh = metadata.derived(needs_dense=needs_dense)
             transaction = None
             derived = fresh
             qo_indptr, kv_seq_lens = metadata.qo_indptr, metadata.kv_seq_lens
@@ -325,8 +333,8 @@ class PagedAttentionController:
             block_tables=block_tables,
             kv_input_form=kv_input_form,
             page_size=metadata.page_size,
-            max_q_len=metadata.max_q_len,
-            max_kv_len=metadata.max_kv_len,
+            max_q_len=max_q_len,
+            max_kv_len=max_kv_len,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim_qk=head_dim_qk,
@@ -447,10 +455,20 @@ class PagedAttentionController:
         )
         _expect(q.dtype == m.q_dtype, f"q dtype {q.dtype} != planned {m.q_dtype}")
         total = m.total_q_tokens
-        _expect(
-            q.shape[0] == total,
-            f"q has {q.shape[0]} tokens but qo_indptr sums to {total}",
-        )
+        if self._graph is not None:
+            # graph mode: q/out/lse are the capture buffers, sized to the
+            # capacity; rows past this batch are neither read nor written
+            rows = self._graph.capacity.total_q_tokens
+            _expect(
+                total <= q.shape[0] <= rows,
+                f"q has {q.shape[0]} tokens; a graph-mode instance needs this "
+                f"batch's {total} tokens and at most its capacity of {rows}",
+            )
+        else:
+            _expect(
+                q.shape[0] == total,
+                f"q has {q.shape[0]} tokens but qo_indptr sums to {total}",
+            )
         cap = CAPABILITIES[self._backend_name]
         if cap.requires_contiguous_q and not q.is_contiguous():
             raise ValueError(
