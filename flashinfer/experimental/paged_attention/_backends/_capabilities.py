@@ -76,6 +76,16 @@ class PagedAttentionCapabilities:
     #   "base2_tokens_h"   — already the contract
     #   "base2_padded_bsh" — base-2 padded (b, max_q, h); backend gathers
     lse_native: str = "base2_tokens_h"
+    # Explicit-False feature axes: a backend that cannot apply a requested
+    # feature is EXCLUDED here so `auto` never drops the feature silently.
+    #   logits soft cap:  cap * tanh(score / cap) on the scaled scores
+    #   custom mask:      per-request flattened boolean mask ANDed into the
+    #                     causal/window envelope
+    #   sinks:            per-head extra softmax-denominator logit (run-time
+    #                     tensor; declared at plan time)
+    supports_logits_soft_cap: bool = False
+    supports_custom_mask: bool = False
+    supports_sinks: bool = False
 
     def rejection_reason(
         self,
@@ -91,6 +101,9 @@ class PagedAttentionCapabilities:
         need_lse: bool,
         window_left: int,
         kv_input_form: str,
+        logits_soft_cap: Optional[float] = None,
+        use_custom_mask: bool = False,
+        use_sinks: bool = False,
     ) -> Optional[str]:
         """Return None if runnable, else the exclusion reason (for explain())."""
         if cc_major not in self.cc_majors:
@@ -115,6 +128,12 @@ class PagedAttentionCapabilities:
             return "LSE output not supported"
         if window_left >= 0 and not self.supports_window:
             return "sliding window (window_left >= 0) not supported"
+        if logits_soft_cap is not None and not self.supports_logits_soft_cap:
+            return "logits soft cap not supported"
+        if use_custom_mask and not self.supports_custom_mask:
+            return "custom attention mask not supported"
+        if use_sinks and not self.supports_sinks:
+            return "attention sinks not supported"
         if (
             self.needs_dense
             and kv_input_form == "page_indices"
@@ -155,6 +174,12 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         supports_noncausal=True,
         supports_window=True,
         requires_contiguous_q=False,
+        # soft cap and custom mask: the generated fa2 kernels
+        # (tests/attention/test_batch_prefill_kernels.py); sinks: the
+        # AttentionSink JIT variant (tests/attention/test_attention_sink.py)
+        supports_logits_soft_cap=True,
+        supports_custom_mask=True,
+        supports_sinks=True,
     ),
     "fa3": PagedAttentionCapabilities(
         name="fa3",
@@ -171,6 +196,12 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         supports_noncausal=True,
         supports_window=True,
         requires_contiguous_q=False,
+        # soft cap: tests/attention/test_hopper.py (cap 30); sinks: the
+        # AttentionSink JIT variant; custom mask: the SM90 batch prefill
+        # kernels reject MaskMode.CUSTOM (utils.is_fa3_backend_supported)
+        supports_logits_soft_cap=True,
+        supports_custom_mask=False,
+        supports_sinks=True,
     ),
     "cudnn": PagedAttentionCapabilities(
         name="cudnn",
@@ -191,6 +222,10 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         requires_contiguous_q=True,
         needs_dense=True,
         lse_native="base2_padded_bsh",
+        # the cuDNN SDPA graph path exposes none of the three
+        supports_logits_soft_cap=False,
+        supports_custom_mask=False,
+        supports_sinks=False,
     ),
     "trtllm-gen": PagedAttentionCapabilities(
         name="trtllm-gen",
@@ -211,6 +246,13 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         # requirement, and the controller enforces that for every backend.
         requires_contiguous_q=False,
         needs_dense=True,
+        # sinks: native run-time argument of trtllm_batch_context_with_kv_cache
+        # (tests/attention/test_attention_sink_blackwell.py); the kernel has
+        # no soft cap ("logits_soft_cap must be 0.0 for trtllm-gen") and no
+        # custom mask
+        supports_logits_soft_cap=False,
+        supports_custom_mask=False,
+        supports_sinks=True,
     ),
 }
 

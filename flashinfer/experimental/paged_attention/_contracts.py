@@ -42,6 +42,22 @@ def _expect_window_left(window_left: int) -> None:
     )
 
 
+def _normalize_logits_soft_cap(logits_soft_cap: Optional[float]) -> Optional[float]:
+    """``None`` / ``0`` mean "no soft cap" (the legacy convention); anything
+    else must be a positive finite host float and is returned as ``float``."""
+    if logits_soft_cap is None:
+        return None
+    _expect(
+        isinstance(logits_soft_cap, (int, float))
+        and not isinstance(logits_soft_cap, bool)
+        and math.isfinite(logits_soft_cap)
+        and logits_soft_cap >= 0,
+        "logits_soft_cap must be None (off) or a non-negative finite host float "
+        f"(cap * tanh(score / cap)), got {logits_soft_cap!r}",
+    )
+    return float(logits_soft_cap) if logits_soft_cap > 0 else None
+
+
 def _expect_page_size(page_size: int, kv_input_form: str) -> None:
     _expect(
         isinstance(page_size, int) and page_size >= 1,
@@ -70,11 +86,19 @@ def resolve_config_key(
     need_lse,
     window_left,
     kv_input_form,
+    logits_soft_cap,
+    custom_mask,
+    sinks,
     cc_major,
     cc_minor,
     device_index,
 ) -> Tuple:
     """The observational config a Resolution is pinned to (drift detection).
+
+    ``logits_soft_cap`` (normalized value or None), ``custom_mask`` and
+    ``sinks`` (booleans) are the feature axes: pinning covers them, so a
+    plan() that requests a feature the Resolution was not resolved for is a
+    drift error rather than a silent capability change.
 
     The last element is the device binding ``(cc_major, cc_minor,
     device_index)``: a Resolution resolved on one device must not be handed
@@ -97,6 +121,9 @@ def resolve_config_key(
         need_lse,
         window_left,
         kv_input_form,
+        logits_soft_cap,
+        bool(custom_mask),
+        bool(sinks),
         (cc_major, cc_minor, device_index),
     )
 
@@ -400,5 +427,6 @@ __all__ = [
     "PlanMetadata",
     "Resolution",
     "_expect_pinned_device",
+    "_normalize_logits_soft_cap",
     "resolve_config_key",
 ]

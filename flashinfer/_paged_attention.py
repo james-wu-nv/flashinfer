@@ -159,6 +159,9 @@ def resolve_paged_attention(
     need_lse: bool = False,
     window_left: int = -1,
     kv_input_form: str = "block_tables",
+    logits_soft_cap: Optional[float] = None,
+    custom_mask: bool = False,
+    sinks: bool = False,
     backend: str = "auto",
 ) -> "Resolution":
     """Static backend resolution — no plan state, no tensors.
@@ -169,6 +172,15 @@ def resolve_paged_attention(
     excluded backend; raises ``ValueError`` when nothing can run.  Pass the
     result to :meth:`PagedAttention.plan` as ``backend=`` to pin the
     candidate set.
+
+    - ``device`` / ``cc_major``: the Resolution is pinned to ``device`` (its
+      full compute capability and index; the default is the current CUDA
+      device).  With only ``cc_major`` it is pinned to that major and to no
+      device, so it can be prepared off-device.
+    - ``logits_soft_cap`` (``cap * tanh(score / cap)``; ``None``/``0`` = off),
+      ``custom_mask`` and ``sinks``: the features the plans will request.  A
+      backend that cannot apply a requested feature is excluded with the
+      reason — ``auto`` never drops a feature silently.
     """
     from .experimental.paged_attention import resolve_paged_attention as _resolve
 
@@ -187,6 +199,9 @@ def resolve_paged_attention(
         need_lse=need_lse,
         window_left=window_left,
         kv_input_form=kv_input_form,
+        logits_soft_cap=logits_soft_cap,
+        custom_mask=custom_mask,
+        sinks=sinks,
         backend=backend,
     )
 

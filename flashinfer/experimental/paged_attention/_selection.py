@@ -18,6 +18,7 @@ from ._contracts import (
     _expect,
     _expect_page_size,
     _expect_window_left,
+    _normalize_logits_soft_cap,
     resolve_config_key,
 )
 
@@ -122,6 +123,9 @@ def resolve_paged_attention(
     need_lse: bool = False,
     window_left: int = -1,
     kv_input_form: str = "block_tables",
+    logits_soft_cap: Optional[float] = None,
+    custom_mask: bool = False,
+    sinks: bool = False,
     backend: str = "auto",
 ) -> Resolution:
     """Static backend resolution — no plan state, no tensors.
@@ -130,6 +134,10 @@ def resolve_paged_attention(
     The result is pinned to ``device`` (or to the current CUDA device when
     neither ``device`` nor ``cc_major`` is given); with only ``cc_major`` it
     is pinned to that compute-capability major and to no device.
+
+    ``logits_soft_cap`` / ``custom_mask`` / ``sinks`` declare the features the
+    plans will use; a backend that cannot apply one is excluded (with the
+    reason) rather than dropping it silently.
     """
     if head_dim_vo is None:
         head_dim_vo = head_dim_qk
@@ -153,6 +161,8 @@ def resolve_paged_attention(
         )
     _expect_window_left(window_left)
     _expect_page_size(page_size, kv_input_form)
+    logits_soft_cap = _normalize_logits_soft_cap(logits_soft_cap)
+    custom_mask, sinks = bool(custom_mask), bool(sinks)
 
     order = HEURISTIC_ORDER.get(cc_major, ())
     if backend != "auto":
@@ -181,6 +191,9 @@ def resolve_paged_attention(
             need_lse=need_lse,
             window_left=window_left,
             kv_input_form=kv_input_form,
+            logits_soft_cap=logits_soft_cap,
+            use_custom_mask=custom_mask,
+            use_sinks=sinks,
         )
         if reason is None:
             reason = PROBES[name](dev)
@@ -209,6 +222,9 @@ def resolve_paged_attention(
             need_lse,
             window_left,
             kv_input_form,
+            logits_soft_cap,
+            custom_mask,
+            sinks,
             cc_major,
             cc_minor,
             device_index,
