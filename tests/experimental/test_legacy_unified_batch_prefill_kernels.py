@@ -88,7 +88,7 @@ from .legacy_unified_helpers import (
     apply_external_rope,
     argnames,
     assert_every_backend_excluded,
-    assert_legacy_close,
+    assert_legacy_isclose,
     assert_nvfp4_unsupported,
     assert_oracle,
     assert_rope_kwargs_rejected,
@@ -436,16 +436,16 @@ def _run_main_grid(
     ref = legacy_reference_single_prefill(
         lb, causal=causal, pos_encoding_mode=pos_encoding_mode
     )
-    assert_legacy_close(out, ref, rtol=1e-3, atol=1e-3)
+    assert_legacy_isclose(out, ref, rtol=1e-3, atol=1e-3)
     if check_caller_buffers and not use_cuda_graph:
         # legacy: a second run into pre-allocated out / lse buffers matches
         out_buf, lse_buf = torch.empty_like(out), torch.empty_like(lse)
         o2, l2 = attn.run(q, (k, lb.v), out=out_buf, lse=lse_buf)
         assert o2 is out_buf and l2 is lse_buf
-        assert_legacy_close(
+        assert_legacy_isclose(
             out, out_buf, rtol=1e-3, atol=1e-3, what="caller out buffer"
         )
-        assert_legacy_close(
+        assert_legacy_isclose(
             lse, lse_buf, rtol=1e-3, atol=1e-3, what="caller lse buffer"
         )
 
@@ -682,7 +682,7 @@ def test_batch_prefill_with_paged_kv_cache_head_dim_512(
     ref = legacy_reference_single_prefill(
         lb, causal=causal, backend="fa2", pos_encoding_mode=pos_encoding_mode
     )
-    assert_legacy_close(out, ref, rtol=1e-3, atol=1e-3)
+    assert_legacy_isclose(out, ref, rtol=1e-3, atol=1e-3)
     assert_oracle(lb, out, lse, causal=causal, q=q, k=k)
     out_buf, lse_buf = torch.empty_like(out), torch.empty_like(lse)
     attn.run(q, (k, lb.v), out=out_buf, lse=lse_buf)
@@ -762,7 +762,7 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
         lb, md, backend, q=q, k=k, causal=False, custom_mask=custom_mask
     )
     _, out_causal, lse_causal = run_batch(lb, md, backend, q=q, k=k, causal=True)
-    assert_legacy_close(out_custom, out_causal, rtol=1e-3, atol=1e-3)  # legacy
+    assert_legacy_isclose(out_custom, out_causal, rtol=1e-3, atol=1e-3)  # legacy
     assert_oracle(
         lb, out_custom, lse_custom, causal=False, custom_mask=custom_mask, q=q, k=k
     )
@@ -956,7 +956,7 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
         custom_mask=lambda i: mask,
         pos_encoding_mode=pos_encoding_mode,
     )
-    assert_legacy_close(out, ref, rtol=1e-3, atol=1e-3)
+    assert_legacy_isclose(out, ref, rtol=1e-3, atol=1e-3)
     assert_oracle(
         lb,
         out,

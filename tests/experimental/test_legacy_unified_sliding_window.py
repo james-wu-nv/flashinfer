@@ -31,7 +31,7 @@ import torch
 
 from .legacy_unified_helpers import (
     argnames,
-    assert_legacy_close,
+    assert_legacy_isclose,
     assert_oracle,
     check_legacy_map,
     check_legacy_map_complete,
@@ -169,5 +169,5 @@ def test_batch_paged_prefill_sliding_window(
     ref = legacy_reference_single_prefill(
         lb, causal=True, window_left=window_left, backend="fa2"
     )
-    assert_legacy_close(out, ref, rtol=1e-3, atol=1e-3)
+    assert_legacy_isclose(out, ref, rtol=1e-3, atol=1e-3)
     assert_oracle(lb, out, lse, causal=True, window_left=window_left)
