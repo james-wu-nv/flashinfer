@@ -43,7 +43,11 @@ legacy public API of the same kernel, with the same phases, so
   indptr/last-page lengths to the host itself, a D2H sync the unified plan
   with host mirrors does not pay) or on the host from the host block table
   for the dense form (vLLM-style; pageable H2D instead).
-- cudnn: ``cudnn_batch_prefill_with_kv_cache`` (dense table only).
+- cudnn: ``cudnn_batch_prefill_with_kv_cache`` (dense table only).  The
+  native API insists on a page table exactly ``ceil(max_kv_len / page_size)``
+  columns wide, so the provider hands it the width-exact column view of the
+  case's wider table (same row stride, same live page ids, the actual
+  ``max_kv_len``) — the same view the unified cuDNN backend takes.
 - trtllm-gen: ``trtllm_batch_context_with_kv_cache`` (dense table only).
 
 Legacy rows keep each API's NATIVE LSE contract (fa/trtllm-gen: packed
@@ -679,6 +683,14 @@ class _LegacyCudnnProvider:
     def __init__(self, args, case, ctx):
         self.args, self.case, self.ctx = args, case, ctx
         self.workspace = ctx["workspace"].view(torch.int8)
+        # cuDNN builds its paged gather from the table width AND max_sequence_kv
+        # and rejects any pairing but width == ceil(max_kv / page_size)
+        # (CUDNN_STATUS_BAD_PARAM); the case's table carries spare columns, so
+        # the API sees the width-exact column VIEW of it: same storage, same
+        # row stride, same live page ids, and the actual longest context as
+        # max_sequence_kv — exactly what the unified cuDNN backend passes.
+        width = (case["max_kv_len"] + case["page_size"] - 1) // case["page_size"]
+        self.block_tables = case["block_tables"][:, :width]
         self.native_lse = (
             torch.empty(
                 case["batch_size"],
@@ -713,7 +725,7 @@ class _LegacyCudnnProvider:
             max_sequence_kv=case["max_kv_len"],
             actual_seq_lens_q=self.q_lens4,
             actual_seq_lens_kv=self.kv_lens4,
-            block_tables=case["block_tables"],
+            block_tables=self.block_tables,  # width == ceil(max_kv / page)
             causal=args.causal,
             return_lse=args.lse_mode != "none",
             lse_base="e" if args.lse_mode == "basee" else "2",
