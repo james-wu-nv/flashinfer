@@ -479,3 +479,30 @@ def test_sinks_with_soft_cap_is_a_typed_rejection_on_fa():
     ones = torch.ones(numel, dtype=torch.bool, device=p["device"])
     with pytest.raises(ValueError, match="not verified"):
         attn.plan(md, backend="fa2", **_plan_kw(p, use_sinks=True, custom_mask=ones))
+
+
+def test_sink_kernels_are_specialized_per_head_dim():
+    """Two sink plans in one process, head_dim 64 then 128 (same dtype,
+    window and backend): the second must run its own JIT module.  Before the
+    fix the sink wrapper's module URI omitted the head dims, so the D=128
+    plan reused the D=64 module and left half of its output unwritten
+    (review CR02)."""
+    outs = []
+    for seed, d in ((131, 64), (132, 128)):
+        p = make_problem(seed=seed, **dict(_SHAPE, head_dim_qk=d))
+        _skip_unless_runnable(p, "fa2", sinks=True)
+        sinks = _sinks(p, seed)
+        attn = PagedAttention(torch.device(p["device"]))
+        attn.plan(make_metadata(p), backend="fa2", **_plan_kw(p, use_sinks=True))
+        out = torch.full(
+            (p["q"].shape[0], p["num_qo_heads"], d),
+            float("nan"),
+            dtype=p["dtype"],
+            device=p["device"],
+        )
+        out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]), sinks=sinks, out=out)
+        torch.cuda.synchronize()
+        assert torch.isfinite(out.float()).all(), f"D={d}: unwritten output rows"
+        _assert_matches(out, lse, *_reference(p, sinks=sinks))
+        outs.append(attn._impl._active._active)
+    assert outs[0] is not outs[1]

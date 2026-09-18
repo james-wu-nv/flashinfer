@@ -32,8 +32,8 @@ from ..utils import (
     determine_attention_backend,
 )
 from ..prefill import BatchPrefillWithPagedKVCacheWrapper
+from ..jit.attention import get_batch_prefill_attention_sink_uri
 from ..jit.attention.variants import attention_sink_decl
-from ..jit.utils import filename_safe_dtype_map
 
 
 @functools.cache
@@ -371,8 +371,26 @@ class BatchAttentionWithAttentionSinkWrapper(BatchPrefillWithPagedKVCacheWrapper
                 head_dim_vo=head_dim_vo,
             )
 
+        # One module per compile parameter set: head dims, KV dtype and the
+        # positional / reduction options change the generated code, so a URI
+        # without them would hand a plan for D=128 the module built for D=64
+        # (review CR02: the second plan in a process left its output unwritten).
+        uri = get_batch_prefill_attention_sink_uri(
+            backend,
+            q_data_type,
+            kv_data_type,
+            q_data_type,
+            torch.int32,
+            head_dim_qk,
+            head_dim_vo,
+            PosEncodingMode[pos_encoding_mode].value,
+            window_left >= 0,
+        ) + (
+            f"_pos_{PosEncodingMode[pos_encoding_mode].value}"
+            f"_f16qk_{int(bool(use_fp16_qk_reduction))}_{backend}"
+        )
         jit_args = [
-            f"batch_prefill_attention_sink_{filename_safe_dtype_map[q_data_type]}_swa_{window_left >= 0}_{backend}",  # uri
+            uri,
             q_data_type,  # dtype_q
             kv_data_type,  # dtype_kv
             q_data_type,  # dtype_o
