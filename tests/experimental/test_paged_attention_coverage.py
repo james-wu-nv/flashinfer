@@ -1793,6 +1793,15 @@ REQUIRED_ROWS = [
     _row("trtllm-gen", {10}, 8, 2, 128, 128, BF16, "csr", 16, note="derived dense"),
     _row("trtllm-gen", {10}, 8, 2, 128, 128, BF16, "dense", 16, window_left=127),
     _row("trtllm-gen", {10}, 8, 2, 128, 128, BF16, "dense", 16, lse_mode="none"),
+    # pages 128 .. 1024 (legacy dynamic_page_size_gqa): measured on B200
+    # (2026-09-17) for trtllm-gen and for cake, see _capabilities.py
+    _row("trtllm-gen", {10}, 8, 2, 128, 128, BF16, "dense", 128),
+    _row("trtllm-gen", {10}, 32, 8, 128, 128, BF16, "dense", 1024, note="GQA 4"),
+    _row("trtllm-gen", {10}, 8, 2, 128, 128, F16, "csr", 1024, note="derived dense"),
+    _row("cake", {10}, 8, 2, 128, 128, BF16, "dense", 16),
+    _row("cake", {10}, 8, 2, 128, 128, BF16, "dense", 128),
+    _row("cake", {10}, 32, 8, 128, 128, BF16, "dense", 1024, note="GQA 4"),
+    _row("cake", {10}, 8, 2, 128, 128, F16, "csr", 1024, note="derived dense"),
 ]
 
 

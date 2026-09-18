@@ -242,6 +242,63 @@ def test_capture_replan_replay(backend):
     assert not torch.allclose(ref_out, ref_out2)  # the two batches really differ
 
 
+@pytest.mark.parametrize("backend", ["trtllm-gen", "cake"])
+def test_capture_replan_replay_large_pages(backend):
+    """The capture / re-plan / replay protocol at page size 1024 on the
+    paged context kernels (declared by measurement, see _capabilities.py):
+    the inferred capacity's dense width is ceil(max_kv_len / 1024), the
+    sibling batch stages into the same reserved table and the replay
+    computes it."""
+    p1 = make_problem(
+        seed=45,
+        batch_size=3,
+        max_q=200,
+        max_kv=3 * 1024 + 37,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        page_size=1024,
+        dtype=torch.bfloat16,
+    )
+    _resolve_or_skip(p1, backend)
+    p2 = _sibling_batch(p1, seed=46)
+    dev = torch.device(p1["device"])
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    q, k, v = p1["q"].clone(), p1["k_cache"].clone(), p1["v_cache"].clone()
+    out = torch.empty(
+        q.shape[0], p1["num_qo_heads"], p1["head_dim_vo"], dtype=q.dtype, device=dev
+    )
+    lse = torch.empty(q.shape[0], p1["num_qo_heads"], dtype=torch.float32, device=dev)
+    _plan(attn, p1, backend)
+    cap = attn._impl._graph.capacity
+    assert cap.page_size == 1024
+    width = -(-p1["max_kv_len"] // 1024)
+    assert 2 <= width == cap.table_width == p1["block_tables"].shape[1]
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            attn.run(q, (k, v), out=out, lse=lse)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        attn.run(q, (k, v), out=out, lse=lse)
+    g.replay()
+    torch.cuda.synchronize()
+    ref_out, ref_lse = _reference(p1)
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+    q.copy_(p2["q"])
+    k.copy_(p2["k_cache"])
+    v.copy_(p2["v_cache"])
+    attn.update(make_metadata(p2))
+    g.replay()
+    torch.cuda.synchronize()
+    ref_out2, ref_lse2 = _reference(p2)
+    torch.testing.assert_close(out.float(), ref_out2, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse2, **LSE_TOL)
+
+
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_replan_rejects_capture_shape_drift(backend):
     p1 = make_problem(seed=43, **_SHAPE)

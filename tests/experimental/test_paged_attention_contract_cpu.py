@@ -325,9 +325,18 @@ def _capability_rows():
         ("cudnn", "fp8-kv", dict(kv_dtype=torch.float8_e4m3fn), "unsupported kv dtype"),
         ("trtllm-gen", "cc9", dict(cc_major=9), "compute capability"),
         ("trtllm-gen", "page8", dict(page_size=8), "unsupported page_size"),
-        ("trtllm-gen", "page128", dict(page_size=128), "unsupported page_size"),
         ("trtllm-gen", "page32", dict(page_size=32), None),
         ("trtllm-gen", "page64", dict(page_size=64), None),
+        # 128 .. 1024: the shipped context kernels, measured on B200 for
+        # trtllm-gen and for cake; nothing above 1024 ships
+        ("trtllm-gen", "page128", dict(page_size=128), None),
+        ("trtllm-gen", "page1024", dict(page_size=1024), None),
+        ("trtllm-gen", "page2048", dict(page_size=2048), "unsupported page_size"),
+        ("trtllm-gen", "page96", dict(page_size=96), "unsupported page_size"),
+        ("cake", "page8", dict(page_size=8), "unsupported page_size"),
+        ("cake", "page128", dict(page_size=128), None),
+        ("cake", "page1024", dict(page_size=1024), None),
+        ("cake", "page2048", dict(page_size=2048), "unsupported page_size"),
         ("trtllm-gen", "noncausal", dict(causal=False), None),  # measured on B200
         ("trtllm-gen", "window0", dict(window_left=0), None),
         (

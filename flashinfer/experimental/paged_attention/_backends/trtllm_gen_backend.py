@@ -30,7 +30,7 @@ from .._planning import FORM_BLOCK_TABLES, FORM_CUM_KV_SEQ_LENS, Derived
 from ._capabilities import _BackendPlanUnsupportedError, _workspace_too_small
 
 # Page sizes the trtllm-gen paged context kernel is shipped for (the
-# capability table admits a verified subset of these).
+# capability table declares the same set, each measured on B200).
 _KERNEL_PAGE_SIZES = frozenset({16, 32, 64, 128, 256, 512, 1024})
 
 # Scratch the context launcher carves out of the shared workspace

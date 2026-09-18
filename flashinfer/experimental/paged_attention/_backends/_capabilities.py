@@ -8,9 +8,9 @@ choosing).
 
 Capability honesty rule: ``CAPABILITIES`` declares ONLY what the conformance
 matrix and fuzzer actually exercise on hardware. Production entries are wider
-(trtllm-gen pages of 128 and above, cuDNN head dims beyond 128 / (192, 128),
-compute capability 11, ...); here an admitted config is a machine-checked
-config, so under-claiming is the only honest default.
+(cuDNN head dims beyond 128 / (192, 128), trtllm-gen head dims 256 / 512 and
+fp8 KV, compute capability 11, ...); here an admitted config is a
+machine-checked config, so under-claiming is the only honest default.
 """
 
 from __future__ import annotations
@@ -179,9 +179,9 @@ def _is_fp8(dtype: torch.dtype) -> bool:
 
 # Per the capability-honesty rule: these sets mirror exactly what
 # tests/experimental/test_paged_attention_{prototype,fuzzer,coverage}.py
-# exercise.  Production sets are wider (trtllm pages up to 1024 with GQA per
-# tests/attention/test_trtllm_gen_attention_prefill.py, cuDNN head dims
-# beyond those listed, ...).
+# exercise.  Production sets are wider (cuDNN head dims beyond those listed,
+# trtllm-gen head dims 256 / 512 and fp8 KV per
+# tests/attention/test_trtllm_gen_attention_prefill.py, ...).
 CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
     "fa2": PagedAttentionCapabilities(
         name="fa2",
@@ -267,9 +267,14 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         cc_majors=frozenset({10}),
         q_dtypes=_F16,
         head_dims=frozenset({(128, 128)}),
-        # 128+ pages are supported by the kernel with GQA (repo tests cover
-        # up to 1024) — kept out until this suite exercises them.
-        page_sizes=frozenset({16, 32, 64}),
+        # Every page size the paged context kernel ships for.  128 .. 1024
+        # measured on B200 (2026-09-17) through the unified API against the
+        # oracle: GQA 32/8 and 8/2, bf16, q [257, 1, 100, 40] over kv
+        # [2P + 37, 300, P, 3P - 1], dense and CSR-derived tables (max out
+        # err 4.2e-3, LSE err 2.9e-6); at 8/2 also fp16 NHD, window 127,
+        # non-causal, LSE none / basee, a uniform-q1 decode batch at 1024
+        # and a CUDA-graph capture / replay at 1024 (6.1e-4).
+        page_sizes=frozenset({16, 32, 64, 128, 256, 512, 1024}),
         kv_layouts=frozenset({"HND", "NHD"}),
         supports_lse=True,
         # Measured on B200 (2026-09-16) against the oracle with causal=False:
@@ -308,7 +313,11 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         cc_majors=frozenset({10}),
         q_dtypes=_F16,
         head_dims=frozenset({(128, 128)}),
-        page_sizes=frozenset({16, 32, 64}),
+        # 128 .. 1024 measured for cake itself on B200 (2026-09-17), same
+        # grid as trtllm-gen above: GQA 32/8 and 8/2 dense and CSR-derived,
+        # fp16 NHD, window 127, non-causal, LSE none / basee, q1 decode at
+        # 1024, graph replay at 1024 -- max out err 5.5e-3, LSE err 5.0e-5.
+        page_sizes=frozenset({16, 32, 64, 128, 256, 512, 1024}),
         kv_layouts=frozenset({"HND", "NHD"}),
         supports_lse=True,
         supports_noncausal=True,

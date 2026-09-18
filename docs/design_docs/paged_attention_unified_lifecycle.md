@@ -504,8 +504,8 @@ is one the conformance matrix and fuzzer exercise on hardware.
 | fa2 | 8, 9, 10, 12 | 64, 128, 256, 512 | any | HND, NHD | yes | yes | yes | no | f16/bf16, fp8 e4m3 / e5m2 | no | yes | yes | yes |
 | fa3 | 9 | 64, 128, 256 | any | HND, NHD | yes | yes | yes | no | f16/bf16 | no | yes | no | yes |
 | cudnn | 8, 9, 10, 12 | 128, (192, 128) | any | HND, NHD | yes | no | n/a | yes | f16/bf16 | yes | no | no | no |
-| trtllm-gen | 10 | 128 | 16, 32, 64 | HND, NHD | yes | yes | no | no | f16/bf16 | yes | no | no | yes |
-| cake | 10 | 128 | 16, 32, 64 | HND, NHD | yes | yes | no | yes | f16/bf16 | yes | no | no | yes |
+| trtllm-gen | 10 | 128 | 16, 32, 64, 128, 256, 512, 1024 | HND, NHD | yes | yes | no | no | f16/bf16 | yes | no | no | yes |
+| cake | 10 | 128 | 16, 32, 64, 128, 256, 512, 1024 | HND, NHD | yes | yes | no | no | f16/bf16 | yes | no | no | yes |
 
 `rejection_reason()` checks, in order: compute capability, q dtype, kv dtype,
 the q/kv pair (only an fp8 KV with an f16/bf16 q may differ), head dims, page

@@ -1172,6 +1172,31 @@ def test_paged_attention_csr_page_indices(backend, page_size):
     check(p, backend)
 
 
+@pytest.mark.parametrize("backend", ["trtllm-gen", "cake"])
+@pytest.mark.parametrize("page_size", [128, 1024])
+@pytest.mark.parametrize("heads", [(8, 2), (32, 8)], ids=["h8-2", "h32-8"])
+@pytest.mark.parametrize("input_form", ["block_tables", "page_indices"])
+def test_paged_attention_large_pages(backend, page_size, heads, input_form):
+    """Page sizes 128 and 1024 on the paged context kernels (legacy
+    ``test_trtllm_batch_prefill_dynamic_page_size_gqa`` covers 128 .. 1024
+    with GQA): dense tables and the dense table derived from flat page ids,
+    requests spanning one to four pages with a ragged last page.  Declared
+    by measurement (B200, see ``_capabilities.py``)."""
+    p = make_problem(
+        seed=67 + page_size + heads[0],
+        batch_size=4,
+        max_q=257,
+        max_kv=3 * page_size + 37,
+        num_qo_heads=heads[0],
+        num_kv_heads=heads[1],
+        head_dim_qk=128,
+        page_size=page_size,
+        dtype=torch.bfloat16,
+        input_form=input_form,
+    )
+    check(p, backend)
+
+
 @pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn", "trtllm-gen", "cake"])
 def test_paged_attention_fp16(backend):
     p = make_problem(
