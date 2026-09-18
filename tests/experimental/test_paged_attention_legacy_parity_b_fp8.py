@@ -18,7 +18,7 @@ import torch
 import flashinfer
 from flashinfer.prefill import PagedAttention, resolve_paged_attention
 
-from .legacy_parity_b_helpers import (
+from .legacy_unified_helpers import (
     DEVICE,
     EXPECT_FA2_E5M2_KV,
     EXPECT_FA2_HEAD_DIM_512,

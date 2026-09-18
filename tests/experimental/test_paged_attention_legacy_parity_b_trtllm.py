@@ -28,7 +28,7 @@ from flashinfer.prefill import (
     resolve_paged_attention,
 )
 
-from .legacy_parity_b_helpers import (
+from .legacy_unified_helpers import (
     DEVICE,
     EXPECT_CHUNKED_ATTENTION_KNOB,
     EXPECT_DEVICE_SCALES,

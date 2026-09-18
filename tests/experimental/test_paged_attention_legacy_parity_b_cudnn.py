@@ -20,7 +20,7 @@ import flashinfer
 from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
 from flashinfer.prefill import PagedAttention, resolve_paged_attention
 
-from .legacy_parity_b_helpers import (
+from .legacy_unified_helpers import (
     DEVICE,
     EXPECT_FP8_Q,
     LSE_TOL,

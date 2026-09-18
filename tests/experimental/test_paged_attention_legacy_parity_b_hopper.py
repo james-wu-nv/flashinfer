@@ -31,7 +31,7 @@ from flashinfer.prefill import PagedAttention
 
 from flashinfer.prefill import resolve_paged_attention
 
-from .legacy_parity_b_helpers import (
+from .legacy_unified_helpers import (
     DEVICE,
     EXPECT_FP8_Q,
     EXPECT_MULTI_ITEM_SCORING,

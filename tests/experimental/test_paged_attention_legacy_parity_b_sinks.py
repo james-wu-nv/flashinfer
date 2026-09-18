@@ -26,7 +26,7 @@ import torch
 
 from flashinfer.prefill import PagedAttention, resolve_paged_attention
 
-from .legacy_parity_b_helpers import (
+from .legacy_unified_helpers import (
     DEVICE,
     EXPECT_SINK_JIT_URI_HAS_HEAD_DIM,
     EXPECT_TRTLLM_HEAD_DIM_64,
