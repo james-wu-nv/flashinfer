@@ -1100,3 +1100,36 @@ def test_lazy_value_types_are_reachable_from_prefill():
         prefill.NoSuchPagedAttentionThing  # noqa: B018
     with pytest.raises(AttributeError):
         entry.NoSuchPagedAttentionThing  # noqa: B018
+
+
+@pytest.mark.parametrize("cc_major", [8, 9, 10, 12])
+@pytest.mark.parametrize(
+    "feature,reason",
+    [
+        ({"logits_soft_cap": 30.0}, "logits soft cap not supported"),
+        ({"custom_mask": True}, "custom attention mask not supported"),
+    ],
+)
+def test_feature_rejection_reasons_follow_the_architecture_gate(
+    no_probes, cc_major, feature, reason
+):
+    """Static: on every architecture a backend the CC admits but the feature
+    excludes carries the feature reason; a backend the CC does not admit is
+    excluded for the CC first (review R3 — the GPU tests must not assume the
+    B200 candidate set)."""
+    plain = _resolve(cc_major)
+    res = _resolve(cc_major, **feature)
+    assert res.backends, f"cc_major={cc_major}: the fa backends must remain"
+    assert set(res.backends) <= {"fa2", "fa3"}
+    for name in CAPABILITIES:
+        if name in res.backends:
+            continue
+        why = res.excluded[name]
+        if name in plain.backends:
+            assert reason in why, (cc_major, name, why)
+        else:
+            assert "compute capability" in why or name in plain.excluded, (
+                cc_major,
+                name,
+                why,
+            )

@@ -168,11 +168,18 @@ def test_logits_soft_cap_excludes_backends_at_plan():
     attn.plan(make_metadata(p), backend="auto", **_plan_kw(p, logits_soft_cap=30.0))
     assert attn.backend in ("fa2", "fa3")
     text = attn.explain()
-    assert "cudnn: logits soft cap not supported" in text
-    if "trtllm-gen" in text:
-        assert "trtllm-gen: logits soft cap not supported" in text
+    # only a backend this architecture admits is excluded FOR the feature; on
+    # other architectures the capability gate speaks first (review R3)
+    admitted = set(res.backends)
     for backend in ("cudnn", "trtllm-gen"):
-        with pytest.raises(ValueError, match="logits soft cap not supported"):
+        if backend in admitted:
+            assert f"{backend}: logits soft cap not supported" in text
+        with pytest.raises(
+            ValueError,
+            match="logits soft cap not supported"
+            if backend in admitted
+            else "logits soft cap not supported|unsupported compute capability",
+        ):
             attn.plan(
                 make_metadata(p), backend=backend, **_plan_kw(p, logits_soft_cap=30.0)
             )
@@ -342,10 +349,15 @@ def test_custom_mask_contract():
         attn.plan(md, backend="fa2", **_plan_kw(p, custom_mask=good.cpu()))
     with pytest.raises(ValueError, match="1-D"):
         attn.plan(md, backend="fa2", **_plan_kw(p, custom_mask=good.view(1, -1)))
-    # backends without custom-mask support are excluded with the reason
+    # backends without custom-mask support are excluded with the reason; a
+    # backend this architecture does not admit is excluded for that first
+    admitted = set(_resolve_or_skip(p, "auto").backends)
     for backend in ("cudnn", "trtllm-gen", "fa3"):
         with pytest.raises(
-            ValueError, match="custom attention mask not supported|SM90|fa3"
+            ValueError,
+            match="custom attention mask not supported"
+            if backend in admitted
+            else "custom attention mask not supported|unsupported compute capability",
         ):
             attn.plan(md, backend=backend, **_plan_kw(p, custom_mask=good))
     # graph mode: named follow-up, not a fallback
