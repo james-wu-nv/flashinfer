@@ -836,3 +836,919 @@ def plan_pinned(
     attn.plan(md, backend=res, **plan_kw)
     assert attn.backend == backend
     return attn
+
+
+# ===========================================================================
+# Group A machinery (round 4: one unified file per legacy file).  Appended
+# after the shared block so the three conversion branches merge cleanly.
+# ===========================================================================
+
+import inspect  # noqa: E402
+import itertools  # noqa: E402
+import zlib  # noqa: E402
+
+import flashinfer  # noqa: E402
+from flashinfer.prefill import GraphCapacity, PagedAttention  # noqa: E402
+
+
+def check_unified_tests_mapped(legacy_map: Sequence, namespace: dict) -> None:
+    """Every ``test_*`` of a conversion module (except the self-check) is named
+    by a LEGACY_MAP row: no unified test without a legacy source."""
+    referenced = {name for row in legacy_map for name in row[1]}
+    module_tests = {
+        name
+        for name, obj in namespace.items()
+        if name.startswith("test_") and callable(obj)
+    } - {"test_legacy_map_is_well_formed"}
+    assert module_tests <= referenced, (
+        f"unified tests without a LEGACY_MAP row: {sorted(module_tests - referenced)}"
+    )
+
+
+BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen", "cake", "auto"]
+slow = pytest.mark.slow
+MB = 1024 * 1024
+
+# Legacy features of group A the unified API does not express (same flip rule
+# as the flags above; the positive branch is written next to each rejection).
+EXPECT_FLOAT_KV_SCALES = True  # k_scale / v_scale on a fp16/bf16 KV (WP-T, c690336a)
+EXPECT_FULLY_MASKED_ROWS = False  # causal rows with q_len > kv_len: out 0 / LSE -inf
+EXPECT_HEAD_DIM_448_256 = False  # the (448, 256) head-dim pair (fa2 CTA-tile probe)
+EXPECT_BATCH_INVARIANT = False  # determinism policy (legacy fixed_split_size knobs)
+EXPECT_ROPE = False  # fused positional encoding (pos_encoding_mode / rope_*)
+
+
+def seed_of(*parts) -> int:
+    """Deterministic per-row seed from the row's parameters (the legacy tests
+    are unseeded; the same point always builds the same fixture)."""
+    return zlib.crc32(repr(parts).encode())
+
+
+def plan_signature_params():
+    return inspect.signature(PagedAttention.plan).parameters
+
+
+def run_signature_params():
+    return inspect.signature(PagedAttention.run).parameters
+
+
+# ---------------------------------------------------------------------------
+# legacy node ids and the default / slow parametrization
+# ---------------------------------------------------------------------------
+
+
+def _idval(name, values, val) -> str:
+    """pytest's id for one parametrize value: numbers, bools, None and
+    strings verbatim; anything else (torch.dtype, a list of pairs) is
+    ``<argname><index>``, as pytest generates it."""
+    if isinstance(val, (bool, int, float)) or val is None:
+        return str(val)
+    if isinstance(val, str):
+        return val
+    return f"{name}{list(values).index(val)}"
+
+
+def legacy_id(axes: dict, point) -> str:
+    """The legacy node id of one grid point.  ``axes`` lists the legacy
+    ``@pytest.mark.parametrize`` decorators top-down; pytest joins stacked
+    decorators innermost first, hence the reversal."""
+    parts = [
+        _idval(name, axes[name], val) for name, val in zip(axes, point, strict=True)
+    ]
+    return "-".join(reversed(parts))
+
+
+def argnames(axes: dict, *extra: str) -> str:
+    return ",".join([*axes, *extra])
+
+
+def grid(axes: dict, **override):
+    return list(itertools.product(*dict(axes, **override).values()))
+
+
+def param_rows(
+    axes: dict,
+    default_pred,
+    *,
+    slow_backends=("fa2",),
+    backends=BACKENDS,
+    backend_first=False,
+):
+    """Cross the legacy grid with the unified backends.  A default-subset
+    point runs on every backend; every other legacy point stays on the
+    legacy backend(s) under ``slow`` (``FI_PARITY_SLOW=1``), so the full
+    legacy grid stays runnable without multiplying it by six.  The row id is
+    the legacy node id plus ``-<backend>``: a legacy case and its unified
+    counterpart differ only by that suffix (``backend_first``: the legacy grid
+    had the backend as its innermost axis, so the id starts with it and the
+    legacy backends' rows carry exactly the legacy ids)."""
+    out = []
+    for point in grid(axes):
+        default = default_pred(point)
+        for backend in backends:
+            if not default and backend not in slow_backends:
+                continue
+            base = legacy_id(axes, point)
+            out.append(
+                pytest.param(
+                    *point,
+                    backend,
+                    marks=() if default else (slow,),
+                    id=f"{backend}-{base}" if backend_first else f"{base}-{backend}",
+                )
+            )
+    return out
+
+
+def backend_rows(*point, ids=None, backends=BACKENDS):
+    """Fixed legacy point(s) crossed with the backends (no slow rows)."""
+    return [
+        pytest.param(*point, backend, id=f"{ids}-{backend}" if ids else backend)
+        for backend in backends
+    ]
+
+
+# ---------------------------------------------------------------------------
+# the legacy fixture and its lossless mapping
+# ---------------------------------------------------------------------------
+
+
+class LegacyBatch:
+    """A legacy paged-prefill batch: the legacy wrapper's CSR metadata
+    (``qo_indptr`` / ``paged_kv_indptr`` / ``paged_kv_indices`` /
+    ``paged_kv_last_page_len``) plus the K/V pools as the legacy test holds
+    them (combined-pool views or separate pools).  ``metadata()`` performs the
+    lossless mapping to the unified canonical form (03 §2.1):
+
+        kv_seq_lens[i] = (pages_i - 1) * page_size + last_page_len[i]
+        page_size < 8  -> PagedAttentionMetadata.csr(legacy indices)
+        page_size >= 8 -> PagedAttentionMetadata.dense(indices per request)
+    """
+
+    def __init__(
+        self,
+        *,
+        q,
+        k,
+        v,
+        q_indptr_cpu,
+        kv_indptr_cpu,
+        kv_indices_cpu,
+        last_page_len_cpu,
+        page_size,
+        kv_layout,
+    ):
+        self.q, self.k, self.v = q, k, v
+        self.q_indptr_cpu = q_indptr_cpu.to("cpu", torch.int32)
+        self.kv_indptr_cpu = kv_indptr_cpu.to("cpu", torch.int32)
+        self.kv_indices_cpu = kv_indices_cpu.to("cpu", torch.int32)
+        self.last_page_len_cpu = last_page_len_cpu.to("cpu", torch.int32)
+        self.page_size = page_size
+        self.kv_layout = kv_layout
+        pages = self.kv_indptr_cpu.diff()
+        self.kv_seq_lens_cpu = torch.where(
+            pages > 0,
+            (pages - 1) * page_size + self.last_page_len_cpu,
+            torch.zeros_like(pages),
+        ).to(torch.int32)
+        self.q_lens_cpu = self.q_indptr_cpu.diff()
+
+    @property
+    def batch_size(self):
+        return int(self.kv_seq_lens_cpu.shape[0])
+
+    @property
+    def num_qo_heads(self):
+        return int(self.q.shape[1])
+
+    @property
+    def num_kv_heads(self):
+        return int(self.k.shape[2] if self.kv_layout == "NHD" else self.k.shape[1])
+
+    @property
+    def head_dim_qk(self):
+        return int(self.k.shape[3])
+
+    @property
+    def head_dim_vo(self):
+        return int(self.v.shape[3])
+
+    @property
+    def dtype(self):
+        return self.q.dtype
+
+    def plan_kwargs(self):
+        return dict(
+            num_qo_heads=self.num_qo_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim_qk=self.head_dim_qk,
+            head_dim_vo=self.head_dim_vo,
+            q_dtype=self.dtype,
+            kv_dtype=self.k.dtype,
+            kv_layout=self.kv_layout,
+        )
+
+    def resolve_kwargs(self):
+        return dict(
+            num_qo_heads=self.num_qo_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim_qk=self.head_dim_qk,
+            head_dim_vo=self.head_dim_vo,
+            q_dtype=self.dtype,
+            kv_dtype=self.k.dtype,
+            page_size=self.page_size,
+            kv_layout=self.kv_layout,
+        )
+
+    # ---- per-request views (the legacy reference's gather) ----
+    def page_ids(self, i):
+        return self.kv_indices_cpu[
+            int(self.kv_indptr_cpu[i]) : int(self.kv_indptr_cpu[i + 1])
+        ]
+
+    def request_q(self, i):
+        return self.q[int(self.q_indptr_cpu[i]) : int(self.q_indptr_cpu[i + 1])]
+
+    def request_kv(self, i, k=None, v=None):
+        """(kv_len, Hkv, D) K and V of request ``i`` gathered from the pools --
+        the legacy tests' ``cat(full pages, last page[:last_page_len])``."""
+        k = self.k if k is None else k
+        v = self.v if v is None else v
+        kv_len = int(self.kv_seq_lens_cpu[i])
+        ids = self.page_ids(i).to(k.device, torch.long)
+
+        def gather(pool):
+            pages = pool[ids]
+            if self.kv_layout == "HND":
+                pages = pages.permute(0, 2, 1, 3)
+            return pages.reshape(-1, pages.shape[-2], pages.shape[-1])[:kv_len]
+
+        return gather(k), gather(v)
+
+    def prefix(self, n_requests):
+        """The first ``n_requests`` requests as a batch of their own (the
+        legacy batch-invariance fixture); the pools are shared."""
+        return LegacyBatch(
+            q=self.q[: int(self.q_indptr_cpu[n_requests])],
+            k=self.k,
+            v=self.v,
+            q_indptr_cpu=self.q_indptr_cpu[: n_requests + 1],
+            kv_indptr_cpu=self.kv_indptr_cpu[: n_requests + 1],
+            kv_indices_cpu=self.kv_indices_cpu[: int(self.kv_indptr_cpu[n_requests])],
+            last_page_len_cpu=self.last_page_len_cpu[:n_requests],
+            page_size=self.page_size,
+            kv_layout=self.kv_layout,
+        )
+
+    def truncated(self, kv_lens):
+        """The same requests over the first ``kv_lens[i]`` tokens of their
+        pages (a warm-up batch for the graph lifecycle)."""
+        kv_lens = torch.as_tensor(kv_lens, dtype=torch.int32)
+        assert bool((kv_lens >= 1).all()) and bool(
+            (kv_lens <= self.kv_seq_lens_cpu).all()
+        )
+        pages = (kv_lens + self.page_size - 1) // self.page_size
+        ids = torch.cat(
+            [self.page_ids(i)[: int(pages[i])] for i in range(self.batch_size)]
+        )
+        indptr = torch.cat([torch.zeros(1, dtype=torch.int32), pages.cumsum(0)]).to(
+            torch.int32
+        )
+        return LegacyBatch(
+            q=self.q,
+            k=self.k,
+            v=self.v,
+            q_indptr_cpu=self.q_indptr_cpu,
+            kv_indptr_cpu=indptr,
+            kv_indices_cpu=ids,
+            last_page_len_cpu=((kv_lens - 1) % self.page_size + 1).to(torch.int32),
+            page_size=self.page_size,
+            kv_layout=self.kv_layout,
+        )
+
+    # ---- lossless mapping to the unified form ----
+    def metadata(self, form=None, device=DEVICE, table_width=None):
+        """``table_width`` pads the dense table (CUDA-graph capacities need
+        every batch's table at the captured width)."""
+        form = form or ("csr" if self.page_size < 8 else "dense")
+        dev = torch.device(device)
+        common = dict(
+            page_size=self.page_size,
+            max_q_len=int(self.q_lens_cpu.max()),
+            max_kv_len=max(int(self.kv_seq_lens_cpu.max()), 1),
+            qo_indptr_cpu=self.q_indptr_cpu,
+            kv_seq_lens_cpu=self.kv_seq_lens_cpu,
+        )
+        if form == "csr":
+            return PagedAttentionMetadata.csr(
+                self.q_indptr_cpu.to(dev),
+                self.kv_seq_lens_cpu.to(dev),
+                self.kv_indices_cpu.to(dev),
+                **common,
+            )
+        assert form == "dense", form
+        pages = self.kv_indptr_cpu.diff()
+        width = int(pages.max()) if table_width is None else table_width
+        assert width >= int(pages.max())
+        table = torch.zeros(self.batch_size, width, dtype=torch.int32)
+        for i in range(self.batch_size):
+            table[i, : int(pages[i])] = self.page_ids(i)
+        return PagedAttentionMetadata.dense(
+            self.q_indptr_cpu.to(dev),
+            self.kv_seq_lens_cpu.to(dev),
+            table.to(dev),
+            **common,
+        )
+
+
+def legacy_uniform_batch(
+    *,
+    batch_size,
+    kv_len,
+    qo_len,
+    page_size,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    seed,
+    kv_layout="NHD",
+    dtype=torch.float16,
+    combined=True,
+    fp32_source=True,
+    scale=1.0,
+    device=DEVICE,
+):
+    """The legacy ``test_batch_prefill_kernels`` fixture: uniform lengths,
+    ``paged_kv_indices = arange(total_pages)``, last page ``(kv_len - 1) % P +
+    1``; a combined ``(pages, 2, ...)`` pool (K/V are its views) or two pools;
+    K/V drawn in fp32 and rounded (``fp32_source``) as the legacy main test
+    does, or directly in ``dtype``; ``scale`` divides q and the pools (the
+    legacy ``/10`` fixtures)."""
+    torch.manual_seed(seed)
+    dev = torch.device(device)
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, device=dev, dtype=dtype
+    )
+    if scale != 1.0:
+        q = q / scale
+    pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_pages = pages_per_seq * batch_size
+    if kv_layout == "HND":
+        pool_shape = (num_kv_heads, page_size, head_dim)
+    else:
+        pool_shape = (page_size, num_kv_heads, head_dim)
+    src_dtype = torch.float32 if fp32_source else dtype
+
+    def draw(shape):
+        t = torch.randn(*shape, dtype=src_dtype, device=dev)
+        if scale != 1.0:
+            t = t / scale
+        return t.to(dtype)
+
+    if combined:
+        kv = draw((total_pages, 2, *pool_shape))
+        k, v = kv[:, 0], kv[:, 1]  # views, no copy
+        assert k.data_ptr() == kv.data_ptr() and not k.is_contiguous()
+    else:
+        k = draw((total_pages, *pool_shape))
+        v = draw((total_pages, *pool_shape))
+    return LegacyBatch(
+        q=q,
+        k=k,
+        v=v,
+        q_indptr_cpu=torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len,
+        kv_indptr_cpu=torch.arange(0, batch_size + 1, dtype=torch.int32)
+        * pages_per_seq,
+        kv_indices_cpu=torch.arange(0, total_pages, dtype=torch.int32),
+        last_page_len_cpu=torch.full(
+            (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
+        ),
+        page_size=page_size,
+        kv_layout=kv_layout,
+    )
+
+
+# ---------------------------------------------------------------------------
+# legacy reference methods and assertions
+# ---------------------------------------------------------------------------
+
+
+def legacy_reference_single_prefill(
+    lb,
+    *,
+    causal,
+    window_left=-1,
+    logits_soft_cap=0.0,
+    backend="auto",
+    custom_mask=None,
+    pos_encoding_mode="NONE",
+    k=None,
+    v=None,
+):
+    """The legacy reference method: ``single_prefill_with_kv_cache`` per
+    request on the legacy per-request K/V gather, concatenated.
+    ``custom_mask`` is a callable ``i -> mask_i``."""
+    outs = []
+    for i in range(lb.batch_size):
+        ki, vi = lb.request_kv(i, k, v)
+        kw = {}
+        if custom_mask is not None:
+            kw["custom_mask"] = custom_mask(i)
+        outs.append(
+            flashinfer.prefill.single_prefill_with_kv_cache(
+                lb.request_q(i),
+                ki,
+                vi,
+                causal=causal,
+                pos_encoding_mode=pos_encoding_mode,
+                logits_soft_cap=logits_soft_cap,
+                window_left=window_left,
+                backend=backend,
+                **kw,
+            )
+        )
+    return torch.cat(outs)
+
+
+def legacy_paged_wrapper(
+    lb,
+    *,
+    backend="fa2",
+    causal=True,
+    logits_soft_cap=0.0,
+    window_left=-1,
+    workspace_mb=256,
+):
+    """The legacy ``BatchPrefillWithPagedKVCacheWrapper`` planned for the
+    batch (the legacy tests' own reference where they compare wrapper against
+    wrapper); the caller runs it."""
+    dev = torch.device(DEVICE)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(workspace_mb * MB, dtype=torch.uint8, device=dev),
+        kv_layout=lb.kv_layout,
+        backend=backend,
+    )
+    wrapper.plan(
+        lb.q_indptr_cpu.to(dev),
+        lb.kv_indptr_cpu.to(dev),
+        lb.kv_indices_cpu.to(dev),
+        lb.last_page_len_cpu.to(dev),
+        lb.num_qo_heads,
+        lb.num_kv_heads,
+        lb.head_dim_qk,
+        lb.page_size,
+        causal=causal,
+        q_data_type=lb.dtype,
+        kv_data_type=lb.k.dtype,
+        logits_soft_cap=logits_soft_cap,
+        window_left=window_left,
+    )
+    return wrapper
+
+
+def assert_legacy_isclose(out, ref, *, rtol, atol, what="output"):
+    """The legacy assertion of the group-A suites: ``torch.isclose`` mismatch
+    count, one sync (``assert_legacy_close`` above is the group-C form with the
+    legacy 1e-7 mismatch allowance)."""
+    assert out.shape == ref.shape, (
+        f"{what}: shape {tuple(out.shape)} vs {tuple(ref.shape)}"
+    )
+    close = torch.isclose(out.float(), ref.float(), rtol=rtol, atol=atol)
+    bad = int((~close).sum())
+    if bad:
+        diff = (out.float() - ref.float()).abs()
+        raise AssertionError(
+            f"{what}: {bad}/{out.numel()} elements outside the legacy tolerance "
+            f"rtol={rtol} atol={atol}; max abs diff {diff.max().item():.3e}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# the fp32 oracle on a legacy batch (query-row chunked for long requests)
+# ---------------------------------------------------------------------------
+
+
+def oracle_on_batch(
+    lb,
+    *,
+    causal,
+    window_left=-1,
+    sm_scale=None,
+    lse_base="2",
+    custom_mask=None,
+    logits_soft_cap=None,
+    q=None,
+    k=None,
+    v=None,
+    max_rows=2048,
+):
+    """``reference_paged_prefill`` on the legacy batch.  A request longer than
+    ``max_rows`` query rows is split into row chunks, each a pseudo-request
+    whose KV is truncated to ``kv_len - q_len + chunk_end`` (bottom-right
+    causal alignment and the sliding window depend only on the absolute
+    query position, which the truncation preserves), so the (H, lq, lkv)
+    score tensor of the 8190x7939 legacy config stays bounded.  Rows carrying
+    a custom mask, or non-causal windows, are never chunked."""
+    q = lb.q if q is None else q
+    k = lb.k if k is None else k
+    v = lb.v if v is None else v
+    P = lb.page_size
+    q_lens, kv_lens, pages = [], [], []
+    for i in range(lb.batch_size):
+        lq, lkv = int(lb.q_lens_cpu[i]), int(lb.kv_seq_lens_cpu[i])
+        ids = lb.page_ids(i)
+        chunk = custom_mask is None and lq > max_rows and (causal or window_left < 0)
+        if not chunk:
+            q_lens.append(lq)
+            kv_lens.append(lkv)
+            pages.append(ids[: (lkv + P - 1) // P])
+            continue
+        for a in range(0, lq, max_rows):
+            b = min(a + max_rows, lq)
+            kv_b = lkv - lq + b if causal else lkv
+            q_lens.append(b - a)
+            kv_lens.append(kv_b)
+            pages.append(ids[: (kv_b + P - 1) // P])
+    qo_indptr_cpu = torch.tensor(
+        [0] + list(itertools.accumulate(q_lens)), dtype=torch.int32
+    )
+    kv_lens_cpu = torch.tensor(kv_lens, dtype=torch.int32)
+    flat = torch.cat(pages).to(q.device, torch.int32)
+    return reference_paged_prefill(
+        q.contiguous(),
+        k,
+        v,
+        qo_indptr_cpu,
+        kv_lens_cpu,
+        None,
+        P,
+        causal,
+        sm_scale=sm_scale,
+        window_left=window_left,
+        kv_layout=lb.kv_layout,
+        kv_page_indices=flat,
+        lse_base=lse_base,
+        logits_soft_cap=logits_soft_cap,
+        custom_mask=custom_mask,
+    )
+
+
+def assert_oracle(lb, out, lse, *, causal, lse_mode="base2", **kw):
+    """The independent check: output against ``OUT_TOL``, LSE (when the plan
+    asked for one) finite, contract-shaped and within ``LSE_TOL``."""
+    ref_out, ref_lse = oracle_on_batch(
+        lb, causal=causal, lse_base="e" if lse_mode == "basee" else "2", **kw
+    )
+    assert torch.isfinite(out).all(), "non-finite output"
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    if lse_mode == "none":
+        assert lse is None
+    else:
+        assert (
+            lse.shape == (out.shape[0], lb.num_qo_heads) and lse.dtype == torch.float32
+        )
+        assert torch.isfinite(lse).all(), "non-finite LSE"
+        torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+    return ref_out, ref_lse
+
+
+# ---------------------------------------------------------------------------
+# unified plan / run with explicit backend pinning
+# ---------------------------------------------------------------------------
+
+
+def resolve_batch_or_skip(
+    lb,
+    md,
+    backend,
+    *,
+    causal=True,
+    window_left=-1,
+    need_lse=True,
+    logits_soft_cap=None,
+    custom_mask=False,
+):
+    """Resolution for the legacy configuration, or a skip that records WHY
+    this backend cannot run the row (the report reads it as a capability
+    exclusion, never as coverage)."""
+    try:
+        return resolve_paged_attention(
+            device=torch.device(DEVICE),
+            **lb.resolve_kwargs(),
+            causal=causal,
+            need_lse=need_lse,
+            window_left=window_left,
+            kv_input_form=md.kv_input_form,
+            logits_soft_cap=logits_soft_cap,
+            custom_mask=custom_mask,
+            backend=backend,
+        )
+    except ValueError as e:
+        pytest.skip(f"[{backend}] capability-excluded: {e}")
+
+
+def plan_batch(
+    lb,
+    md,
+    backend,
+    *,
+    causal=True,
+    window_left=-1,
+    lse_mode="base2",
+    logits_soft_cap=None,
+    custom_mask=None,
+    attn=None,
+):
+    """Resolve (or skip with the reason), plan on ``attn`` (a fresh eager
+    instance by default) and assert the pinned backend was chosen."""
+    res = resolve_batch_or_skip(
+        lb,
+        md,
+        backend,
+        causal=causal,
+        window_left=window_left,
+        need_lse=lse_mode != "none",
+        logits_soft_cap=logits_soft_cap,
+        custom_mask=custom_mask is not None,
+    )
+    attn = attn if attn is not None else PagedAttention(torch.device(DEVICE))
+    attn.plan(
+        md,
+        **lb.plan_kwargs(),
+        causal=causal,
+        window_left=window_left,
+        lse_mode=lse_mode,
+        logits_soft_cap=logits_soft_cap,
+        custom_mask=custom_mask,
+        backend=backend,
+    )
+    if backend == "auto":
+        assert attn.backend in res.backends, attn.explain()
+    else:
+        assert attn.backend == backend, attn.explain()
+    return attn
+
+
+def run_batch(
+    lb,
+    md,
+    backend,
+    *,
+    q=None,
+    k=None,
+    v=None,
+    sm_scale=None,
+    k_scale=None,
+    v_scale=None,
+    **plan_kw,
+):
+    attn = plan_batch(lb, md, backend, **plan_kw)
+    out, lse = attn.run(
+        lb.q if q is None else q,
+        (lb.k if k is None else k, lb.v if v is None else v),
+        sm_scale=sm_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    return attn, out, lse
+
+
+def graph_capacity_for(lb, md):
+    """The capacity of exactly this batch in its paging form (dense: the
+    table's width rule ``max_kv_len == table_width * page_size``)."""
+    common = dict(
+        batch_size=lb.batch_size,
+        total_q_tokens=int(lb.q_indptr_cpu[-1]),
+        max_q_len=int(lb.q_lens_cpu.max()),
+        page_size=lb.page_size,
+    )
+    if md.kv_input_form == "block_tables":
+        width = int(md.block_tables.shape[1])
+        return GraphCapacity(
+            max_kv_len=width * lb.page_size, table_width=width, **common
+        )
+    return GraphCapacity(
+        max_kv_len=max(int(lb.kv_seq_lens_cpu.max()), 1),
+        kv_input_form="page_indices",
+        flat_capacity=int(md.kv_page_indices.shape[0]),
+        **common,
+    )
+
+
+_SHARED_WORKSPACE = None
+
+
+def shared_workspace(nbytes: int) -> torch.Tensor:
+    """One growing caller-owned scratch buffer for the graph-mode rows (the
+    tests run sequentially, so sharing it is legal).  ``workspace_requirements``
+    asks for several GiB at the largest legacy graph geometries (B128 x
+    kv2048 with 32 heads: capacity substitution plans the fa2 split-KV
+    scratch for the capacity maxes), where the 128 MiB library default -- and
+    the legacy wrapper's 128 MiB, hence the legacy xfail -- overflows."""
+    global _SHARED_WORKSPACE
+    if _SHARED_WORKSPACE is None or _SHARED_WORKSPACE.numel() < nbytes:
+        _SHARED_WORKSPACE = None
+        _SHARED_WORKSPACE = torch.empty(
+            nbytes, dtype=torch.uint8, device=torch.device(DEVICE)
+        )
+    return _SHARED_WORKSPACE[:nbytes]
+
+
+def run_batch_graph(
+    lb,
+    md,
+    backend,
+    *,
+    q=None,
+    k=None,
+    v=None,
+    sm_scale=None,
+    k_scale=None,
+    v_scale=None,
+    warmup_runs=3,
+    causal=True,
+    **plan_kw,
+):
+    """The legacy ``use_cuda_graph=True`` rows through the unified graph
+    lifecycle, in the legacy order: a capacity sized for the batch, a
+    workspace sized by ``workspace_requirements`` for it, a plan on a warm-up
+    batch (the same requests over ``q_len`` tokens if causal, one token
+    otherwise -- the legacy warm-up planned one page per request), eager
+    warm-up runs on a side stream, capture one ``run()``, ``update()`` to the
+    legacy batch, replay.  Returns the captured output buffers."""
+    dev = torch.device(DEVICE)
+    q = lb.q if q is None else q
+    k = lb.k if k is None else k
+    v = lb.v if v is None else v
+    width = (
+        int(md.block_tables.shape[1]) if md.kv_input_form == "block_tables" else None
+    )
+    warm_lens = lb.q_lens_cpu.clamp(min=1) if causal else torch.ones_like(lb.q_lens_cpu)
+    warm = lb.truncated(torch.minimum(warm_lens, lb.kv_seq_lens_cpu))
+    warm_md = warm.metadata("dense" if width is not None else "csr", table_width=width)
+    feature_kw = {
+        key: plan_kw[key]
+        for key in ("window_left", "logits_soft_cap")
+        if key in plan_kw
+    }
+    res = resolve_batch_or_skip(lb, md, backend, causal=causal, **feature_kw)
+    cap = graph_capacity_for(lb, md)
+    # the legacy graph rows were an xfail for the wrapper's 128 MiB workspace
+    # overflow; the unified contract sizes the scratch for the capacity
+    nbytes = PagedAttention.workspace_requirements(
+        cap,
+        device=dev,
+        **lb.plan_kwargs(),
+        causal=causal,
+        need_lse=plan_kw.get("lse_mode", "base2") != "none",
+        use_cuda_graph=True,
+        backend=res,
+        **feature_kw,
+    )
+    attn = PagedAttention(
+        dev, graph_capacity=cap, workspace_buffer=shared_workspace(nbytes)
+    )
+    plan_batch(warm, warm_md, backend, attn=attn, causal=causal, **plan_kw)
+    kw = dict(sm_scale=sm_scale, k_scale=k_scale, v_scale=v_scale)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(warmup_runs):
+            out, lse = attn.run(q, (k, v), **kw)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out, lse = attn.run(q, (k, v), **kw)
+    attn.update(md)
+    g.replay()
+    torch.cuda.synchronize()
+    return attn, out, lse
+
+
+# ---------------------------------------------------------------------------
+# rejection helpers for the support-surface gaps
+# ---------------------------------------------------------------------------
+
+
+def assert_every_backend_excluded(match, *, also=(), **cfg):
+    """Every backend is excluded and each reason names the axis (``match``),
+    one of the ``also`` axes the configuration violates first, or the
+    device's compute capability; ``auto`` raises the aggregated ValueError."""
+    with pytest.raises(ValueError, match="no runnable backend") as ei:
+        resolve_paged_attention(device=torch.device(DEVICE), backend="auto", **cfg)
+    assert match in str(ei.value), str(ei.value)
+    accepted = (match, "compute capability", *also)
+    for backend in BACKENDS[:-1]:
+        with pytest.raises(ValueError) as ei:
+            resolve_paged_attention(device=torch.device(DEVICE), backend=backend, **cfg)
+        msg = str(ei.value)
+        assert any(a in msg for a in accepted), f"{backend}: {msg}"
+
+
+def assert_nvfp4_unsupported(
+    *,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim_qk,
+    head_dim_vo,
+    page_size,
+    q_dtype,
+    causal,
+    kv_layout="NHD",
+    what="",
+):
+    """The legacy NVFP4 rows: a packed uint8 KV cache is not a declared KV
+    dtype (every backend excluded with the dtype -- or, for D512 /
+    asymmetric entries, the head-dim -- reason) and ``run()`` has no
+    ``kv_cache_sf``.  Flipping ``EXPECT_NVFP4_KV`` marks the row for the
+    quantization-descriptor extension."""
+    cfg = dict(
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim_qk,
+        head_dim_vo=head_dim_vo,
+        q_dtype=q_dtype,
+        kv_dtype=torch.uint8,
+        page_size=page_size,
+        kv_layout=kv_layout,
+        causal=causal,
+        # the flat page-id form is legal at every page size (the dense form
+        # is refused below MIN_DENSE_PAGE_SIZE before any backend is asked)
+        kv_input_form="page_indices",
+    )
+    with pytest.raises(ValueError, match="no runnable backend") as ei:
+        resolve_paged_attention(device=torch.device(DEVICE), backend="auto", **cfg)
+    msg = str(ei.value)
+    assert (
+        "unsupported kv dtype torch.uint8" in msg or "unsupported head dims" in msg
+    ), msg
+    assert "kv_cache_sf" not in run_signature_params()
+    if EXPECT_NVFP4_KV:
+        pytest.fail(f"EXPECT_NVFP4_KV is set: port the legacy NVFP4 fixture ({what})")
+
+
+def assert_rope_kwargs_rejected(lb, md=None, backend="fa2"):
+    """The legacy ``pos_encoding_mode="ROPE_LLAMA"`` rows: ``plan()`` has no
+    positional-encoding argument (RoPE is the caller's, applied before the
+    call), so the legacy kwargs are a TypeError, never a silent NONE."""
+    params = plan_signature_params()
+    for name in ("pos_encoding_mode", "rope_scale", "rope_theta"):
+        assert name not in params, f"plan() grew {name!r}: port the ROPE_LLAMA rows"
+    if EXPECT_ROPE:
+        pytest.fail(
+            "EXPECT_ROPE is set: run the ROPE_LLAMA rows through the fused plan"
+        )
+    with pytest.raises(TypeError, match="pos_encoding_mode"):
+        PagedAttention(torch.device(DEVICE)).plan(
+            lb.metadata() if md is None else md,
+            **lb.plan_kwargs(),
+            causal=True,
+            pos_encoding_mode="ROPE_LLAMA",
+            backend=backend,
+        )
+
+
+def apply_external_rope(lb, *, q=None, k=None, rope_theta=1e4):
+    """The migration adapter for the fused ROPE_LLAMA rows: rotate q at its
+    absolute positions ``kv_len - q_len + r`` and the request's K pages at
+    positions ``j`` with ``flashinfer.apply_rope_pos_ids`` (Llama
+    non-interleaved, theta 1e4, scale 1: the fused kernel's defaults).
+    Returns rotated copies; the caller's tensors are untouched.  Requests
+    must not share pages (each page is rotated once, in its request's
+    position frame)."""
+    q = lb.q if q is None else q
+    k = lb.k if k is None else k
+    dev = q.device
+    q_rot = q.clone()
+    # keep K's strides: a combined-pool view (page stride 2 * P * H * D) must
+    # stay in the same stride family as its V view (trtllm-gen / cake read V
+    # with K's strides and reject a mismatch, ledger M16); clone() would
+    # compact it
+    k_rot = torch.empty_strided(k.shape, k.stride(), dtype=k.dtype, device=k.device)
+    k_rot.copy_(k)
+    P, Hk, D = lb.page_size, lb.num_kv_heads, lb.head_dim_qk
+    for i in range(lb.batch_size):
+        s, e = int(lb.q_indptr_cpu[i]), int(lb.q_indptr_cpu[i + 1])
+        lq, lkv = e - s, int(lb.kv_seq_lens_cpu[i])
+        if lq:
+            pos_q = torch.arange(lkv - lq, lkv, dtype=torch.int32, device=dev)
+            q_i = q[s:e].contiguous()
+            q_rot[s:e] = flashinfer.apply_rope_pos_ids(
+                q_i, q_i, pos_q, rope_theta=rope_theta
+            )[0]
+        ids = lb.page_ids(i).to(dev, torch.long)
+        if ids.numel() == 0:
+            continue
+        pages = k_rot[ids]
+        if lb.kv_layout == "HND":
+            pages = pages.permute(0, 2, 1, 3)
+        rows = pages.reshape(-1, Hk, D).contiguous()
+        pos_k = torch.arange(rows.shape[0], dtype=torch.int32, device=dev)
+        rows = flashinfer.apply_rope_pos_ids(rows, rows, pos_k, rope_theta=rope_theta)[
+            1
+        ]
+        pages = rows.reshape(ids.numel(), P, Hk, D)
+        if lb.kv_layout == "HND":
+            pages = pages.permute(0, 2, 1, 3)
+        k_rot[ids] = pages
+    return q_rot, k_rot
