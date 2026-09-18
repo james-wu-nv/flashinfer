@@ -291,6 +291,15 @@ class PagedAttentionMetadata:
     the native calls); ``qo_indptr`` must be non-decreasing and the batch
     must hold at least one query token.
 
+    In-page tail: the slots of a request's last page past ``kv_seq_lens[i]``
+    are never attended, but they must hold finite values.  The FA kernels
+    zero the tail before the PV product; trtllm-gen, cake and cuDNN load the
+    whole page and multiply the masked (zero) probabilities with V, so a NaN
+    or Inf there reaches the output as ``0 * NaN`` (ledger M23, measured on
+    B200).  Any finite content — stale tokens of an earlier request, zeros —
+    gives the exact result; a pool that is never written past ``kv_len`` is
+    only safe if its storage was initialised.
+
     Identity semantics: two objects compare by identity, not by tensor
     contents (they are meant to be built once per step and reused).
     """

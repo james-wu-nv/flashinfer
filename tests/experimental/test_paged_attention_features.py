@@ -620,3 +620,20 @@ def test_fa2_kernel_noncausal_sliding_window_defect():
         kv_page_indices=ids,
     )
     torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("head_dim", [128, 256])
+def test_attention_sinks_with_fp8_kv(kv_dtype, head_dim):
+    """fa2 attention sinks over an fp8 KV cache (M22): the sink variant used to
+    be declined at plan time as "not verified"; measured on B200 it matches
+    the sink-aware oracle on the dequantized cache, with k_scale folded into
+    the launch scale and v_scale applied to the output."""
+    p = make_problem(
+        seed=140 + head_dim, **dict(_SHAPE, head_dim_qk=head_dim), kv_dtype=kv_dtype
+    )
+    _skip_unless_runnable(p, "fa2", sinks=True)
+    sinks = _sinks(p, 3)
+    attn, out, lse = _run(p, "fa2", sinks=sinks, use_sinks=True)
+    assert attn.backend == "fa2"
+    _assert_matches(out, lse, *_reference(p, sinks=sinks))

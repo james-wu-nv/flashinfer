@@ -80,14 +80,16 @@ EXPECT_ATTENTION_VARIANTS = (
 # 2026-09-18): fa2 masks the in-page tail past kv_len of a request's last page
 # before the PV product, so a non-finite tail is harmless; trtllm-gen, cake and
 # cuDNN over-read the tail and 0 x NaN reaches the output (the TensorSpeed and
-# modular legacy suites poison exactly that tail).  Flip when every backend
-# ignores the tail (or the input contract states the tail must be finite).
+# modular legacy suites poison exactly that tail).  The input contract now
+# states the tail must be finite (PagedAttentionMetadata docstring, ledger
+# M23), so the flag stays False by design: the poisoned-tail legacy cases are
+# outside the contract and are recorded, not required.
 EXPECT_INPAGE_TAIL_IGNORED = False
-# fa2 attention sinks: the AttentionSink JIT variant declines an fp8 KV cache at
-# plan time ("not verified", _backends/fa_backend.py) although the capability
-# table admits fp8 KV and sinks separately -- the XQA legacy suite runs sinks
-# with an fp8 KV natively.  Flip when the adapter verifies the pair.
-EXPECT_FA2_SINKS_FP8_KV = False
+# fa2 attention sinks with an fp8 KV cache: the AttentionSink JIT variant used
+# to decline the pair at plan time ("not verified"); measured on B200 (ledger
+# M22, e4m3 / e5m2 at D128 / D256) it matches the sink-aware oracle, the
+# decline is gone and the XQA fp8 rows run.
+EXPECT_FA2_SINKS_FP8_KV = True
 # fa2 attention sinks at head_dim 512 compute WRONG values on B200 (2026-09-18,
 # XQA legacy fixture: q_len 1, kv <= 111, H8:2 / 10:2 / 32:2, bf16 and fp16,
 # NHD and HND, with and without window 127; 55% of the elements off by up to

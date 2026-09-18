@@ -256,8 +256,10 @@ class _FaBackend:
             self._check_workspace(meta)
         if meta.use_sinks:
             # The AttentionSink variant owns the softmax update: it has no
-            # soft-cap hook, and its combination with MaskMode.CUSTOM and
-            # with fp8 KV dequantization is not verified by any suite.
+            # soft-cap hook, and its combination with MaskMode.CUSTOM is not
+            # verified by any suite.  fp8 KV with sinks IS verified (B200,
+            # 2026-09-18: e4m3 / e5m2 at D128 / D256 match the sink-aware
+            # oracle to 4e-3; k_scale folds into the launch scale below).
             if meta.logits_soft_cap is not None:
                 raise _BackendPlanUnsupportedError(
                     f"{self.name} AttentionSink kernel variant has no logits soft cap"
@@ -265,10 +267,6 @@ class _FaBackend:
             if meta.custom_mask is not None:
                 raise _BackendPlanUnsupportedError(
                     f"{self.name} attention sinks with a custom mask are not verified"
-                )
-            if meta.kv_dtype != meta.q_dtype:
-                raise _BackendPlanUnsupportedError(
-                    f"{self.name} attention sinks with an fp8 KV cache are not verified"
                 )
         if meta.custom_mask is not None and self._graph_capacity is not None:
             # Not a fallback case (no other backend takes custom masks): the
@@ -551,7 +549,9 @@ class _FaBackend:
             sm_scale = sm_scale * k_scale
         if self._use_sinks:
             # AttentionSink variant: the sink tensor and sm_scale are the
-            # module's additional run() arguments (positional, in that order)
+            # module's additional run() arguments (positional, in that order);
+            # sm_scale already carries k_scale (folded above), v_scale is
+            # applied below over the whole buffer
             r = self._active.run(
                 q_v,
                 (k_cache, v_cache),
