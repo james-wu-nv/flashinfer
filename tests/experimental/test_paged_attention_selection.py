@@ -334,7 +334,9 @@ def test_trtllm_gen_noncausal_is_declared_but_not_with_a_window():
     with pytest.raises(ValueError, match="no runnable backend") as ei:
         resolve_paged_attention(cc_major=10, **dict(_CFG, causal=False, window_left=16))
     detail = str(ei.value)
-    assert "trtllm-gen: sliding window with non-causal attention not supported" in detail
+    assert (
+        "trtllm-gen: sliding window with non-causal attention not supported" in detail
+    )
     assert "fa2: sliding window with non-causal attention not supported" in detail
     assert "cudnn" in detail  # no window at all
 
