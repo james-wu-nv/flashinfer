@@ -190,8 +190,8 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
-        "slow: full legacy parameter grid of a parity test; deselect with "
-        '-m "not slow" (the default subset covers every axis value)',
+        "slow: full legacy parameter grid of a parity test; skipped unless "
+        "FI_PARITY_SLOW=1 (the default subset covers every axis value)",
     )
     config.addinivalue_line(
         "markers",
@@ -216,7 +216,19 @@ def pytest_collection_modifyitems(config, items):
         else (0, 0)
     )
 
+    # Legacy-parity grids (tests/experimental/test_paged_attention_legacy_
+    # parity_*.py) keep every legacy parameter point under `slow`; a plain
+    # run executes the default subsets only, FI_PARITY_SLOW=1 opts in to the
+    # full grids (hours on a shared GPU).
+    run_slow = os.environ.get("FI_PARITY_SLOW", "0") == "1"
+
     for item in items:
+        if "slow" in item.keywords and not run_slow:
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="full legacy parity grid; set FI_PARITY_SLOW=1 to run"
+                )
+            )
         if "nvep" in item.keywords and not nvep_built:
             item.add_marker(
                 pytest.mark.skip(

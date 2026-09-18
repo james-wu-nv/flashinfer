@@ -25,8 +25,9 @@ run where the legacy test used the default backend.  A row whose backend is
 capability-excluded skips with the resolve reason -- the manifest status of
 that row is ``partial`` for that backend, never ``equivalent``.  The full
 legacy parameter grids are kept under the ``slow`` marker (legacy backend
-only); the default run covers a deterministic subset in which every axis
-value appears at least once.  Shapes are never shrunk.
+only), which ``tests/conftest.py`` skips unless ``FI_PARITY_SLOW=1``; the
+default run covers a deterministic subset in which every axis value appears
+at least once.  Shapes are never shrunk.
 
 ``LEGACY_MAP`` below is the per-file crosswalk (format: PLAN.md §2); the
 gap rows (RoPE, head_dim 512, NVFP4, ...) live in
