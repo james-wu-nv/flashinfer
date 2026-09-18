@@ -763,6 +763,28 @@ time, and frozen by the first graph-mode plan:
   envelope (`_envelope_mask`) because `MaskMode.CUSTOM` replaces the kernel's
   causal mask, so a mask never widens the envelope. Not available in graph
   mode.
+  *Packed masks (design note, WP-T).* The legacy wrapper also takes a
+  pre-packed `packed_custom_mask`: a uint8 tensor produced by
+  `segment_packbits(mask, mask_indptr, bitorder="little")`, i.e. each
+  request's row-major `(q_len_i, kv_len_i)` mask packed separately, eight
+  positions per byte, least significant bit first, every request padded to a
+  byte boundary, addressed by a `mask_indptr` the wrapper derives from the
+  page metadata. The unified API does not accept it, for three reasons. (1)
+  The contract ANDs the mask with the causal / window envelope; for a packed
+  input the FA adapter would have to unpack it on the device, AND, and hand
+  the bool mask to the wrapper, which packs it again with the same
+  `segment_packbits` kernel — the caller saves nothing and the plan gains
+  two passes. (2) A pass-through that skips the repack is correct only with
+  `causal=False, window_left=-1` and would put the legacy encoding (bit
+  order, per-request byte alignment, a second indptr) into the public
+  contract as an adapter detail, which this design forbids. (3) Custom masks
+  are not in the CUDA-graph capacity yet; a second representation before the
+  mask storage joins `GraphCapacity` would have to be revisited then. A
+  caller holding a legacy packed mask unpacks it once on the device
+  (`(packed.unsqueeze(-1) >> torch.arange(8)) & 1`, per request, trimmed to
+  `q_len_i * kv_len_i`) and passes the bool mask. Revisit together with the
+  graph-mode mask storage; the pass-through variant is the candidate if a
+  consumer shows the repack on its plan path.
 - `use_sinks` / `run(sinks=)`: per-head attention sinks, one extra softmax
   denominator logit per head with no value contribution. fa2 and fa3 select
   the `AttentionSink` JIT variant wrapper at plan time (the default wrapper

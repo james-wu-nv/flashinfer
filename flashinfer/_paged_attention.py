@@ -488,7 +488,9 @@ class PagedAttention:
           may attend), on this instance's device.  It is ANDed into the
           causal / sliding-window envelope, so ``causal=True`` plus a mask
           never widens the envelope.  Not yet supported together with
-          ``use_cuda_graph=True``.
+          ``use_cuda_graph=True``.  The legacy wrapper's pre-packed uint8
+          ``packed_custom_mask`` is not accepted (its bit layout is a kernel
+          detail; unpack it to bool once, see the design doc).
         - ``use_sinks``: declare that ``run()`` will pass per-head attention
           sinks (the backend plans its sink-aware kernel variant); ``run()``
           then requires ``sinks=``.
