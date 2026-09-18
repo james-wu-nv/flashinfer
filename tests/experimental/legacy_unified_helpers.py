@@ -1,10 +1,11 @@
-"""Shared helpers for the legacy -> unified parity tests, group B.
+"""Shared helpers for the legacy -> unified conversion tests.
 
-The group-B parity files (``test_paged_attention_legacy_parity_b_*.py``)
-re-run each legacy paged-prefill test's OWN fixture through the unified
-``PagedAttention`` API and assert the legacy tolerance against the legacy
-reference and the independent fp32 oracle.  This module holds what every
-file needs and nothing backend-specific:
+The per-file conversion modules (``test_legacy_unified_<name>.py``, one per
+legacy ``tests/attention/test_<name>.py``) re-run each legacy paged-prefill
+test's OWN fixture through the unified ``PagedAttention`` API and assert the
+legacy tolerance against the legacy reference and the independent fp32
+oracle.  This module holds what every file needs and nothing
+backend-specific:
 
 - the ``EXPECT_*`` flags: one per legacy feature the unified API cannot
   express today.  A parity test for such a feature asserts the clear
@@ -279,15 +280,55 @@ def reference_long(
     return torch.cat(outs).to(dev), torch.cat(lses).to(dev)
 
 
+LEGACY_MAP_STATUSES = frozenset(
+    {"equivalent", "partial", "unsupported-by-design", "native-only", "out-of-scope"}
+)
+
+
 def check_legacy_map(legacy_map: Sequence, namespace: dict) -> None:
     """Every unified function a LEGACY_MAP row names exists in the module and
-    every row carries one of the four statuses (PLAN §2)."""
-    statuses = {"equivalent", "partial", "unsupported-by-design", "native-only"}
+    every row carries one of the five statuses (round-4 PLAN §1).  An
+    ``out-of-scope`` row (a legacy function that is not paged prefill:
+    ragged / single / decode-only) names no unified function; every other
+    status names at least one."""
     seen = set()
     for legacy, unified, status, note in legacy_map:
         assert legacy not in seen, f"duplicate legacy entry {legacy}"
         seen.add(legacy)
-        assert status in statuses, (legacy, status)
+        assert status in LEGACY_MAP_STATUSES, (legacy, status)
         assert isinstance(note, str) and note, legacy
+        if status == "out-of-scope":
+            assert not unified, f"{legacy}: out-of-scope rows name no unified test"
+        else:
+            assert unified, f"{legacy}: {status} rows name a unified test"
         for name in unified:
             assert callable(namespace.get(name)), f"{legacy}: {name} is not a test here"
+
+
+def legacy_test_functions(legacy_source: str) -> list:
+    """The ``test_*`` function names of a legacy test file (source scan, no
+    import: the legacy modules pull in backend-specific dependencies).  A
+    conversion module's self-check compares this with its LEGACY_MAP so every
+    legacy function has exactly one row."""
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    tree = ast.parse((root / legacy_source).read_text())
+    return [
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test_")
+    ]
+
+
+def check_legacy_map_complete(legacy_source: str, legacy_map: Sequence) -> None:
+    """One LEGACY_MAP row per legacy ``test_*`` function (PLAN §1: out-of-scope
+    functions included), keyed by ``<legacy_source>::<function>``."""
+    expected = {f"{legacy_source}::{fn}" for fn in legacy_test_functions(legacy_source)}
+    got = {row[0] for row in legacy_map}
+    assert got == expected, (
+        f"LEGACY_MAP rows missing: {sorted(expected - got)}; "
+        f"unexpected: {sorted(got - expected)}"
+    )
