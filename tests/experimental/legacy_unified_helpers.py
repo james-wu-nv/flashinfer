@@ -26,7 +26,11 @@ from typing import Callable, Optional, Sequence, TypeVar
 import pytest
 import torch
 
-from flashinfer.prefill import PagedAttentionMetadata, resolve_paged_attention
+from flashinfer.prefill import (
+    PagedAttention,
+    PagedAttentionMetadata,
+    resolve_paged_attention,
+)
 
 from .paged_attention_reference import reference_paged_prefill
 
@@ -332,3 +336,42 @@ def check_legacy_map_complete(legacy_source: str, legacy_map: Sequence) -> None:
         f"LEGACY_MAP rows missing: {sorted(expected - got)}; "
         f"unexpected: {sorted(got - expected)}"
     )
+
+
+def plan_pinned(
+    backend: str,
+    md: PagedAttentionMetadata,
+    *,
+    attn: Optional[PagedAttention] = None,
+    **plan_kw,
+) -> PagedAttention:
+    """Pin ``backend`` for a plan: ``resolve_or_skip`` on the plan's static
+    configuration (skip with the resolve reason when the capability table or
+    the probe excludes it), plan a ``PagedAttention`` (a fresh instance unless
+    ``attn`` is given, for re-plan scenarios) on the resolution and assert the
+    pinned backend was published.  ``plan_kw`` are the ``PagedAttention.plan``
+    keywords minus ``metadata`` / ``backend``."""
+    res = resolve_or_skip(
+        backend,
+        num_qo_heads=plan_kw["num_qo_heads"],
+        num_kv_heads=plan_kw["num_kv_heads"],
+        head_dim_qk=plan_kw["head_dim_qk"],
+        head_dim_vo=plan_kw.get("head_dim_vo"),
+        q_dtype=plan_kw["q_dtype"],
+        kv_dtype=plan_kw.get("kv_dtype"),
+        page_size=md.page_size,
+        kv_layout=plan_kw.get("kv_layout", "HND"),
+        causal=plan_kw.get("causal", True),
+        need_lse=plan_kw.get("lse_mode", "none") != "none",
+        window_left=plan_kw.get("window_left", -1),
+        kv_input_form="block_tables" if md.block_tables is not None else "page_indices",
+        logits_soft_cap=plan_kw.get("logits_soft_cap"),
+        custom_mask=plan_kw.get("custom_mask") is not None,
+        sinks=plan_kw.get("use_sinks", False),
+        max_q_len=md.max_q_len,
+    )
+    if attn is None:
+        attn = PagedAttention(torch.device(DEVICE))
+    attn.plan(md, backend=res, **plan_kw)
+    assert attn.backend == backend
+    return attn
