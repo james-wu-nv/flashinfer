@@ -524,12 +524,14 @@ def _time_candidate(
                 else:
                     # CUPTI (graph or eager) and eager CUDA events: the helper
                     # keeps the bindings fixed and flushes L2 between calls.
+                    # (enable_cupti follows the timer actually available, so
+                    # the helper's fallback warning is not re-issued per row.)
                     samples = bench_gpu_time(
                         fn=run_once,
                         dry_run_iters=args.dry_run_iters,
                         repeat_iters=args.num_iters,
                         sleep_after_run=False,
-                        enable_cupti=args.use_cupti,
+                        enable_cupti=ctx["timing_metric"] == "cupti",
                         use_cuda_graph=use_cuda_graph,
                         cold_l2_cache=True,
                         input_args=input_args,
