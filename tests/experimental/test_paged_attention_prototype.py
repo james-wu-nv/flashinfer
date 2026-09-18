@@ -28,6 +28,22 @@ BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen", "cake", "auto"]
 OUT_TOL = dict(atol=2e-2, rtol=2e-2)
 LSE_TOL = dict(atol=3e-2, rtol=2e-2)
 
+FP8_KV_DTYPES = [torch.float8_e4m3fn, torch.float8_e5m2]
+
+
+def quantize_kv(k_cache, v_cache, kv_dtype):
+    """Per-tensor fp8 quantization of a float K/V pool for the tests: scale =
+    amax / the format's largest finite value (448 for e4m3fn, 57344 for
+    e5m2), so both formats use their full range.  Returns the quantized
+    caches, the dequantized ``k_ref`` / ``v_ref`` the oracle reads, and the
+    two scales ``run()`` takes."""
+    qmax = torch.finfo(kv_dtype).max
+    k_scale = float(k_cache.abs().amax().item()) / qmax
+    v_scale = float(v_cache.abs().amax().item()) / qmax
+    k_q = (k_cache.float() / k_scale).to(kv_dtype)
+    v_q = (v_cache.float() / v_scale).to(kv_dtype)
+    return k_q, v_q, k_q.float() * k_scale, v_q.float() * v_scale, k_scale, v_scale
+
 
 def make_problem(
     seed,
@@ -53,9 +69,10 @@ def make_problem(
     both seeded by ``seed``, so a repro line reproduces the tensors bitwise
     (the fuzzer prints ``seed=`` on every failure).
 
-    ``kv_dtype=torch.float8_e4m3fn`` quantizes K/V per-tensor (scale = amax/448)
-    and keeps the dequantized values as ``k_ref``/``v_ref`` for the oracle, so
-    the kernel is judged on its math, not on the quantization error.
+    An fp8 ``kv_dtype`` (``float8_e4m3fn`` / ``float8_e5m2``) quantizes K/V
+    per-tensor (scale = amax / the format's largest finite value) and keeps
+    the dequantized values as ``k_ref``/``v_ref`` for the oracle, so the
+    kernel is judged on its math, not on the quantization error.
     """
     head_dim_vo = head_dim_vo or head_dim_qk
     g = torch.Generator().manual_seed(seed)
@@ -99,12 +116,9 @@ def make_problem(
     v_cache = torch.randn(*v_shape, dtype=dtype, device=device, generator=g_dev)
     k_ref, v_ref, k_scale, v_scale = k_cache, v_cache, None, None
     if kv_dtype is not None and kv_dtype != dtype:
-        k_scale = float(k_cache.abs().amax().item()) / 448.0
-        v_scale = float(v_cache.abs().amax().item()) / 448.0
-        k_cache = (k_cache.float() / k_scale).to(kv_dtype)
-        v_cache = (v_cache.float() / v_scale).to(kv_dtype)
-        k_ref = k_cache.float() * k_scale
-        v_ref = v_cache.float() * v_scale
+        k_cache, v_cache, k_ref, v_ref, k_scale, v_scale = quantize_kv(
+            k_cache, v_cache, kv_dtype
+        )
 
     # flat CSR page-id list: request-ordered concatenation of each row's
     # live prefix (same info as the dense table)
@@ -431,10 +445,13 @@ def test_paged_attention_noncausal(backend):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_paged_attention_fp8_kv(backend):
-    """fp8 (e4m3) KV cache with bf16 q and per-tensor k_scale/v_scale at run();
-    the oracle sees the dequantized values, so this checks the kernel's
-    in-kernel dequant + scale plumbing, not the quantization error."""
+@pytest.mark.parametrize("kv_dtype", FP8_KV_DTYPES, ids=["e4m3", "e5m2"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_paged_attention_fp8_kv(backend, kv_dtype, dtype):
+    """fp8 (e4m3 or e5m2) KV cache with a bf16 / fp16 q and per-tensor
+    k_scale/v_scale at run(); the oracle sees the dequantized values, so this
+    checks the kernel's in-kernel dequant + scale plumbing, not the
+    quantization error (e5m2 measured on B200, see the capability table)."""
     p = make_problem(
         seed=31,
         batch_size=4,
@@ -444,8 +461,8 @@ def test_paged_attention_fp8_kv(backend):
         num_kv_heads=2,
         head_dim_qk=128,
         page_size=16,
-        dtype=torch.bfloat16,
-        kv_dtype=torch.float8_e4m3fn,
+        dtype=dtype,
+        kv_dtype=kv_dtype,
     )
     check(p, backend)
 

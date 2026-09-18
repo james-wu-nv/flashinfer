@@ -270,14 +270,21 @@ def _capability_rows():
                 dict(q_dtype=torch.float32, kv_dtype=torch.float32),
                 "unsupported q dtype",
             ),
-            (name, "kv-e5m2", dict(kv_dtype=torch.float8_e5m2), "unsupported kv dtype"),
             (name, "kv-f16-q-bf16", dict(kv_dtype=torch.float16), "dtype pair"),
             (name, "d32", dict(head_dim_qk=32, head_dim_vo=32), "head dims"),
             (name, "nhd", dict(kv_layout="NHD"), None),
             (name, "no-lse", dict(need_lse=False), None),
         ]
+    # e5m2 KV: the generated fa2 kernels dequantize both fp8 formats
+    # (measured on B200, see _capabilities.py); nobody else declares fp8 KV
+    rows += [
+        (name, "kv-e5m2", dict(kv_dtype=torch.float8_e5m2), "unsupported kv dtype")
+        for name in CAPABILITIES
+        if name != "fa2"
+    ]
     rows += [
         ("fa2", "fp8-kv", dict(kv_dtype=torch.float8_e4m3fn), None),
+        ("fa2", "kv-e5m2", dict(kv_dtype=torch.float8_e5m2), None),
         ("fa2", "d64", dict(head_dim_qk=64, head_dim_vo=64), None),
         ("fa2", "d256", dict(head_dim_qk=256, head_dim_vo=256), None),
         ("fa2", "d192-128", dict(head_dim_qk=192, head_dim_vo=128), "head dims"),

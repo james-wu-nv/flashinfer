@@ -59,6 +59,7 @@ from .test_paged_attention_prototype import (
     _resolve_or_skip,
     make_metadata,
     make_problem,
+    quantize_kv,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -324,11 +325,7 @@ def _exact_problem(
     v = torch.randn_like(k)
     k_ref, v_ref, k_scale, v_scale = k, v, None, None
     if kv_dtype is not None and kv_dtype != dtype:
-        k_scale = float(k.abs().amax().item()) / 448.0
-        v_scale = float(v.abs().amax().item()) / 448.0
-        k = (k.float() / k_scale).to(kv_dtype)
-        v = (v.float() / v_scale).to(kv_dtype)
-        k_ref, v_ref = k.float() * k_scale, v.float() * v_scale
+        k, v, k_ref, v_ref, k_scale, v_scale = quantize_kv(k, v, kv_dtype)
     return dict(
         q=q,
         k_cache=k,

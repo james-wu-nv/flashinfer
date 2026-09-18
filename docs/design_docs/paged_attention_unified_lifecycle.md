@@ -501,7 +501,7 @@ is one the conformance matrix and fuzzer exercise on hardware.
 
 | backend | cc | head dims | page sizes | layouts | noncausal | window | window + noncausal | contiguous q | kv dtypes | dense table | soft cap | custom mask | sinks |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| fa2 | 8, 9, 10, 12 | 64, 128, 256 | any | HND, NHD | yes | yes | yes | no | f16/bf16, fp8 e4m3 | no | yes | yes | yes |
+| fa2 | 8, 9, 10, 12 | 64, 128, 256 | any | HND, NHD | yes | yes | yes | no | f16/bf16, fp8 e4m3 / e5m2 | no | yes | yes | yes |
 | fa3 | 9 | 64, 128, 256 | any | HND, NHD | yes | yes | yes | no | f16/bf16 | no | yes | no | yes |
 | cudnn | 8, 9, 10, 12 | 128, (192, 128) | any | HND, NHD | yes | no | n/a | yes | f16/bf16 | yes | no | no | no |
 | trtllm-gen | 10 | 128 | 16, 32, 64 | HND, NHD | yes | yes | no | no | f16/bf16 | yes | no | no | yes |
@@ -767,10 +767,12 @@ time, and frozen by the first graph-mode plan:
   the `AttentionSink` JIT variant wrapper at plan time (the default wrapper
   forwards `sinks` only on its trtllm-gen path); trtllm-gen and cake pass the
   tensor natively. The pair mirrors the MLA wrapper's `use_sinks` / `sinks`.
-- fp8 KV cache: `kv_dtype=torch.float8_e4m3fn` with an f16/bf16 q, declared
-  for fa2 only. `k_scale` / `v_scale` are per-tensor host floats
-  (`dequant = fp8_value * scale`); omitted scales mean no scaling. fp8 q and
-  nvfp4 are undeclared axes.
+- fp8 KV cache: `kv_dtype=torch.float8_e4m3fn` or `torch.float8_e5m2` with
+  an f16/bf16 q, declared for fa2 only (e5m2 measured on B200 against the
+  oracle on the dequantized cache, same error magnitude as e4m3; see the
+  `_capabilities.py` comment). `k_scale` / `v_scale` are per-tensor host
+  floats (`dequant = fp8_value * scale`); omitted scales mean no scaling.
+  fp8 q and nvfp4 are undeclared axes.
 
 `sm_scale` is a `run()` argument so one plan serves layers with different
 scales.

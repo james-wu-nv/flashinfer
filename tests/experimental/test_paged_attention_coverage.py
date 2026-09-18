@@ -44,6 +44,7 @@ from .test_paged_attention_prototype import (
     OUT_TOL,
     _resolve_or_skip,
     make_metadata,
+    quantize_kv,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -52,6 +53,7 @@ DEVICE = "cuda:0"
 BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen", "cake", "auto"]
 EXPLICIT_BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen", "cake"]
 FP8 = torch.float8_e4m3fn
+E5M2 = torch.float8_e5m2
 CANARY = -7.0  # exactly representable in bf16 / fp16 / fp32
 
 
@@ -134,12 +136,9 @@ def build_problem(
         v_cache = (v_cache * value_scale).to(dtype)
     k_ref, v_ref, k_scale, v_scale = k_cache, v_cache, None, None
     if kv_dtype is not None and kv_dtype != dtype:
-        k_scale = float(k_cache.abs().amax().item()) / 448.0
-        v_scale = float(v_cache.abs().amax().item()) / 448.0
-        k_cache = (k_cache.float() / k_scale).to(kv_dtype)
-        v_cache = (v_cache.float() / v_scale).to(kv_dtype)
-        k_ref = k_cache.float() * k_scale
-        v_ref = v_cache.float() * v_scale
+        k_cache, v_cache, k_ref, v_ref, k_scale, v_scale = quantize_kv(
+            k_cache, v_cache, kv_dtype
+        )
 
     return dict(
         q=q,
@@ -1719,6 +1718,21 @@ REQUIRED_ROWS = [
     _row("fa2", _ALL_FA2_ARCHES, 8, 2, 128, 128, BF16, "csr", 1, kv_layout="NHD"),
     _row("fa2", _ALL_FA2_ARCHES, 8, 1, 128, 128, F16, "dense", 8, note="MQA Hkv=1"),
     _row("fa2", _ALL_FA2_ARCHES, 8, 2, 128, 128, BF16, "dense", 16, kv_dtype=FP8),
+    # e5m2 KV: measured on B200 (2026-09-17), see _capabilities.py
+    _row("fa2", _ALL_FA2_ARCHES, 8, 2, 128, 128, BF16, "dense", 16, kv_dtype=E5M2),
+    _row(
+        "fa2",
+        _ALL_FA2_ARCHES,
+        8,
+        2,
+        128,
+        128,
+        F16,
+        "csr",
+        1,
+        kv_dtype=E5M2,
+        kv_layout="NHD",
+    ),
     _row("fa2", _ALL_FA2_ARCHES, 8, 2, 128, 128, BF16, "dense", 16, window_left=32),
     _row("fa2", _ALL_FA2_ARCHES, 8, 2, 128, 128, BF16, "dense", 16, causal=False),
     _row("fa2", _ALL_FA2_ARCHES, 4, 4, 64, 64, F16, "csr", 1, kv_layout="NHD"),
@@ -1776,7 +1790,7 @@ def _row_id(r):
         f"{r['form']}{r['page_size']}",
     ]
     if r["kv_dtype"] is not None:
-        bits.append("fp8kv")
+        bits.append(str(r["kv_dtype"]).replace("torch.float8_", "") + "kv")
     if not r["causal"]:
         bits.append("noncausal")
     if r["window_left"] >= 0:

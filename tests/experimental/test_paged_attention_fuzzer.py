@@ -81,7 +81,7 @@ FEATURES = (None, None, None, "soft_cap", "custom_mask", "sinks")
 
 def _sample_config(rng: random.Random):
     input_form = rng.choice(["block_tables", "block_tables", "page_indices"])
-    kv_dtype = rng.choice([None, None, torch.float8_e4m3fn])
+    kv_dtype = rng.choice([None, None, torch.float8_e4m3fn, torch.float8_e5m2])
     feature = rng.choice(FEATURES)
     if feature == "sinks" and kv_dtype is not None:
         feature = None

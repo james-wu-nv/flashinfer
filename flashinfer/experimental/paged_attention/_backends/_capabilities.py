@@ -81,8 +81,9 @@ class PagedAttentionCapabilities:
     # sliding window together with non-causal attention (trtllm-gen ships no
     # such context kernel; irrelevant where either axis is already False)
     supports_window_noncausal: bool = True
-    # KV-cache dtypes; fp8 entries mean "fp8 KV with a fp16/bf16 q" (per-tensor
-    # k_scale/v_scale at run()). fp8 q is a separate, undeclared axis.
+    # KV-cache dtypes; fp8 entries (e4m3 / e5m2) mean "fp8 KV with a fp16/bf16
+    # q", dequantized by the per-tensor k_scale/v_scale of run().  fp8 q is a
+    # separate, undeclared axis.
     kv_dtypes: frozenset = frozenset({torch.float16, torch.bfloat16})
     # True if the backend consumes the dense block table (derivation from the
     # flat-indices input form is forbidden below page_size 8 — table blowup)
@@ -161,7 +162,15 @@ class PagedAttentionCapabilities:
 
 
 _F16 = frozenset({torch.float16, torch.bfloat16})
-_FP8 = frozenset({torch.float8_e4m3fn})
+# Both fp8 KV formats the generated fa2 kernels dequantize in-kernel.  e5m2
+# measured on B200 (2026-09-17) through the unified API against the oracle on
+# the dequantized cache: the four conformance shapes with bf16 and fp16 q,
+# head dims 64 / 128 / 256 / 512, NHD, CSR page 1, sliding window 16,
+# non-causal, both LSE bases and a uniform-q1 decode batch all match (max
+# out err 1.2e-2, LSE err 1.6e-3 -- the same magnitude as e4m3 on the same
+# shapes); the legacy wrapper on the legacy fp8 fixture (batch 12, q 7,
+# kv 54, page 16, H4:4) matches to 1.5e-5.
+_FP8 = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
 
 
 def _is_fp8(dtype: torch.dtype) -> bool:
@@ -181,7 +190,8 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         cc_majors=frozenset({8, 9, 10, 12}),
         q_dtypes=_F16,
         head_dims=frozenset({(64, 64), (128, 128), (256, 256)}),
-        kv_dtypes=_F16 | _FP8,  # fp8 KV + f16 q, per-tensor scales (in-kernel dequant)
+        # fp8 (e4m3 / e5m2) KV + f16 q, per-tensor scales (in-kernel dequant)
+        kv_dtypes=_F16 | _FP8,
         page_sizes=None,
         kv_layouts=frozenset({"HND", "NHD"}),
         supports_lse=True,

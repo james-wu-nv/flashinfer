@@ -45,9 +45,9 @@ Design rules enforced (each traces to a documented failure mode):
     because it selects a compiled kernel variant on the FA backends.
 
 Prototype simplifications (documented, not hidden):
-- dtypes: fp16/bf16 activations; an fp8 (e4m3) KV cache with per-tensor
-  ``k_scale`` / ``v_scale`` at ``run()`` where the capability table declares
-  it (fa2).  fp8 Q and nvfp4 are undeclared axes.
+- dtypes: fp16/bf16 activations; an fp8 (e4m3 or e5m2) KV cache with
+  per-tensor ``k_scale`` / ``v_scale`` at ``run()`` where the capability
+  table declares it (fa2).  fp8 Q and nvfp4 are undeclared axes.
 - Heuristic order is a static per-arch table bucketed by the optional
   ``max_q_len`` hint of ``resolve_paged_attention`` (seeded from the B200
   sweep in the WP-K report; proposal §5.2).  Autotune hook (§5.4) is not
