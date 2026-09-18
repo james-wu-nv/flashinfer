@@ -805,12 +805,24 @@ requested backend (`fa2`, `fa3`, `cudnn`, `trtllm-gen`, `cake`, `auto`),
 gates each on the fp32 oracle before timing, and emits one CSV row per
 (backend, `api_variant`, phase): `plan` (metadata construction plus `plan()`,
 synchronized host wall; a graph-mode re-plan when CUDA graphs are on), `run`
-(warmed `run()` with preallocated buffers, GPU time under a captured graph by
-default), `step` (one plan plus N runs). Rows for unsupported, erroring or
-incorrect candidates are kept with a `status` column; the typed preflight
-signal, alone or chained under the candidate walk's `ValueError`, is
-classified as `unsupported`. `auto` rows record the resolved backend.
-`--pa_legacy` adds rows through the legacy public API of the same kernel.
+(warmed `run()` with preallocated buffers, GPU time: by default one `run()`
+on the case's own buffers captured once and its replay timed with CUDA events
+and an L2 flush before every replay — bindings fixed, so cake's M18 rule holds
+for every backend, instead of the timing helper's rotating clones), `update`
+and `update_replay` (CUDA graphs on: a second instance built with an explicit
+`GraphCapacity` from the case, one `run()` captured, then per step a fresh
+metadata plus `update()`, alone and followed by the replay; synchronized host
+wall, the replayed buffers re-checked against the oracle), `step` (one plan
+plus N eager runs). Rows for unsupported, erroring or incorrect candidates
+are kept with a `status` column; the typed preflight signal, alone or chained
+under the candidate walk's `ValueError`, is classified as `unsupported`.
+`auto` rows record the resolved backend. `--pa_legacy` adds rows through the
+legacy public API of the same kernel; its cuDNN provider hands the native API
+the width-exact column view of the case's wider block table (the view the
+unified cuDNN backend takes), and its `update` rows time the per-step re-arm
+of the captured legacy call (the graph-mode wrapper's `plan()` for fa2/fa3,
+the device-metadata derivation into fixed buffers for cuDNN and
+trtllm-gen/cake).
 `benchmarks/bench_paged_attention_plan.py` is the micro-benchmark for
 metadata construction, eager plan and graph re-plan cost, with launch and
 memcpy counts from the profiler.
@@ -869,7 +881,7 @@ because the controller, not the backend, owns the reserved storage.
 | M14 | The 128 MiB shared default workspace overflows the fa2 split-KV planner on a single 2048-token request with 32 heads. | WP-I adds `workspace_requirements()`; pass the engine's buffer meanwhile. |
 | M15 | `flashinfer/cudnn/decode.py` keeps the older graph-cache key and decorator order that the prefill path fixed. | Out of this package; recorded. |
 | M16 | trtllm-gen and cake compute silently wrong results when the V cache's page stride differs from the K cache's (independently allocated pools); cuDNN and fa2 are correct. | Rejected at `run()` in the trtllm-gen backend (a `ValueError` naming the stride constraint); `tests/experimental/test_paged_attention_coverage.py::test_tc05_strided_inputs[trtllm-gen-kv_independent_strides]` pins it. |
-| M18 | Cake creates its TMA descriptors for `q`, `k_cache` and `v_cache` (storage address, shape, strides) eagerly and pins them at capture; a `run()` whose q/k/v binding was never run eagerly raises `RuntimeError("... prewarm each Cake FMHA tensor/layout binding before CUDA Graph capture")` inside the capture (the benchmark's cold-L2 rotating buffers). | Documented rule, not fixable from `plan()` (it sees no tensors): run the exact `q`, `k_cache`, `v_cache` once eagerly before capturing them; `out` and `lse` may be fresh. The failed capture is clean (no device fault, instance reusable). `tests/experimental/test_paged_attention_cuda_graph.py::test_cake_capture_requires_an_eager_run_on_the_captured_tensors`. |
+| M18 | Cake creates its TMA descriptors for `q`, `k_cache` and `v_cache` (storage address, shape, strides) eagerly and pins them at capture; a `run()` whose q/k/v binding was never run eagerly raises `RuntimeError("... prewarm each Cake FMHA tensor/layout binding before CUDA Graph capture")` inside the capture. The eager descriptor pool is bounded (`kMaxReusableSlots = kMaxPinnedSlots = 4096` in `csrc/cake_fmha/jit/*_jit_binding.cu`), so a capture over thousands of distinct binding sets — the timing helper's cold-L2 rotating clones for an input far below L2 — cannot be prewarmed into it. | Documented rule, not fixable from `plan()` (it sees no tensors): run the exact `q`, `k_cache`, `v_cache` once eagerly before capturing them; `out` and `lse` may be fresh. The failed capture is clean (no device fault, instance reusable). The benchmark therefore captures one `run()` on fixed buffers and flushes L2 between replays. `tests/experimental/test_paged_attention_cuda_graph.py::test_cake_capture_requires_an_eager_run_on_the_captured_tensors`. |
 | — | `auto` is a static order. On SM100 it picks trtllm-gen for a decode-shaped batch (B=32, q=1, kv=4096) that fa2 runs about five times faster in the benchmark smoke run. | Shape-bucket order table is wave-2 work; the benchmark's `resolved_backend` column shows the regret. |
 | — | `custom_mask` with graph mode raises `ValueError`: the FA wrapper's packed-mask storage is not part of `GraphCapacity`. | Follow-up. |
 | — | The generated-FA backend re-plans its wrapper in place; a failure inside that plan can leave backend-internal state ahead of the published metadata. | Same caveat as the MLA generated backends. |
