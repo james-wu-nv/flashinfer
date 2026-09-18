@@ -190,6 +190,11 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
+        "slow: full legacy parameter grid of a parity test; deselect with "
+        '-m "not slow" (the default subset covers every axis value)',
+    )
+    config.addinivalue_line(
+        "markers",
         "shard_group(name): keep marked nodes from one source in one pytest batch",
     )
 
