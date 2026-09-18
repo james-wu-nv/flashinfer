@@ -73,9 +73,10 @@ class GraphCapacity:
       ``out`` and ``lse`` may carry up to ``total_q_tokens`` rows; the
       smallest row count any ``run()`` of the instance sees becomes a bound
       every later batch must fit (a graph captured on those buffers cannot
-      reach past them).  Rows past the batch are not read and ``out`` rows
-      past it are not written; ``lse`` rows past it may be overwritten by
-      some backends (cuDNN's base conversion, trtllm-gen's ``-inf`` fill).
+      reach past them).  Rows past the batch are not read; ``out`` / ``lse``
+      rows past it are unspecified and may be written (whole-buffer
+      post-processing such as the fa fp8 V descale and LSE base fold, cuDNN's
+      base conversion, trtllm-gen's ``-inf`` fill).
     - dense form: ``table_width`` is the caller's block-table width and must
       equal ``ceil(max_kv_len / page_size)`` — cuDNN plans its paged gather
       from both and rejects any other pairing — so pass
@@ -105,11 +106,9 @@ class GraphCapacity:
             f"'page_indices', got {self.kv_input_form!r}",
         )
         _expect_page_size(self.page_size, self.kv_input_form)
-        _expect(
-            self.total_q_tokens >= self.batch_size,
-            f"GraphCapacity.total_q_tokens ({self.total_q_tokens}) must cover at "
-            f"least one query token per request (batch_size {self.batch_size})",
-        )
+        # no "one token per request" floor: q_len == 0 padding rows are legal,
+        # so a batch may carry fewer tokens than requests (vLLM pads the tail
+        # of query_start_loc); only the longest request must fit
         _expect(
             self.max_q_len <= self.total_q_tokens,
             f"GraphCapacity.max_q_len ({self.max_q_len}) exceeds total_q_tokens "
@@ -183,10 +182,13 @@ class GraphCapacity:
         Dense form: ``max_kv_len`` is widened to ``table_width * page_size``,
         so the table's whole width stays usable by later batches and the
         width rule above holds whatever the first batch's longest context.
+        ``total_q_tokens`` is at least the declared ``max_q_len``: the batch
+        may claim a longer query bound than it uses (a decode bucket declared
+        for speculative drafts), and a later batch may spend it on one request.
         """
         common = dict(
             batch_size=metadata.batch_size,
-            total_q_tokens=metadata.total_q_tokens,
+            total_q_tokens=max(metadata.total_q_tokens, metadata.max_q_len),
             max_q_len=metadata.max_q_len,
             page_size=metadata.page_size,
             kv_input_form=metadata.kv_input_form,

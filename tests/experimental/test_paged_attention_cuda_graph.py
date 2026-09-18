@@ -558,7 +558,10 @@ def test_graph_capacity_validation():
         GraphCapacity(**dense, table_width=4, flat_capacity=9)
     with pytest.raises(ValueError, match="page_size"):
         GraphCapacity(**dict(dense, page_size=1), table_width=64)  # dense floor
-    with pytest.raises(ValueError, match="total_q_tokens"):
+    # fewer tokens than requests is legal (q_len == 0 padding rows); only the
+    # longest request must fit
+    assert GraphCapacity(**dict(dense, total_q_tokens=1, max_q_len=1), table_width=4)
+    with pytest.raises(ValueError, match="max_q_len"):
         GraphCapacity(**dict(dense, total_q_tokens=1), table_width=4)
     with pytest.raises(ValueError, match="max_q_len"):
         GraphCapacity(**dict(dense, max_q_len=9), table_width=4)
@@ -1691,3 +1694,84 @@ def test_graph_growth_covers_lse_fold_and_v_scale(kv, lse_mode):
         )
         torch.testing.assert_close(out[:n].float(), ref_out, **OUT_TOL)
         torch.testing.assert_close(lse[:n], ref_lse, **LSE_TOL)
+
+
+def test_inferred_capacity_accepts_a_zero_query_first_batch():
+    """use_cuda_graph=True with q_lens=[1, 0] (a padded decode capture) must
+    infer a capacity and run; total_q_tokens < batch_size is legal (R2)."""
+    p = make_problem(seed=201, **_SHAPE)
+    _resolve_or_skip(p, "fa2")
+    dev = torch.device(p["device"])
+    qo = torch.tensor([0, 1, 1], dtype=torch.int32)
+    kv = torch.tensor([16, 16], dtype=torch.int32)
+    md = PagedAttentionMetadata.dense(
+        qo.to(dev),
+        kv.to(dev),
+        p["block_tables"][:2],
+        page_size=p["page_size"],
+        max_q_len=1,
+        max_kv_len=16,
+        qo_indptr_cpu=qo,
+        kv_seq_lens_cpu=kv,
+    )
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn.plan(
+        md,
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim_qk"],
+        q_dtype=p["dtype"],
+        causal=True,
+        lse_mode="base2",
+        backend="fa2",
+    )
+    cap = attn._impl._graph.capacity
+    assert (cap.batch_size, cap.total_q_tokens, cap.max_q_len) == (2, 1, 1)
+    out, lse = attn.run(p["q"][:1], (p["k_cache"], p["v_cache"]))
+    torch.cuda.synchronize()
+    ref_out, ref_lse = reference_paged_prefill(
+        p["q"][:1],
+        p["k_ref"],
+        p["v_ref"],
+        qo,
+        kv,
+        p["block_tables"][:2],
+        p["page_size"],
+        True,
+    )
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+
+def test_inferred_capacity_covers_a_declared_max_q_len():
+    """A first batch that declares max_q_len above its own longest request
+    (a bucket sized for speculative drafts) infers total_q_tokens >= max_q_len
+    instead of failing the capacity invariant (R2 / CR03)."""
+    p = make_problem(seed=202, **_SHAPE)
+    _resolve_or_skip(p, "fa2")
+    dev = torch.device(p["device"])
+    qo = torch.tensor([0, 1, 2], dtype=torch.int32)
+    kv = torch.tensor([32, 48], dtype=torch.int32)
+    md = PagedAttentionMetadata.dense(
+        qo.to(dev),
+        kv.to(dev),
+        p["block_tables"][:2],
+        page_size=p["page_size"],
+        max_q_len=8,
+        max_kv_len=48,
+        qo_indptr_cpu=qo,
+        kv_seq_lens_cpu=kv,
+    )
+    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn.plan(
+        md,
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim_qk"],
+        q_dtype=p["dtype"],
+        causal=True,
+        lse_mode="base2",
+        backend="fa2",
+    )
+    cap = attn._impl._graph.capacity
+    assert (cap.total_q_tokens, cap.max_q_len) == (8, 8)
