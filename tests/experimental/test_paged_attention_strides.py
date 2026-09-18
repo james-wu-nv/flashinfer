@@ -577,3 +577,27 @@ def test_cudnn_graph_cache_keys_block_table_strides(order):
     for table in (first, second):
         q = dict(p, block_tables=table)
         _check_unified(_plan(q, "cudnn"), q, q["q"])
+
+
+def test_fa3_rejects_independent_kv_strides_before_launch():
+    """The SM90 binding asserts equal K/V page and token strides; the fa3
+    backend refuses such a pool with a ValueError before any launch (R4).
+    Exercised on the backend object directly so the check is verified on
+    hardware without an SM90 device."""
+    from flashinfer.experimental.paged_attention._backends.fa_backend import _FaBackend
+
+    be = object.__new__(_FaBackend)
+    be.name = "fa3"
+    be._lse_mode = "none"
+    be._total_q_tokens = 4
+    be._use_sinks = False
+    k = torch.zeros(3, 2, 16, 128, dtype=torch.bfloat16, device="cuda:0")
+    big_v = torch.zeros(3, 2, 32, 128, dtype=torch.bfloat16, device="cuda:0")
+    v = big_v[:, :, :16]
+    q = torch.zeros(4, 8, 128, dtype=torch.bfloat16, device="cuda:0")
+    with pytest.raises(ValueError, match="fa3 requires k_cache and v_cache"):
+        be.run(q, k, v, sm_scale=1.0)
+    be.name = "fa2"
+    be._active = None  # fa2 would proceed to the wrapper: not reached here
+    with pytest.raises(AttributeError):
+        be.run(q, k, v, sm_scale=1.0)

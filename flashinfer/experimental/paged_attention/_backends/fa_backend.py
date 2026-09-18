@@ -511,6 +511,17 @@ class _FaBackend:
         sinks=None,
     ):
         need_lse = self._lse_mode != "none"
+        if self.name == "fa3" and v_cache.stride() != k_cache.stride():
+            # The SM90 binding (csrc/batch_prefill_sm90.cu) takes one set of
+            # page/token strides for K and V and asserts they match; a V pool
+            # laid out differently from K would trip the native check or be
+            # misread.  fa2 and cuDNN walk each pool by its own strides.
+            raise ValueError(
+                "fa3 requires k_cache and v_cache to share one layout (equal page "
+                f"and token strides); got K strides {tuple(k_cache.stride())} vs V "
+                f"strides {tuple(v_cache.stride())} — independent K/V pools with "
+                "different strides are supported by the fa2 and cudnn backends"
+            )
         rows, n = q.shape[0], self._total_q_tokens
         if rows != n:
             # Graph mode: q/out/lse are the capacity-sized capture buffers, and

@@ -1411,7 +1411,9 @@ def test_tc05_strided_inputs(backend, case):
         big_v[:, :, :ps] = v
         v = big_v[:, :, :ps]
         assert v.stride() != k.stride() and v.stride(-1) == 1
-        required = backend in ("fa2", "fa3")
+        # fa2 and cudnn walk each pool by its own strides; the SM90 (fa3)
+        # binding takes one stride set for K and V, so fa3 rejects (R4)
+        required = backend == "fa2"
     elif case == "page_table_narrow_view":
         b, w = bt.shape
         wide = torch.zeros(b, 2 * w, dtype=torch.int32, device=dev)
