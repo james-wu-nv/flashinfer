@@ -239,16 +239,21 @@ def _paged_attention_init(
     - ``total_q`` is split evenly over ``batch_size`` requests (or
       ``len_indptr - 1`` when ``len_indptr`` is given); ``total_q >=
       batch_size``.
-    - dense form: the block table is ``(batch_size, max_pages)`` and every
-      request uses ``max_pages`` pages (default ``num_pages_per_seq``), the
-      last one partially.
+    - dense form: the block table is ``(batch_size, max_pages)`` (default
+      width ``num_pages_per_seq``); its columns are capacity, not live pages.
+      Each request's live pages are at least its query tokens' pages and at
+      most the width; with ``num_pages`` they are sized so the pool holds
+      them all (spare pool pages spread over the requests, the remaining
+      columns idle), without it every column is live.
     - flat form: the live page-id list has exactly ``num_kv_indices``
       entries, spread over the requests (default ``num_pages_per_seq`` per
-      request), each request's last page partially used.
+      request).
     - ``num_pages`` is the K/V pool size (default: one physical page per
-      referenced page).  Page ids are a random permutation of the pool; a
-      pool smaller than the pages the batch references makes requests share
-      pages (legal: a shared prefix), but a single request never repeats one.
+      live page).  Page ids are a random permutation of the pool; a pool
+      smaller than the live pages the batch needs makes requests share pages
+      (legal: a shared prefix), but a single request never repeats one, so
+      the pool must hold the longest request's pages.  Every request's last
+      live page is partial where the page size allows.
 
     Per-request KV lengths never fall below the request's query length, so
     the bundle satisfies the definition's constraints for the causal variant
@@ -304,12 +309,33 @@ def _paged_attention_init(
                 f"max_pages ({max_pages}) x page_size ({page_size}) cannot hold "
                 f"the longest request's {int(q_lens.max())} query tokens"
             )
-        pages = torch.full((batch_size,), table_width, dtype=torch.int64)
+        if num_pages:
+            # live pages the pool can satisfy; the other columns stay idle
+            if num_pages < int(min_pages.max()):
+                raise ValueError(
+                    f"num_pages ({num_pages}) is smaller than the "
+                    f"{int(min_pages.max())} pages the longest request's "
+                    f"{int(q_lens.max())} query tokens need"
+                )
+            pages = min_pages.clone()
+            room = table_width - pages
+            spare = num_pages - int(pages.sum())  # < 0: requests share pages
+            if spare > 0:
+                pages += torch.minimum(room, torch.tensor(spare // batch_size))
+                spare = num_pages - int(pages.sum())
+            for i in range(batch_size):
+                if spare <= 0:
+                    break
+                if pages[i] < table_width:
+                    pages[i] += 1
+                    spare -= 1
+        else:
+            pages = torch.full((batch_size,), table_width, dtype=torch.int64)
 
-    # partial last pages (request i leaves i % page_size slots unused), never
-    # shorter than the request's own query length
+    # partial last pages (request i leaves (i + 1) % page_size slots unused),
+    # never shorter than the request's own query length
     kv_lens = torch.maximum(
-        pages * page_size - (torch.arange(batch_size) % page_size), q_lens
+        pages * page_size - ((torch.arange(batch_size) + 1) % page_size), q_lens
     )
     assert bool(((kv_lens + page_size - 1) // page_size == pages).all())
 

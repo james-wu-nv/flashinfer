@@ -634,9 +634,78 @@ def test_init_rejects_axes_it_cannot_honour():
     with pytest.raises(ValueError, match="num_kv_indices"):
         _paged_attention_init(total_q=65, batch_size=1, csr=1, num_kv_indices=4)
     with pytest.raises(ValueError, match="num_pages"):
-        _paged_attention_init(total_q=8, batch_size=1, max_pages=4, num_pages=3)
+        _paged_attention_init(total_q=65, batch_size=1, max_pages=5, num_pages=3)
+    with pytest.raises(ValueError, match="num_pages"):
+        _paged_attention_init(total_q=65, batch_size=2, csr=1, num_pages=2)
     with pytest.raises(ValueError, match="total_q"):
         _paged_attention_init(total_q=1, batch_size=2)
+
+
+def _dense_init_live_pages(**axes):
+    """(live pages per request, table width, pool pages) of a dense init bundle."""
+    bundle = _paged_attention_init(device="cuda", **axes)
+    md = bundle["plan"]["metadata"]
+    live = ((md.kv_seq_lens_cpu + md.page_size - 1) // md.page_size).tolist()
+    return live, md.block_tables.shape[1], bundle["run"]["kv_cache"][0].shape[0]
+
+
+@cuda_only
+def test_dense_init_sizes_live_pages_from_the_pool_not_the_table_width():
+    """R06: max_pages is table capacity.  A pool of one page with a five-column
+    table (batch 1, one query token, page_size 16) is a legal traced workload:
+    one live page, four idle columns.  On 0f0123c5 every column counted as a
+    live page and the init rejected it (num_pages 1 < 5)."""
+    live, width, pool = _dense_init_live_pages(
+        total_q=1, batch_size=1, len_indptr=2, num_pages=1, max_pages=5
+    )
+    assert live == [1] and width == 5 and pool == 1
+    # spare pool pages spread over the requests, the table width caps them
+    live, width, pool = _dense_init_live_pages(
+        total_q=8, batch_size=3, num_pages=10, max_pages=4
+    )
+    assert width == 4 and pool == 10 and sum(live) <= 10 and max(live) <= 4
+    assert live == [4, 3, 3]
+    # a pool larger than the table can hold leaves pool pages unreferenced
+    live, width, pool = _dense_init_live_pages(
+        total_q=4, batch_size=2, num_pages=100, max_pages=3
+    )
+    assert live == [3, 3] and width == 3 and pool == 100
+    # a pool smaller than the query tokens' pages makes requests share pages
+    live, width, pool = _dense_init_live_pages(
+        total_q=64, batch_size=2, num_pages=2, max_pages=4
+    )
+    assert live == [2, 2] and pool == 2
+    # without num_pages every column is live (the old default workload)
+    live, width, pool = _dense_init_live_pages(total_q=8, batch_size=2, max_pages=4)
+    assert live == [4, 4] and pool == 8
+
+
+@cuda_only
+def test_wide_table_small_pool_trace_rebuilds_from_the_json_alone():
+    """R06 end to end: trace the one-live-page / five-column workload, then
+    rebuild it with the JSON's axes (num_pages 1, max_pages 5) and check the
+    rebuilt plan against the reference and the definition's constraints."""
+    p = _problem(16, batch_size=1, max_q=1, max_kv=2)
+    assert p["block_tables"].shape == (1, 1) and int(p["kv_seq_lens_cpu"][0]) == 1
+    # a pool of exactly the one page the request reads (id 0) and a table
+    # five columns wide whose idle columns hold that same valid pool page
+    page = int(p["block_tables"][0, 0])
+    k = p["k_cache"][page : page + 1].contiguous()
+    v = p["v_cache"][page : page + 1].contiguous()
+    wide = torch.zeros(1, 5, dtype=torch.int32, device=p["device"])
+    p1 = dict(p, block_tables=wide, k_cache=k, v_cache=v)
+    attn = _plan(p1, "fa2")
+    attn.run(p1["q"], (k, v))
+    defn = _trace(attn, p1)
+    init_fn = _exec(defn["init"])["_paged_attention_init"]
+    ref_fn = _exec(defn["reference"])["_paged_attention_reference"]
+    axes = dict(total_q=1, batch_size=1, len_indptr=2, num_pages=1, max_pages=5)
+    inputs, rebuilt = _rebuild_and_check(
+        defn, init_fn, ref_fn, axes, device=p["device"]
+    )
+    md = inputs["plan"]["metadata"]
+    assert md.block_tables.shape == (1, 5) and int(md.kv_seq_lens_cpu[0]) <= 16
+    assert fi_trace(rebuilt.run, **inputs["run"]) == defn
 
 
 @cuda_only
