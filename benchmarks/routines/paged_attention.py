@@ -16,9 +16,18 @@ shape the oracle cannot hold, and the rows then say so) — and every
     graph-mode re-plan into reserved storage; with ``--no_cuda_graph`` it is
     the eager plan.
 ``run``
-    A warmed ``PagedAttention.run`` with preallocated ``out``/``lse``.  GPU
-    time from ``bench_gpu_time`` (CUDA graph replay by default, eager with
-    ``--no_cuda_graph``), cold L2.
+    A warmed ``PagedAttention.run`` with preallocated ``out``/``lse``, GPU
+    time, cold L2.  By default one ``run()`` on the case's own buffers is
+    captured in a CUDA graph and its replay is timed with CUDA events, an L2
+    flush (a 2x-L2 memset) before every timed replay; with ``--no_cuda_graph``
+    the eager call is timed the same way; with CUPTI the helper's CUPTI timer
+    does the flushing.  All three keep the q/k/v bindings fixed: cake binds
+    q/k/v through TMA descriptors it creates only eagerly (design doc known
+    limitation M18), so the rotating-copies strategy
+    ``bench_gpu_time_with_cudagraph`` uses for cold L2 (fresh clones captured
+    without an eager run) is refused inside its capture — and prewarming the
+    clones does not scale: the eager descriptor pool holds 4096 entries and a
+    below-L2 case rotates thousands of copies.
 ``step``
     One ``plan`` followed by N ``run`` calls (N from ``--pa_layers``), eager,
     synchronized host wall time — the per-scheduler-step cost an engine pays
@@ -79,6 +88,7 @@ from flashinfer.testing.utils import (
     attention_tb_per_sec_with_actual_seq_lens,
     attention_tflops_per_sec_with_actual_seq_lens,
     bench_gpu_time,
+    bench_gpu_time_with_cuda_event,
 )
 
 from .attention import sample_actual_seq_lens
@@ -130,10 +140,30 @@ def _load_reference_oracle():
 
 
 def _cupti_available():
+    """The gate ``bench_gpu_time_with_cupti`` applies before it falls back to
+    CUDA events: the ``cupti`` module importable and ``cupti-python`` >= 13.
+    Mirrored here so ``timing_metric`` names the timer that actually runs and
+    the run phase picks the matching cold-L2 strategy."""
     try:
-        return importlib.util.find_spec("cupti") is not None
-    except (ImportError, ValueError):
+        if importlib.util.find_spec("cupti") is None:
+            return False
+        from importlib.metadata import version
+
+        return int(version("cupti-python").split(".")[0]) >= 13
+    except Exception:  # noqa: BLE001 - any failure means the helper falls back
         return False
+
+
+def _capture_run(run_once, bufs):
+    """One eager ``run_once(*bufs)`` (every backend's lazy work; cake's TMA
+    bindings, M18) and then a CUDA graph of exactly one ``run_once(*bufs)``."""
+    run_once(*bufs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_once(*bufs)
+    torch.cuda.synchronize()
+    return graph
 
 
 def _build_case(args, device, q_dtype, kv_dtype, head_dim_vo):
@@ -372,7 +402,7 @@ class _PhaseRows:
         print(f"[INFO] {self.label}: {status}")
 
 
-def _time_candidate(args, phases, case, plan_once, run_once, recheck, use_cuda_graph):
+def _time_candidate(args, phases, case, plan_once, run_once, recheck, ctx):
     """Fill the timing of every phase row; a failing phase keeps its own status.
 
     ``recheck`` (optional, zero-arg) re-validates the buffers the timed run
@@ -382,26 +412,46 @@ def _time_candidate(args, phases, case, plan_once, run_once, recheck, use_cuda_g
     out, lse = case["out"], case["lse"]
     q_lens, kv_lens = case["q_lens_cpu"], case["kv_seq_lens_cpu"]
     q_dtype = q.dtype
+    use_cuda_graph = ctx["use_cuda_graph"]
     for row in phases.rows:
         phase, layers = row["phase"], row["layers"]
         try:
             if phase == "plan":
                 samples = _wall_ms(plan_once, args.dry_run_iters, args.num_iters)
             elif phase == "run":
-                samples = bench_gpu_time(
-                    fn=run_once,
-                    dry_run_iters=args.dry_run_iters,
-                    repeat_iters=args.num_iters,
-                    sleep_after_run=False,
-                    enable_cupti=args.use_cupti,
-                    use_cuda_graph=use_cuda_graph,
-                    cold_l2_cache=True,
-                    input_args=(q, k_cache, v_cache, out, lse),
-                )
+                input_args = (q, k_cache, v_cache, out, lse)
+                row["cold_l2_cache"] = True
+                if use_cuda_graph and ctx["timing_metric"] != "cupti":
+                    # CUDA graph + CUDA events: one run() on the case's own
+                    # buffers captured once (bindings fixed: cake, M18) and its
+                    # replay timed with an L2 flush before every replay — the
+                    # same cold-L2 mechanism as the eager and CUPTI timers,
+                    # instead of the helper's rotating clones (see module doc).
+                    graph = _capture_run(run_once, input_args)
+                    samples = bench_gpu_time_with_cuda_event(
+                        fn=graph.replay,
+                        dry_run_iters=args.dry_run_iters,
+                        repeat_iters=args.num_iters,
+                        sleep_after_run=False,
+                        cold_l2_cache=True,
+                    )
+                else:
+                    # CUPTI (graph or eager) and eager CUDA events: the helper
+                    # keeps the bindings fixed and flushes L2 between calls.
+                    samples = bench_gpu_time(
+                        fn=run_once,
+                        dry_run_iters=args.dry_run_iters,
+                        repeat_iters=args.num_iters,
+                        sleep_after_run=False,
+                        enable_cupti=args.use_cupti,
+                        use_cuda_graph=use_cuda_graph,
+                        cold_l2_cache=True,
+                        input_args=input_args,
+                    )
                 if recheck is not None:
-                    # The timed calls wrote into the original buffers (the first
-                    # rotation slot); a replay/eager result that drifted from
-                    # the oracle marks the row instead of publishing its time.
+                    # The timed calls wrote into the case's buffers; a replay /
+                    # eager result that drifted from the oracle marks the row
+                    # instead of publishing its time.
                     torch.cuda.synchronize()
                     problem = recheck()
                     if problem is not None:
@@ -573,9 +623,7 @@ def _bench_unified(args, case, backend, ctx):
         elif args.verbose >= 1:
             print(f"[INFO] {phases.label}: matches the fp32 oracle")
 
-    _time_candidate(
-        args, phases, case, plan_once, run_once, recheck, ctx["use_cuda_graph"]
-    )
+    _time_candidate(args, phases, case, plan_once, run_once, recheck, ctx)
     return phases, resolved
 
 
@@ -866,9 +914,7 @@ def _bench_legacy(args, case, backend, ctx):
         elif args.verbose >= 1:
             print(f"[INFO] {phases.label}: matches the fp32 oracle")
 
-    _time_candidate(
-        args, phases, case, provider.plan, run_once, recheck, ctx["use_cuda_graph"]
-    )
+    _time_candidate(args, phases, case, provider.plan, run_once, recheck, ctx)
     return phases
 
 
