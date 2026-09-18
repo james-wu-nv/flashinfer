@@ -51,6 +51,7 @@ from flashinfer.trace.templates.paged_attention import (
 )
 
 from .paged_attention_reference import reference_paged_prefill
+from .test_paged_attention_coverage import build_problem
 from .test_paged_attention_prototype import (
     LSE_TOL,
     OUT_TOL,
@@ -638,7 +639,7 @@ def test_init_rejects_axes_it_cannot_honour():
     with pytest.raises(ValueError, match="num_pages"):
         _paged_attention_init(total_q=65, batch_size=2, csr=1, num_pages=2)
     with pytest.raises(ValueError, match="total_q"):
-        _paged_attention_init(total_q=1, batch_size=2)
+        _paged_attention_init(total_q=0, batch_size=1)
 
 
 def _dense_init_live_pages(**axes):
@@ -862,6 +863,84 @@ def test_padding_rows_refuse_to_trace():
     assert int(attn._trace_context()["kv_seq_lens_cpu"].min()) == 0
     with pytest.raises(ValueError, match="padding rows"):
         fi_trace(attn.run, q=p["q"], kv_cache=(p["k_cache"], p["v_cache"]))
+
+
+def _zero_query_problem(seed, form, q_lens):
+    return build_problem(
+        q_lens,
+        [16, 16],
+        num_qo_heads=_SHAPE["num_qo_heads"],
+        num_kv_heads=_SHAPE["num_kv_heads"],
+        head_dim_qk=_SHAPE["head_dim_qk"],
+        page_size=_SHAPE["page_size"],
+        dtype=_SHAPE["dtype"],
+        seed=seed,
+        input_form=FORMS[form],
+    )
+
+
+@cuda_only
+@pytest.mark.parametrize("q_lens", [[1, 0], [0, 1]], ids=["qo_0_1_1", "qo_0_0_1"])
+@pytest.mark.parametrize("form", list(FORMS))
+def test_zero_query_rows_trace_and_rebuild(form, q_lens):
+    """R8 / R07 / CR05 / C06: a request without query rows (qo_indptr [0,1,1]
+    or [0,0,1], kv_seq_lens [16,16]) is a legal plan; its trace must satisfy
+    its own constraints and its init must rebuild total_q=1 over batch_size=2.
+    On 0f0123c5 the definition required min(q_len) >= 1 and the init refused
+    total_q < batch_size."""
+    p = _zero_query_problem(61, form, q_lens)
+    attn = _plan(p, "fa2")
+    out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]))
+    ref_out, ref_lse = _oracle(p, causal=True, window_left=-1, lse_mode="base2")
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+    defn = _trace(attn, p)
+    _assert_complete(defn)
+    assert "min(qo_indptr[1:] - qo_indptr[:-1]) >= 0" in defn["constraints"]
+    assert not any(">= 1" in c and "qo_indptr" in c for c in defn["constraints"])
+    ctx = attn._trace_context()
+    assert int(ctx["qo_indptr_cpu"].diff().min()) == 0
+    _assert_constraints_hold(
+        defn, _kwargs_from_context(ctx, p["q"], p["k_cache"], p["v_cache"])
+    )
+
+    init_fn = _exec(defn["init"])["_paged_attention_init"]
+    ref_fn = _exec(defn["reference"])["_paged_attention_reference"]
+    axes = dict(total_q=1, batch_size=2, len_indptr=3, num_pages=4)
+    axes["max_pages" if form == "dense" else "num_kv_indices"] = 2
+    inputs, rebuilt = _rebuild_and_check(
+        defn, init_fn, ref_fn, axes, device=p["device"]
+    )
+    md = inputs["plan"]["metadata"]
+    assert md.qo_indptr_cpu.tolist() == [0, 1, 1]
+    assert int(md.kv_seq_lens_cpu.min()) >= 1
+    assert fi_trace(rebuilt.run, **inputs["run"]) == defn
+
+
+@cuda_only
+def test_row_boundaries():
+    """The three row boundaries stay distinct: ordinary rows trace, kv_len == 0
+    padding rows are refused before export, q_len == 0 rows trace and hold
+    the definition's constraints."""
+    normal = _problem(62)
+    assert _trace(_plan(normal, "fa2"), normal)["name"].startswith("paged_attention_")
+    kv0 = normal["kv_seq_lens_cpu"].clone()
+    kv0[0] = 0
+    padded = dict(
+        normal, kv_seq_lens_cpu=kv0, kv_seq_lens=kv0.to(normal["kv_seq_lens"].device)
+    )
+    with pytest.raises(ValueError, match="padding rows"):
+        _trace(_plan(padded, "fa2"), padded)
+    zero_q = _zero_query_problem(63, "dense", [1, 0])
+    attn = _plan(zero_q, "fa2")
+    defn = _trace(attn, zero_q)
+    _assert_constraints_hold(
+        defn,
+        _kwargs_from_context(
+            attn._trace_context(), zero_q["q"], zero_q["k_cache"], zero_q["v_cache"]
+        ),
+    )
 
 
 @cuda_only

@@ -893,6 +893,9 @@ the chosen backend read a derived dense table. A plan that uses
 definition does not encode them yet; so does a planned batch that contains
 padding rows (`kv_len == 0`), because the definition constrains
 `min(kv_seq_lens) >= 1` and its reference has no padding-row convention.
+Requests without query rows (`q_len == 0`) are inside the definition: the
+constraint is `min(q_len) >= 0`, the reference skips them and `init` emits
+them for `total_q < batch_size`.
 Tracing before the first successful plan or through the unbound
 `PagedAttention.run.fi_trace(...)` raises.
 

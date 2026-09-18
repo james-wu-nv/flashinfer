@@ -364,7 +364,11 @@ instance: ``PagedAttention.run.fi_trace(...)`` and a trace before ``plan()``
 raise instead of guessing; a plan that uses ``logits_soft_cap``, a custom
 mask or attention sinks refuses to trace until the definition encodes them,
 and so does a batch with padding rows (``kv_len == 0``), which the
-definition's ``min(kv_seq_lens) >= 1`` constraint excludes.
+definition's ``min(kv_seq_lens) >= 1`` constraint excludes. Requests without
+query rows (``q_len == 0``, vLLM's padded ``query_start_loc`` tail) are part
+of the definition: its constraint is ``min(q_len) >= 0``, the reference
+skips them, and the exported ``init`` produces them when ``total_q <
+batch_size``.
 With the fa2/fa3 backends auto-dump also emits the nested legacy
 ``gqa_paged_prefill`` definition of the wrapper they run on.
 

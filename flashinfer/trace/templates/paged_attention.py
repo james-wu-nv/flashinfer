@@ -104,8 +104,10 @@ def _paged_attention_reference(
     with request ``b`` at rows ``qo_indptr[b]:qo_indptr[b+1]``; request ``b``
     reads ``kv_seq_lens[b]`` tokens from its pages — row ``b`` of the dense
     ``block_tables`` or the next ``ceil(len / page_size)`` entries of the flat
-    ``kv_page_indices`` (request order) — with the last page partially used.
-    ``kv_layout`` 0/1 = HND/NHD; ``causal`` is bottom-right aligned (query
+    ``kv_page_indices`` (request order) — with the last page partially used;
+    a request without query rows (``q_len == 0``) contributes no rows and
+    still consumes its pages.  ``kv_layout`` 0/1 = HND/NHD; ``causal`` is
+    bottom-right aligned (query
     position ``p`` of a request with ``lq`` queries and ``lkv`` keys sits at
     key position ``lkv - lq + p``); ``window_left >= 0`` additionally hides
     keys more than ``window_left`` positions behind the query; ``lse_mode``
@@ -236,9 +238,10 @@ def _paged_attention_init(
     select the variant; the Var axes size the workload and are honoured when
     given (0 = unspecified):
 
-    - ``total_q`` is split evenly over ``batch_size`` requests (or
-      ``len_indptr - 1`` when ``len_indptr`` is given); ``total_q >=
-      batch_size``.
+    - ``total_q`` (>= 1) is split evenly over ``batch_size`` requests (or
+      ``len_indptr - 1`` when ``len_indptr`` is given); with ``total_q <
+      batch_size`` the last requests have no query rows (vLLM's padded
+      ``query_start_loc`` tail), each still reading at least one KV page.
     - dense form: the block table is ``(batch_size, max_pages)`` (default
       width ``num_pages_per_seq``); its columns are capacity, not live pages.
       Each request's live pages are at least its query tokens' pages and at
@@ -276,15 +279,16 @@ def _paged_attention_init(
         batch_size = len_indptr - 1
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
-    if total_q < batch_size:
-        raise ValueError(
-            f"total_q ({total_q}) must be >= batch_size ({batch_size}): every "
-            "request needs at least one query token"
-        )
+    if total_q < 1:
+        raise ValueError(f"total_q must be >= 1, got {total_q}")
     torch.manual_seed(seed)
+    # even split; total_q < batch_size leaves the last requests without query
+    # rows (vLLM's padded query_start_loc tail), which the definition allows
     q_lens = torch.full((batch_size,), total_q // batch_size, dtype=torch.int64)
     q_lens[: total_q % batch_size] += 1
-    min_pages = (q_lens + page_size - 1) // page_size  # kv_len >= q_len
+    # kv_len >= q_len and >= 1: a request keeps one KV page even without
+    # query rows (kv_len == 0 padding rows are outside the definition)
+    min_pages = torch.clamp((q_lens + page_size - 1) // page_size, min=1)
 
     # pages per request from the Var axes of the traced form
     if csr:
@@ -833,7 +837,7 @@ def _build_paged_attention_template(
         "num_qo_heads % num_kv_heads == 0",
         "len_indptr == batch_size + 1",
         "total_q == qo_indptr[-1].item()",
-        "min(qo_indptr[1:] - qo_indptr[:-1]) >= 1",
+        "min(qo_indptr[1:] - qo_indptr[:-1]) >= 0",
         "min(kv_seq_lens) >= 1",
         "causal == 0 or min(kv_seq_lens - (qo_indptr[1:] - qo_indptr[:-1])) >= 0",
         "window_left >= -1",
