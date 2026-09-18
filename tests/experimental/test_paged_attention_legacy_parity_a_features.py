@@ -214,7 +214,7 @@ LEGACY_MAP = [
 
 # Flip constants (see the module docstring); the two shared with the core
 # file are imported from there.
-EXPECT_HEAD_DIM_512 = False
+EXPECT_HEAD_DIM_512 = True  # fa2 (512, 512) declared by WP-T (a466bd67)
 EXPECT_HEAD_DIM_448_256 = False
 EXPECT_NVFP4_KV = False
 EXPECT_BATCH_INVARIANT = False

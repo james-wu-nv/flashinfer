@@ -175,7 +175,9 @@ slow = pytest.mark.slow
 
 # Flip constants for rows the unified API cannot express today (the features
 # file asserts the rejection while False; WP-T style extensions flip them).
-EXPECT_FLOAT_KV_SCALES = False  # k_scale / v_scale on a fp16/bf16 KV cache
+EXPECT_FLOAT_KV_SCALES = (
+    True  # k_scale / v_scale on a fp16/bf16 KV cache (WP-T, c690336a)
+)
 EXPECT_FULLY_MASKED_ROWS = False  # causal rows with q_len > kv_len (out 0 / LSE -inf)
 
 
@@ -1483,7 +1485,10 @@ def test_legacy_batch_attention_correctness(
     out, lse = attn.run(lb.q, (lb.k, lb.v), v_scale=v_scale)
     torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)  # legacy
     torch.testing.assert_close(lse, ref_lse, rtol=1e-2, atol=1e-2)  # legacy
-    assert_oracle(lb, out, lse, causal=causal, logits_soft_cap=cap)
+    # the oracle sees the unscaled V; v_scale multiplies the output (exactly,
+    # in fp32) so undo it before the independent check
+    out_for_oracle = (out.float() / v_scale).to(out.dtype) if v_scale else out
+    assert_oracle(lb, out_for_oracle, lse, causal=causal, logits_soft_cap=cap)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)

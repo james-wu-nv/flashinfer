@@ -40,10 +40,10 @@ LSE_TOL = dict(atol=3e-2, rtol=2e-2)
 # e5m2 KV / head_dim 512 on fa2 / pages 128-1024 on trtllm-gen and cake /
 # float-KV scales; the rest are proposals in reports/.../wp-s-b.md.
 # ---------------------------------------------------------------------------
-EXPECT_FA2_E5M2_KV = False  # kv_dtype=float8_e5m2 on fa2 (WP-T)
-EXPECT_FA2_HEAD_DIM_512 = False  # (512, 512) on fa2 (WP-T; Gemma-4 shape)
+EXPECT_FA2_E5M2_KV = True  # kv_dtype=float8_e5m2 on fa2 (WP-T, 2e3f80a6)
+EXPECT_FA2_HEAD_DIM_512 = True  # (512, 512) on fa2 (WP-T, a466bd67; Gemma-4 shape)
 EXPECT_TRTLLM_LARGE_PAGES = (
-    False  # page_size 128/256/512/1024 on trtllm-gen, cake (WP-T)
+    True  # page_size 128/256/512/1024 on trtllm-gen, cake (WP-T, a8b1114d)
 )
 EXPECT_TRTLLM_HEAD_DIM_64 = False  # (64, 64) on trtllm-gen / cake
 EXPECT_TRTLLM_HEAD_DIM_256 = False  # (256, 256) on trtllm-gen / cake
