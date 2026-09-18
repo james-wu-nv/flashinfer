@@ -98,6 +98,10 @@ class PagedAttentionCapabilities:
     supports_logits_soft_cap: bool = False
     supports_custom_mask: bool = False
     supports_sinks: bool = False
+    # head-dim pairs the sink kernel variant is verified on; None = every
+    # declared pair (the sink JIT variant is compiled per head dim, so a
+    # backend can be right at one size and wrong at another — see fa2 / M21)
+    sinks_head_dims: Optional[frozenset] = None
 
     def rejection_reason(
         self,
@@ -148,6 +152,15 @@ class PagedAttentionCapabilities:
             return "custom attention mask not supported"
         if use_sinks and not self.supports_sinks:
             return "attention sinks not supported"
+        if (
+            use_sinks
+            and self.sinks_head_dims is not None
+            and (head_dim_qk, head_dim_vo) not in self.sinks_head_dims
+        ):
+            return (
+                f"attention sinks not supported at head dims ({head_dim_qk}, "
+                f"{head_dim_vo}) (verified: {sorted(self.sinks_head_dims)})"
+            )
         if (
             self.needs_dense
             and kv_input_form == "page_indices"
@@ -224,6 +237,12 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         supports_logits_soft_cap=True,
         supports_custom_mask=True,
         supports_sinks=True,
+        # M21 (B200, 2026-09-18, found by the XQA legacy grid): the fa2
+        # AttentionSink variant at head_dim 512 returns wrong values (max abs
+        # err 1.4-1.75, LSE off by ~3) while D64/128/256 sinks and D512 without
+        # sinks are exact; the legacy sink wrapper is wrong there too.  The
+        # pair is excluded until the kernel is fixed.
+        sinks_head_dims=frozenset({(64, 64), (128, 128), (256, 256)}),
     ),
     "fa3": PagedAttentionCapabilities(
         name="fa3",

@@ -289,6 +289,15 @@ def _capability_rows():
         ("fa2", "d256", dict(head_dim_qk=256, head_dim_vo=256), None),
         # 512: the Ampere+ large-head path, fa2 only (measured on B200)
         ("fa2", "d512", dict(head_dim_qk=512, head_dim_vo=512), None),
+        # M21: the fa2 sink variant is wrong at head_dim 512 (measured); the
+        # pair is excluded while plain D512 and sinks at D128 stay admitted
+        (
+            "fa2",
+            "sinks-d512",
+            dict(head_dim_qk=512, head_dim_vo=512, use_sinks=True),
+            "attention sinks not supported at head dims (512, 512)",
+        ),
+        ("fa2", "sinks-d128", dict(use_sinks=True), None),
         ("fa3", "d512", dict(head_dim_qk=512, head_dim_vo=512), "head dims"),
         ("cudnn", "d512", dict(head_dim_qk=512, head_dim_vo=512), "head dims"),
         ("trtllm-gen", "d512", dict(head_dim_qk=512, head_dim_vo=512), "head dims"),
