@@ -57,6 +57,12 @@ EXPECT_INDEPENDENT_KV_TABLES = False  # separate K and V page-id mappings
 EXPECT_MULTI_ITEM_SCORING = False  # prefix_len_ptr / token_pos_in_items_ptr
 EXPECT_FMHA_V2_CANDIDATE = False  # FMHA v2 as a unified backend
 EXPECT_CHUNKED_ATTENTION_KNOB = False  # chunked_attention_size as a plan axis
+# Library defects the parity tests reproduce (not API gaps); flip when fixed.
+# CR02 (review 2026-09-17, WP-P): BatchAttentionWithAttentionSinkWrapper builds
+# its JIT URI from (q dtype, window, backend) only, so the first sink module a
+# process builds is reused for every head_dim: D64 after D128 returns NaN,
+# D128 after D64 is wrong.  Alone, each head_dim passes.
+EXPECT_SINK_JIT_URI_HAS_HEAD_DIM = False
 
 _T = TypeVar("_T")
 
