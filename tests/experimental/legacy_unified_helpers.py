@@ -68,6 +68,34 @@ EXPECT_CHUNKED_ATTENTION_KNOB = False  # chunked_attention_size as a plan axis
 # process builds is reused for every head_dim: D64 after D128 returns NaN,
 # D128 after D64 is wrong.  Alone, each head_dim passes.
 EXPECT_SINK_JIT_URI_HAS_HEAD_DIM = True  # fixed on the integration head (7c9b2ac8)
+# Round 4, WP-C (2026-09-18): axes of the SM100 / SM120 backend-specific legacy
+# files (modular cute-dsl, SM120 FMHA / prims, TensorSpeed, XQA) the unified
+# API does not express.
+EXPECT_HEAD_DIM_32 = False  # (32, 32): no backend declares it (SM120 fp8 fixtures)
+EXPECT_MIXED_KV_DTYPE = False  # K and V caches of different dtypes (bf16 K, fp8 V)
+EXPECT_ATTENTION_VARIANTS = (
+    False  # score-mod / logits-transform variants (sigmoid, ALiBi)
+)
+# Library behaviour the WP-C conversions reproduce (measured on B200,
+# 2026-09-18): fa2 masks the in-page tail past kv_len of a request's last page
+# before the PV product, so a non-finite tail is harmless; trtllm-gen, cake and
+# cuDNN over-read the tail and 0 x NaN reaches the output (the TensorSpeed and
+# modular legacy suites poison exactly that tail).  Flip when every backend
+# ignores the tail (or the input contract states the tail must be finite).
+EXPECT_INPAGE_TAIL_IGNORED = False
+# fa2 attention sinks: the AttentionSink JIT variant declines an fp8 KV cache at
+# plan time ("not verified", _backends/fa_backend.py) although the capability
+# table admits fp8 KV and sinks separately -- the XQA legacy suite runs sinks
+# with an fp8 KV natively.  Flip when the adapter verifies the pair.
+EXPECT_FA2_SINKS_FP8_KV = False
+# fa2 attention sinks at head_dim 512 compute WRONG values on B200 (2026-09-18,
+# XQA legacy fixture: q_len 1, kv <= 111, H8:2 / 10:2 / 32:2, bf16 and fp16,
+# NHD and HND, with and without window 127; 55% of the elements off by up to
+# 0.38 against the sink reference and the oracle; D128 / D256 sinks and D512
+# without sinks are exact) while the capability table admits the combination.
+# Recorded as a non-strict xfail; flip when the sink variant handles D512 (or
+# the table excludes the pair).
+EXPECT_FA2_SINKS_HEAD_DIM_512 = False
 
 _T = TypeVar("_T")
 
@@ -282,6 +310,437 @@ def reference_long(
             outs.append(o)
             lses.append(l)
     return torch.cat(outs).to(dev), torch.cat(lses).to(dev)
+
+
+# ---------------------------------------------------------------------------
+# The legacy trtllm-gen paged fixture (tests/attention/test_trtllm_gen_attention_
+# decode.py helpers under the legacy seed), shared by the trtllm-gen, cake and
+# XQA conversion modules.  Round 3 kept it in the trtllm theme file; round 4
+# splits that file per legacy source, so the fixture lives here.
+# ---------------------------------------------------------------------------
+
+_legacy_ws = None
+
+
+def legacy_workspace() -> torch.Tensor:
+    """The legacy 256 MiB int8 workspace, allocated once per process."""
+    global _legacy_ws
+    if _legacy_ws is None:
+        _legacy_ws = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=DEVICE)
+    return _legacy_ws
+
+
+def legacy_trtllm_problem(
+    kv_layout: str,
+    batch_size: int,
+    page_size: int,
+    num_kv_heads: int,
+    head_grp_size: int,
+    dtype_name: str,
+    max_q_len: int,
+    max_kv_len: int,
+    head_dim: int,
+    *,
+    seed: int = 0,
+) -> dict:
+    """``_test_trtllm_batch_prefill``'s tensors in the legacy call order under
+    ``torch.manual_seed(seed)``: query, stacked ``(pages, 2, ...)`` pool, the
+    dense page table, the CSR mirrors and the sink draw."""
+    from tests.attention.test_trtllm_gen_attention_decode import (
+        create_kv_cache,
+        create_page_table,
+        create_query_tensor,
+        generate_cumsum_lens,
+        generate_seq_lens_prefill,
+        get_last_page_len,
+    )
+
+    torch.manual_seed(seed)
+    num_qo_heads = num_kv_heads * head_grp_size
+    q_lens, _, seq_lens = generate_seq_lens_prefill(batch_size, max_q_len, max_kv_len)
+    q, _q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, dtype_name)
+    q_indptr = generate_cumsum_lens(q_lens)
+    kv_cache, _k_scale, _v_scale, ref_kv_cache, _ = create_kv_cache(
+        batch_size,
+        seq_lens,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype_name,
+        dtype_name,
+        kv_layout,
+    )
+    page_table, all_page_ids, page_per_seq = create_page_table(
+        batch_size, seq_lens, page_size
+    )
+    kv_indptr = generate_cumsum_lens(page_per_seq)
+    kv_last_page_len = get_last_page_len(seq_lens, page_size)
+    sink = torch.rand(num_qo_heads, device=DEVICE, dtype=torch.float32) * 5
+    return dict(
+        kv_layout=kv_layout,
+        batch_size=batch_size,
+        page_size=page_size,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=torch.bfloat16 if dtype_name == "bf16" else torch.float16,
+        q=q,
+        ref_q=ref_q,
+        q_lens=q_lens,
+        seq_lens=seq_lens,
+        q_indptr=q_indptr,
+        kv_cache=kv_cache,  # (pages, 2, ...) stacked pool
+        ref_kv_cache=ref_kv_cache,
+        page_table=page_table,
+        all_page_ids=all_page_ids,
+        kv_indptr=kv_indptr,
+        kv_last_page_len=kv_last_page_len,
+        sink=sink,
+        sm_scale=float(1.0 / (head_dim**0.5)),
+    )
+
+
+def legacy_fa2_paged_reference(p: dict, *, causal: bool, window_left: int = -1):
+    """The legacy reference of the no-sink rows: the fa2 paged wrapper on the
+    reference pool (the legacy leaves backend='auto', which is fa2 on B200;
+    pinned here so the reference is the same kernel on every machine)."""
+    import flashinfer
+
+    wrapper_ref = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        legacy_workspace(), p["kv_layout"], backend="fa2"
+    )
+    wrapper_ref.plan(
+        qo_indptr=p["q_indptr"],
+        paged_kv_indptr=p["kv_indptr"],
+        paged_kv_indices=p["all_page_ids"],
+        paged_kv_last_page_len=p["kv_last_page_len"].to(DEVICE),
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim"],
+        page_size=p["page_size"],
+        causal=causal,
+        pos_encoding_mode="NONE",
+        logits_soft_cap=0.0,
+        q_data_type=p["ref_q"].dtype,
+        kv_data_type=p["ref_kv_cache"].dtype,
+        window_left=window_left,
+    )
+    return wrapper_ref.run(p["ref_q"], p["ref_kv_cache"], return_lse=True)
+
+
+def legacy_sink_reference(p: dict, *, causal: bool, window_left: int = -1):
+    """The legacy reference of the sink rows: ``sink_attention_unified`` on
+    the flattened reference pool."""
+    from tests.attention.test_trtllm_gen_attention_decode import flatten_paged_kv
+    from tests.test_helpers.sink_attention_reference import sink_attention_unified
+
+    k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
+        p["ref_kv_cache"],
+        p["page_table"],
+        p["seq_lens"].to(DEVICE),
+        p["page_size"],
+        p["kv_last_page_len"],
+        p["kv_layout"],
+    )
+    return sink_attention_unified(
+        p["ref_q"],
+        k_flat,
+        v_flat,
+        p["sink"],
+        window_left,
+        causal,
+        p["sm_scale"],
+        mode="varlen",
+        batch_size=p["batch_size"],
+        qo_indptr=p["q_indptr"],
+        kv_indptr=kv_indptr_tokens,
+    )
+
+
+def assert_legacy_close(out, ref, *, rtol=1e-2, atol=1e-2) -> None:
+    """The legacy assertion: ``assert_close`` with the 1e-7 mismatch allowance."""
+    from tests.test_helpers.test_helpers import assert_close_with_mismatch_tolerance
+
+    assert_close_with_mismatch_tolerance(
+        out.float(),
+        ref.float(),
+        rtol=rtol,
+        atol=atol,
+        max_mismatched_elements=int(1e-7 * out.numel()),
+    )
+
+
+def trtllm_resolve_kwargs(p: dict, *, causal: bool, backend: str, **overrides):
+    kw = dict(
+        device=torch.device(DEVICE),
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim"],
+        q_dtype=p["dtype"],
+        page_size=p["page_size"],
+        kv_layout=p["kv_layout"],
+        causal=causal,
+        need_lse=True,
+        backend=backend,
+    )
+    kw.update(overrides)
+    return kw
+
+
+def plan_legacy_problem(
+    p: dict,
+    backend: str,
+    *,
+    causal: bool,
+    lse_mode: str = "base2",
+    use_sinks: bool = False,
+    window_left: int = -1,
+):
+    """Plan the legacy fixture in the dense form on a pinned backend (skipping
+    with the resolve reason when it is capability-excluded), or on ``auto``.
+    Returns ``(attn, md)``; ``attn.backend`` is asserted for a pinned name."""
+    from flashinfer.prefill import PagedAttention
+
+    md = dense_metadata(p["q_indptr"], p["seq_lens"], p["page_table"], p["page_size"])
+    common = dict(
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim"],
+        q_dtype=p["dtype"],
+        kv_layout=p["kv_layout"],
+        causal=causal,
+        window_left=window_left,
+    )
+    if backend == "auto":
+        res = "auto"
+    else:
+        res = resolve_or_skip(
+            backend,
+            page_size=p["page_size"],
+            need_lse=lse_mode != "none",
+            kv_input_form="block_tables",
+            sinks=use_sinks,
+            **common,
+        )
+    attn = PagedAttention(torch.device(DEVICE))
+    attn.plan(md, lse_mode=lse_mode, use_sinks=use_sinks, backend=res, **common)
+    if backend != "auto":
+        assert attn.backend == backend
+    return attn, md
+
+
+def independent_tables_rejected(p: dict):
+    """The legacy interleaved layout (K at page 2p, V at 2p+1, a [B, 2, M]
+    table) is two page-id mappings; the metadata takes exactly one.  Returns
+    None while EXPECT_INDEPENDENT_KV_TABLES is False (the rejection asserted),
+    the metadata once the extension lands."""
+    from tests.attention.test_trtllm_gen_attention_decode import (
+        prepare_paged_kv_for_kernel,
+    )
+
+    (k_i, v_i), table_2, _ = prepare_paged_kv_for_kernel(
+        p["kv_cache"], p["page_table"], False
+    )
+    assert table_2.shape == (p["batch_size"], 2, p["page_table"].shape[1])
+    assert not torch.equal(table_2[:, 0], table_2[:, 1])  # K ids != V ids
+    md = dense_metadata(p["q_indptr"], p["seq_lens"], p["page_table"], p["page_size"])
+    return gated(
+        EXPECT_INDEPENDENT_KV_TABLES,
+        lambda: PagedAttentionMetadata.dense(
+            md.qo_indptr,
+            md.kv_seq_lens,
+            table_2[:, 0].contiguous(),
+            v_block_tables=table_2[:, 1].contiguous(),
+            page_size=p["page_size"],
+            max_q_len=md.max_q_len,
+            max_kv_len=md.max_kv_len,
+        ),
+        match="v_block_tables",
+        exc=TypeError,
+    )
+
+
+def skip_softmax_knob_present() -> bool:
+    """Whether ``skip_softmax_threshold_scale_factor`` (approximate softmax) has
+    a plan- or run-time spelling; asserted equal to EXPECT_SKIP_SOFTMAX."""
+    import inspect
+
+    from flashinfer.prefill import PagedAttention
+
+    run_params = inspect.signature(PagedAttention.run).parameters
+    plan_params = inspect.signature(PagedAttention.plan).parameters
+    return (
+        "skip_softmax_threshold_scale_factor" in run_params
+        or "skip_softmax_threshold_scale_factor" in plan_params
+    )
+
+
+def output_dtype_knob_present() -> bool:
+    """Whether an output dtype independent of q (``o_dtype`` / ``out_dtype``)
+    has a spelling; asserted equal to EXPECT_OUTPUT_DTYPE."""
+    import inspect
+
+    from flashinfer.prefill import PagedAttention
+
+    run_params = inspect.signature(PagedAttention.run).parameters
+    plan_params = inspect.signature(PagedAttention.plan).parameters
+    return "o_dtype" in plan_params or "out_dtype" in run_params
+
+
+def fp8_q_rejected(
+    *,
+    backend: str,
+    num_qo_heads: int = 2,
+    num_kv_heads: int = 2,
+    head_dim: int = 128,
+    page_size: int = 16,
+    kv_layout: str = "HND",
+    causal: bool = True,
+    window_left: int = -1,
+    kv_dtype: torch.dtype = torch.float8_e4m3fn,
+):
+    """fp8 (e4m3) q is rejected at resolve on every backend while EXPECT_FP8_Q
+    is False (``'unsupported q dtype'``); returns the Resolution once it flips."""
+    return gated(
+        EXPECT_FP8_Q,
+        lambda: resolve_paged_attention(
+            device=torch.device(DEVICE),
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            q_dtype=torch.float8_e4m3fn,
+            kv_dtype=kv_dtype,
+            page_size=page_size,
+            kv_layout=kv_layout,
+            causal=causal,
+            window_left=window_left,
+            need_lse=False,
+            backend=backend,
+        ),
+        match="unsupported q dtype",
+    )
+
+
+def xfail_unless(flag: bool, ok: bool, reason: str) -> None:
+    """A measured library behaviour the conversion reproduces: while ``flag``
+    is False the row is a non-strict xfail when ``ok`` is False (so the
+    outcome is recorded, not hidden); once the flag flips, ``ok`` must hold."""
+    if ok:
+        return
+    if flag:
+        pytest.fail(reason)
+    pytest.xfail(reason)
+
+
+# ---------------------------------------------------------------------------
+# Multi-backend runner for the backend-specific legacy files (WP-C): the
+# workload runs on every pinned unified backend that resolves, the excluded
+# ones are recorded with their resolve reason (junit properties), and ``auto``
+# records which backend served the workload.
+# ---------------------------------------------------------------------------
+
+ALL_BACKENDS = ("fa2", "trtllm-gen", "cake", "cudnn")
+
+
+def run_on_backends(
+    md: PagedAttentionMetadata,
+    q: torch.Tensor,
+    kv_cache,
+    *,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim_qk: int,
+    q_dtype: torch.dtype,
+    kv_dtype: Optional[torch.dtype] = None,
+    kv_layout: str,
+    causal: bool,
+    window_left: int = -1,
+    lse_mode: str = "base2",
+    logits_soft_cap: Optional[float] = None,
+    custom_mask: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    sm_scale: Optional[float] = None,
+    k_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    backends: Sequence[str] = ALL_BACKENDS,
+    include_auto: bool = True,
+    record_property=None,
+):
+    """Plan and run one legacy workload on every pinned backend in ``backends``
+    that resolves, then on ``auto``.  Returns ``[(pinned_name, served_by, out,
+    lse)]`` (``pinned_name == "auto"`` for the auto row); skips -- never
+    silently -- when no backend resolves, with every reason."""
+    from flashinfer.prefill import PagedAttention
+
+    dev = torch.device(DEVICE)
+    kv_dtype = kv_dtype if kv_dtype is not None else q_dtype
+    resolve_kw = dict(
+        device=dev,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim_qk,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        page_size=md.page_size,
+        kv_layout=kv_layout,
+        causal=causal,
+        need_lse=lse_mode != "none",
+        window_left=window_left,
+        kv_input_form=md.kv_input_form,
+        logits_soft_cap=logits_soft_cap,
+        custom_mask=custom_mask is not None,
+        sinks=sinks is not None,
+    )
+    plan_kw = dict(
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim_qk,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        kv_layout=kv_layout,
+        causal=causal,
+        window_left=window_left,
+        lse_mode=lse_mode,
+        logits_soft_cap=logits_soft_cap,
+        custom_mask=custom_mask,
+        use_sinks=sinks is not None,
+    )
+    run_kw = dict(
+        sm_scale=sm_scale, k_scale=k_scale, v_scale=v_scale, sinks=sinks, out=out
+    )
+    results, excluded = [], {}
+    names = list(backends) + (["auto"] if include_auto else [])
+    for name in names:
+        try:
+            res = resolve_paged_attention(backend=name, **resolve_kw)
+        except ValueError as e:
+            excluded[name] = str(e)
+            continue
+        attn = PagedAttention(dev)
+        try:
+            attn.plan(md, backend=res, **plan_kw)
+        except ValueError as e:
+            # a plan-time (batch-specific) decline of the pinned candidate(s):
+            # recorded with its reason like a resolve-time exclusion
+            if "cannot plan this batch" not in str(e):
+                raise
+            excluded[name] = "plan: " + str(e)
+            continue
+        if name != "auto":
+            assert attn.backend == name
+        o, lse = attn.run(q, kv_cache, **run_kw)
+        results.append((name, attn.backend, o, lse))
+    if record_property is not None:
+        for name, reason in excluded.items():
+            record_property(f"excluded_{name}", reason)
+        for name, served, _, _ in results:
+            if name == "auto":
+                record_property("auto_backend", served)
+    if not results:
+        detail = "; ".join(f"{k}: {v}" for k, v in excluded.items())
+        pytest.skip(f"no unified backend resolves this legacy case ({detail})")
+    return results
 
 
 LEGACY_MAP_STATUSES = frozenset(
