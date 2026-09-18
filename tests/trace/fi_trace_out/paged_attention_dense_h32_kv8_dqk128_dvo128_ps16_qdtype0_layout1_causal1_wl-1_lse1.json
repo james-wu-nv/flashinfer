@@ -1,0 +1,244 @@
+{
+  "name": "paged_attention_dense_h32_kv8_dqk128_dvo128_ps16_qdtype0_layout1_causal1_wl-1_lse1",
+  "description": "Experimental unified PagedAttention.run: packed queries over a paged KV cache in the NHD layout, paging metadata from plan() in the dense block-table form. Const axes encode the plan: csr 0=dense block table/1=flat page ids, fp8_kv 0=K/V in q's dtype/1=float8_e4m3fn K/V, q_dtype 0=bfloat16/1=float16, kv_layout 0=HND/1=NHD, causal 0/1 (bottom-right aligned), window_left -1=unlimited, lse_mode 0=none/1=base-2/2=natural log; the reference takes the same values as int scalars and init rebuilds the variant from them. qo_indptr, kv_seq_lens and the page table are plan() inputs, filled from the planned instance by flashinfer.fi_trace(attn.run, ...). The resolved backend is not part of this identity.",
+  "op_type": "gqa_paged",
+  "tags": [
+    "fi_api:flashinfer.prefill.PagedAttention.run",
+    "status:experimental",
+    "stage:prefill",
+    "stage:decode",
+    "form:dense",
+    "layout:NHD",
+    "mask:causal",
+    "window:-1",
+    "lse:base2",
+    "q:bf16"
+  ],
+  "axes": {
+    "num_qo_heads": {
+      "type": "const",
+      "value": 32
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 8
+    },
+    "head_dim_qk": {
+      "type": "const",
+      "value": 128
+    },
+    "head_dim_vo": {
+      "type": "const",
+      "value": 128
+    },
+    "page_size": {
+      "type": "const",
+      "value": 16
+    },
+    "csr": {
+      "type": "const",
+      "value": 0,
+      "description": "Paging form fixed by plan(): 0 = dense block table (block_tables), 1 = flat page ids (kv_page_indices); also the dense / csr name prefix."
+    },
+    "fp8_kv": {
+      "type": "const",
+      "value": 0,
+      "description": "0 = K/V cache in q's dtype, 1 = float8_e4m3fn K/V dequantized by k_scale / v_scale; also the _fp8kv name prefix."
+    },
+    "q_dtype": {
+      "type": "const",
+      "value": 0,
+      "description": "Query and output dtype fixed by plan(): 0 = bfloat16, 1 = float16."
+    },
+    "kv_layout": {
+      "type": "const",
+      "value": 1,
+      "description": "Plan-time KV layout: 0 = HND (pages, H, page_size, D), 1 = NHD (pages, page_size, H, D)."
+    },
+    "causal": {
+      "type": "const",
+      "value": 1,
+      "description": "1 = bottom-right aligned causal mask, 0 = none."
+    },
+    "window_left": {
+      "type": "const",
+      "value": -1,
+      "description": "Sliding-window extent fixed by plan(); -1 = unlimited."
+    },
+    "lse_mode": {
+      "type": "const",
+      "value": 1,
+      "description": "LSE base fixed by plan(): 0 = none, 1 = base-2, 2 = natural log."
+    },
+    "total_q": {
+      "type": "var",
+      "description": "Total number of packed query tokens."
+    },
+    "batch_size": {
+      "type": "var",
+      "description": "Number of requests in the plan."
+    },
+    "len_indptr": {
+      "type": "var",
+      "description": "Length of qo_indptr (batch_size + 1)."
+    },
+    "num_pages": {
+      "type": "var",
+      "description": "Physical pages in the KV pool."
+    },
+    "max_pages": {
+      "type": "var",
+      "description": "Dense block-table width (pages)."
+    }
+  },
+  "constraints": [
+    "num_qo_heads % num_kv_heads == 0",
+    "len_indptr == batch_size + 1",
+    "total_q == qo_indptr[-1].item()",
+    "min(qo_indptr[1:] - qo_indptr[:-1]) >= 1",
+    "min(kv_seq_lens) >= 1",
+    "causal == 0 or min(kv_seq_lens - (qo_indptr[1:] - qo_indptr[:-1])) >= 0",
+    "window_left >= -1",
+    "max_pages * page_size >= max(kv_seq_lens)"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "total_q",
+        "num_qo_heads",
+        "head_dim_qk"
+      ],
+      "dtype": "bfloat16",
+      "description": "Packed queries; request b occupies rows qo_indptr[b]:qo_indptr[b+1]."
+    },
+    "k_cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "num_kv_heads",
+        "head_dim_qk"
+      ],
+      "dtype": "bfloat16",
+      "description": "Paged keys in the NHD layout (kv_cache[0])."
+    },
+    "v_cache": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "num_kv_heads",
+        "head_dim_vo"
+      ],
+      "dtype": "bfloat16",
+      "description": "Paged values in the NHD layout (kv_cache[1])."
+    },
+    "qo_indptr": {
+      "shape": [
+        "len_indptr"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Token-unit query prefix sums. Owned by plan(), filled from the planned instance when tracing."
+    },
+    "kv_seq_lens": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Valid KV length per request (last page may be partial). Owned by plan(), filled from the planned instance."
+    },
+    "block_tables": {
+      "shape": [
+        "batch_size",
+        "max_pages"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Dense page table (vLLM-style); row b uses its first ceil(kv_seq_lens[b] / page_size) entries. Owned by plan()."
+    },
+    "sm_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Softmax scale for this call; default 1/sqrt(head_dim_qk)."
+    },
+    "k_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Per-tensor dequantization scale of an fp8 K cache (real = stored * k_scale); fp8 KV only."
+    },
+    "v_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Per-tensor dequantization scale of an fp8 V cache; fp8 KV only."
+    },
+    "csr": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Same encoding as the csr axis; fixed by plan(), passed to the reference."
+    },
+    "fp8_kv": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Same encoding as the fp8_kv axis; fixed by plan()."
+    },
+    "q_dtype": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Same encoding as the q_dtype axis; fixed by plan()."
+    },
+    "kv_layout": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Same encoding as the kv_layout axis; fixed by plan(), passed to the reference."
+    },
+    "causal": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Same encoding as the causal axis; fixed by plan()."
+    },
+    "window_left": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Same encoding as the window_left axis; fixed by plan()."
+    },
+    "lse_mode": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Same encoding as the lse_mode axis; fixed by plan()."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "total_q",
+        "num_qo_heads",
+        "head_dim_vo"
+      ],
+      "dtype": "bfloat16",
+      "param": "out",
+      "description": "Attention output in q's dtype (optional out= buffer)."
+    },
+    "lse": {
+      "shape": [
+        "total_q",
+        "num_qo_heads"
+      ],
+      "dtype": "float32",
+      "param": "lse",
+      "description": "Packed fp32 log-sum-exp of the attention logits in base 2 (optional lse= buffer)."
+    }
+  },
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef _paged_attention_reference(\n    q,\n    k_cache,\n    v_cache,\n    qo_indptr,\n    kv_seq_lens,\n    block_tables=None,\n    kv_page_indices=None,\n    sm_scale=None,\n    k_scale=None,\n    v_scale=None,\n    *,\n    kv_layout,\n    causal,\n    window_left,\n    lse_mode,\n    csr=None,\n    fp8_kv=None,\n    q_dtype=None,\n):\n    \"\"\"FP32 paged attention over packed queries; returns ``(output, lse)``.\n\n    Mirrors ``PagedAttention.run``: ``q`` is packed ``(total_q, Hq, Dqk)``\n    with request ``b`` at rows ``qo_indptr[b]:qo_indptr[b+1]``; request ``b``\n    reads ``kv_seq_lens[b]`` tokens from its pages \u2014 row ``b`` of the dense\n    ``block_tables`` or the next ``ceil(len / page_size)`` entries of the flat\n    ``kv_page_indices`` (request order) \u2014 with the last page partially used.\n    ``kv_layout`` 0/1 = HND/NHD; ``causal`` is bottom-right aligned (query\n    position ``p`` of a request with ``lq`` queries and ``lkv`` keys sits at\n    key position ``lkv - lq + p``); ``window_left >= 0`` additionally hides\n    keys more than ``window_left`` positions behind the query; ``lse_mode``\n    0/1/2 = none/base-2/natural log.  ``k_scale`` / ``v_scale`` dequantize an\n    fp8 KV cache (``real = stored * scale``).  Output dtype follows ``q``;\n    the LSE is fp32 ``(total_q, Hq)`` or ``None`` when ``lse_mode == 0``.\n    The variant axes are optional: ``csr`` 0/1 selects the paging table (the\n    other one is ignored), ``fp8_kv`` 0/1 and ``q_dtype`` 0/1 = bf16/fp16\n    are checked against the tensors so a definition is never evaluated on\n    another variant's inputs.\n    \"\"\"\n    if csr is not None:\n        block_tables, kv_page_indices = (\n            (None, kv_page_indices) if csr else (block_tables, None)\n        )\n    if (block_tables is None) == (kv_page_indices is None):\n        raise ValueError(\"exactly one of block_tables / kv_page_indices is required\")\n    if fp8_kv is not None and bool(fp8_kv) != (k_cache.dtype == torch.float8_e4m3fn):\n        raise ValueError(\n            f\"fp8_kv={fp8_kv} does not match the K cache dtype {k_cache.dtype}\"\n        )\n    if q_dtype is not None and q.dtype != (torch.bfloat16, torch.float16)[q_dtype]:\n        raise ValueError(f\"q_dtype={q_dtype} does not match q's dtype {q.dtype}\")\n    if kv_layout == 1:  # NHD -> HND view\n        k_cache = k_cache.permute(0, 2, 1, 3)\n        v_cache = v_cache.permute(0, 2, 1, 3)\n    total_q, num_qo_heads, head_dim_qk = q.shape\n    num_kv_heads, page_size = k_cache.shape[1], k_cache.shape[2]\n    head_dim_vo = v_cache.shape[3]\n    group = num_qo_heads // num_kv_heads\n    scale = head_dim_qk**-0.5 if sm_scale is None else float(sm_scale)\n    offsets = [int(x) for x in qo_indptr.tolist()]\n    lengths = [int(x) for x in kv_seq_lens.tolist()]\n\n    output = torch.zeros(\n        (total_q, num_qo_heads, head_dim_vo), dtype=q.dtype, device=q.device\n    )\n    lse = torch.full(\n        (total_q, num_qo_heads), -float(\"inf\"), dtype=torch.float32, device=q.device\n    )\n    page_start = 0\n    for b, lkv in enumerate(lengths):\n        s, e = offsets[b], offsets[b + 1]\n        lq = e - s\n        n_pages = (lkv + page_size - 1) // page_size\n        if block_tables is not None:\n            ids = block_tables[b, :n_pages]\n        else:\n            ids = kv_page_indices[page_start : page_start + n_pages]\n            page_start += n_pages\n        if lq == 0 or lkv == 0:\n            continue  # nothing to attend; the rows stay zero / -inf\n        ids = ids.to(torch.long)\n        k = (\n            k_cache[ids]\n            .permute(1, 0, 2, 3)\n            .reshape(num_kv_heads, -1, head_dim_qk)[:, :lkv]\n            .to(torch.float32)\n        )\n        v = (\n            v_cache[ids]\n            .permute(1, 0, 2, 3)\n            .reshape(num_kv_heads, -1, head_dim_vo)[:, :lkv]\n            .to(torch.float32)\n        )\n        if k_scale is not None:\n            k = k * float(k_scale)\n        if v_scale is not None:\n            v = v * float(v_scale)\n        k = k.repeat_interleave(group, dim=0)  # (Hq, lkv, Dqk)\n        v = v.repeat_interleave(group, dim=0)  # (Hq, lkv, Dvo)\n        scores = torch.einsum(\"qhd,hkd->hqk\", q[s:e].to(torch.float32), k) * scale\n        qpos = torch.arange(lq, device=q.device).unsqueeze(1) + (lkv - lq)\n        kpos = torch.arange(lkv, device=q.device).unsqueeze(0)\n        allowed = torch.ones((lq, lkv), dtype=torch.bool, device=q.device)\n        if causal:\n            allowed &= kpos <= qpos\n        if window_left >= 0:\n            allowed &= kpos >= qpos - window_left\n        scores = scores.masked_fill(~allowed.unsqueeze(0), -float(\"inf\"))\n        lse[s:e] = torch.logsumexp(scores, dim=-1).transpose(0, 1)\n        probs = torch.softmax(scores, dim=-1)\n        output[s:e] = torch.einsum(\"hqk,hkd->qhd\", probs, v).to(q.dtype)\n    if lse_mode == 0:\n        return output, None\n    if lse_mode == 1:\n        lse = lse / math.log(2.0)\n    return output, lse\n",
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n",
+  "init": "from __future__ import annotations\nimport math\nimport torch\n\n# ----- shared init helpers -----\n# Copyright (c) 2025 by FlashInfer team.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#   http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Shared helpers used by ``TraceTemplate.init`` functions.\n\nThis module contains the small set of input-construction patterns that\nrecur across many templates (paged-KV cache index arrays, ragged indptr,\nRoPE pos_ids and cos/sin caches, sampling probs). Each helper is short and\ndocumented; init functions in ``templates/<category>.py`` call into here so\nthe per-template init bodies stay focused on shape/dtype, not boilerplate.\n\nThe full source of this module is **inlined into every dumped JSON's\n``\"init\"`` field** by ``flashinfer/trace/template.py:_render_init_source``,\nso downstream consumers don't need flashinfer installed to re-run the init\nsnippets.\n\"\"\"\n\n\nfrom typing import Optional, Tuple\n\nimport torch\n\n\ndef make_paged_kv_indices(\n    batch_size: int,\n    num_pages_per_seq: int,\n    page_size: int,\n    *,\n    device: str = \"cuda\",\n) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:\n    \"\"\"Return ``(kv_indptr, kv_indices, kv_last_page_len)`` for a uniform batch.\n\n    Every sequence is assigned exactly ``num_pages_per_seq`` pages, fully\n    populated (last-page length == page_size).\n\n    Invariants\n    ----------\n    - ``kv_indptr.shape == (batch_size + 1,)``, dtype int32, monotonic, [0]=0.\n    - ``kv_indices == arange(0, batch_size * num_pages_per_seq)``, int32.\n    - ``kv_last_page_len == full(batch_size, page_size)``, int32.\n    \"\"\"\n    total_pages = batch_size * num_pages_per_seq\n    kv_indptr = (\n        torch.arange(batch_size + 1, dtype=torch.int32, device=device)\n        * num_pages_per_seq\n    )\n    kv_indices = torch.arange(total_pages, dtype=torch.int32, device=device)\n    kv_last_page_len = torch.full(\n        (batch_size,), page_size, dtype=torch.int32, device=device\n    )\n    return kv_indptr, kv_indices, kv_last_page_len\n\n\ndef make_ragged_indptr(\n    seg_lens,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.int32,\n) -> torch.Tensor:\n    \"\"\"Return cumulative-sum ``indptr`` of length ``len(seg_lens)+1``.\n\n    ``seg_lens`` may be a list / tuple / 1-D tensor of segment lengths.\n    \"\"\"\n    if isinstance(seg_lens, torch.Tensor):\n        lens = seg_lens.to(device=device, dtype=dtype)\n    else:\n        lens = torch.tensor(list(seg_lens), dtype=dtype, device=device)\n    indptr = torch.zeros(lens.numel() + 1, dtype=dtype, device=device)\n    indptr[1:] = torch.cumsum(lens, dim=0).to(dtype)\n    return indptr\n\n\ndef make_uniform_qo_indptr(\n    batch_size: int,\n    qo_len: int,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, qo_len, 2*qo_len, ..., batch_size*qo_len]`` int32.\"\"\"\n    return torch.arange(batch_size + 1, dtype=torch.int32, device=device) * qo_len\n\n\ndef make_pos_ids(\n    nnz: int,\n    max_seq_len: Optional[int] = None,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, 1, ..., nnz-1] (% max_seq_len)`` as int32 on ``device``.\n\n    If ``max_seq_len`` is None, no wrapping is applied.\n    \"\"\"\n    pos = torch.arange(nnz, dtype=torch.int32, device=device)\n    if max_seq_len is not None:\n        pos = pos % max_seq_len\n    return pos\n\n\ndef make_rope_cos_sin_cache(\n    max_seq_len: int,\n    rope_dim: int,\n    *,\n    base: float = 1e4,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return concatenated ``[cos | sin]`` cache of shape ``[max_seq_len, rope_dim]``.\"\"\"\n    t = torch.arange(max_seq_len, dtype=torch.float32, device=device)\n    inv = 1.0 / (\n        base\n        ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)\n    )\n    freqs = t.unsqueeze(-1) * inv.unsqueeze(0)\n    cache = torch.cat([torch.cos(freqs), torch.sin(freqs)], dim=-1)\n    return cache.to(dtype)\n\n\ndef make_probs(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return a ``[batch_size, vocab_size]`` probability distribution.\n\n    Uses ``softmax(randn(...))`` so each row sums to 1.0. This mirrors the\n    pattern used throughout ``tests/utils/test_sampling.py``.\n    \"\"\"\n    return torch.softmax(\n        torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device),\n        dim=-1,\n    ).to(dtype)\n\n\ndef make_logits(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return ``randn(batch_size, vocab_size)`` logits.\"\"\"\n    return torch.randn(batch_size, vocab_size, dtype=dtype, device=device)\n\n\ndef fp8_safe_randn(\n    *shape: int,\n    scale: float = 0.1,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.bfloat16,\n) -> torch.Tensor:\n    \"\"\"``randn(*shape) * scale`` \u2014 keeps values in the FP8/FP4 representable range.\n\n    Tests for fp8/fp4 paths typically multiply ``randn`` by 0.1 to avoid\n    saturation when quantizing. Use this helper to mirror that convention.\n    \"\"\"\n    return (torch.randn(*shape, dtype=dtype, device=device) * scale).to(dtype)\n\n\ndef per_tensor_fp8_quantize(\n    x: torch.Tensor,\n    *,\n    fp8_dtype: torch.dtype = torch.float8_e4m3fn,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Per-tensor FP8 quantization, mirroring ``tests/utils_fp8.py:to_float8``.\n\n    Returns ``(x_fp8, inv_scale)`` where ``inv_scale`` is the dequant\n    multiplier (``float \u2248 fp8 * inv_scale``).\n    \"\"\"\n    finfo = torch.finfo(fp8_dtype)\n    amax = x.abs().amax().clamp(min=1e-12)\n    scale = finfo.max / amax\n    x_q = (x.float() * scale).clamp(min=finfo.min, max=finfo.max).to(fp8_dtype)\n    return x_q, scale.float().reciprocal()\n\n\ndef fp8_block_quant_1d(\n    x_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize ``[T, H]`` activations into FP8 with per-``(token, block)``\n    column-block scales. Returns ``(x_fp8, scales)`` where\n    ``scales`` has shape ``[T, H // block]``.\n\n    Mirrors ``_fp8_block_quant_1d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert x_bf16.dim() == 2\n    T, H = x_bf16.shape\n    assert H % block == 0\n    nb = H // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    x_f32 = x_bf16.to(torch.float32)\n    x_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=x_bf16.device)\n    scales = torch.empty((T, nb), dtype=torch.float32, device=x_bf16.device)\n    for j in range(nb):\n        sl = slice(j * block, (j + 1) * block)\n        blk = x_f32[:, sl]\n        amax = torch.amax(torch.abs(blk), dim=1)\n        s = torch.where(amax > 0, amax / max_fp8, torch.ones_like(amax))\n        x_fp8[:, sl] = (blk / s.unsqueeze(1)).to(torch.float8_e4m3fn)\n        scales[:, j] = s\n    return x_fp8, scales\n\n\ndef fp8_block_quant_2d(\n    w_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize weights ``[..., R, C]`` with 2-D ``block \u00d7 block`` scales.\n\n    Returns ``(w_fp8, scales)`` where ``scales`` has shape\n    ``[..., R // block, C // block]``. Mirrors ``_fp8_block_quant_2d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert w_bf16.dim() >= 2\n    *prefix, R, C = w_bf16.shape\n    assert R % block == 0 and C % block == 0\n    nb_r, nb_c = R // block, C // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    w_f32 = w_bf16.to(torch.float32).contiguous()\n    prefix_ndim = len(prefix)\n    reshaped = w_f32.reshape(*prefix, nb_r, block, nb_c, block)\n    permute_dims = tuple(range(prefix_ndim)) + (\n        prefix_ndim,\n        prefix_ndim + 2,\n        prefix_ndim + 1,\n        prefix_ndim + 3,\n    )\n    blocks = reshaped.permute(permute_dims).contiguous()\n    amax = torch.amax(torch.abs(blocks), dim=(-1, -2))\n    scales = torch.where(\n        amax > 0, amax / max_fp8, torch.ones_like(amax, dtype=torch.float32)\n    )\n    q_blocks = (blocks / scales.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)\n    inv_permute = [0] * (prefix_ndim + 4)\n    for i, p in enumerate(permute_dims):\n        inv_permute[p] = i\n    w_fp8 = q_blocks.permute(*inv_permute).reshape(*prefix, R, C).contiguous()\n    return w_fp8, scales\n\n\n__all__ = [\n    \"make_paged_kv_indices\",\n    \"make_ragged_indptr\",\n    \"make_uniform_qo_indptr\",\n    \"make_pos_ids\",\n    \"make_rope_cos_sin_cache\",\n    \"make_probs\",\n    \"make_logits\",\n    \"fp8_safe_randn\",\n    \"per_tensor_fp8_quantize\",\n    \"fp8_block_quant_1d\",\n    \"fp8_block_quant_2d\",\n]\n\n# ----- init -----\ndef _paged_attention_init(\n    *,\n    total_q: int = 8,\n    batch_size: int = 2,\n    len_indptr: int = 0,\n    num_pages: int = 0,\n    max_pages: int = 0,\n    num_kv_indices: int = 0,\n    num_qo_heads: int = 8,\n    num_kv_heads: int = 2,\n    head_dim_qk: int = 128,\n    head_dim_vo: int = 128,\n    page_size: int = 16,\n    kv_layout: int = 0,\n    causal: int = 1,\n    window_left: int = -1,\n    lse_mode: int = 0,\n    csr: int = 0,\n    fp8_kv: int = 0,\n    q_dtype: int = 0,\n    num_pages_per_seq: int = 4,\n    backend: str = \"auto\",\n    device: str = \"cuda\",\n    seed: int = 0,\n    **unused,\n):\n    \"\"\"Build ``{\"plan\": {...}, \"run\": {...}}`` for ``flashinfer.prefill.PagedAttention``.\n\n    ``attn = PagedAttention(device); attn.plan(**inputs[\"plan\"]);\n    attn.run(**inputs[\"run\"])`` is a valid planned execution of the traced\n    workload.  The Const axes of the definition (heads, dims, page_size, and\n    the encoded ``kv_layout`` 0/1 = HND/NHD, ``causal`` 0/1, ``window_left``\n    -1/N, ``lse_mode`` 0/1/2 = none/base2/basee, ``csr`` 0/1 = dense block\n    table / flat page ids, ``fp8_kv`` 0/1, ``q_dtype`` 0/1 = bf16/fp16)\n    select the variant; the Var axes size the workload and are honoured when\n    given (0 = unspecified):\n\n    - ``total_q`` is split evenly over ``batch_size`` requests (or\n      ``len_indptr - 1`` when ``len_indptr`` is given); ``total_q >=\n      batch_size``.\n    - dense form: the block table is ``(batch_size, max_pages)`` and every\n      request uses ``max_pages`` pages (default ``num_pages_per_seq``), the\n      last one partially.\n    - flat form: the live page-id list has exactly ``num_kv_indices``\n      entries, spread over the requests (default ``num_pages_per_seq`` per\n      request), each request's last page partially used.\n    - ``num_pages`` is the K/V pool size (default: one physical page per\n      referenced page).  Page ids are a random permutation of the pool; a\n      pool smaller than the pages the batch references makes requests share\n      pages (legal: a shared prefix), but a single request never repeats one.\n\n    Per-request KV lengths never fall below the request's query length, so\n    the bundle satisfies the definition's constraints for the causal variant\n    too.  Q (and the output) take ``q_dtype``; K/V take q's dtype, or with\n    ``fp8_kv`` are quantized per tensor to float8_e4m3fn (scale = amax / 448)\n    with the ``k_scale`` / ``v_scale`` dequantization scales in the run\n    bundle, and ``plan`` receives the matching ``kv_dtype``.  Requires CUDA\n    (the metadata contract is device-resident).\n    \"\"\"\n    del unused\n    # The experimental package is imported only when init runs.\n    from flashinfer.prefill import PagedAttentionMetadata\n\n    if len_indptr:\n        if batch_size and batch_size != len_indptr - 1:\n            raise ValueError(\n                f\"len_indptr ({len_indptr}) must equal batch_size + 1 \"\n                f\"({batch_size + 1})\"\n            )\n        batch_size = len_indptr - 1\n    if batch_size < 1:\n        raise ValueError(f\"batch_size must be >= 1, got {batch_size}\")\n    if total_q < batch_size:\n        raise ValueError(\n            f\"total_q ({total_q}) must be >= batch_size ({batch_size}): every \"\n            \"request needs at least one query token\"\n        )\n    torch.manual_seed(seed)\n    q_lens = torch.full((batch_size,), total_q // batch_size, dtype=torch.int64)\n    q_lens[: total_q % batch_size] += 1\n    min_pages = (q_lens + page_size - 1) // page_size  # kv_len >= q_len\n\n    # pages per request from the Var axes of the traced form\n    if csr:\n        if num_kv_indices:\n            if num_kv_indices < int(min_pages.sum()):\n                raise ValueError(\n                    f\"num_kv_indices ({num_kv_indices}) cannot hold one page per \"\n                    f\"query token: the {batch_size} requests of {total_q} tokens \"\n                    f\"need at least {int(min_pages.sum())} pages\"\n                )\n            pages = min_pages.clone()\n            spare = num_kv_indices - int(pages.sum())\n            pages += spare // batch_size\n            pages[: spare % batch_size] += 1\n        else:\n            pages = torch.maximum(min_pages, torch.tensor(num_pages_per_seq))\n        table_width = int(pages.max())\n    else:\n        table_width = max_pages or max(num_pages_per_seq, int(min_pages.max()))\n        if table_width < int(min_pages.max()):\n            raise ValueError(\n                f\"max_pages ({max_pages}) x page_size ({page_size}) cannot hold \"\n                f\"the longest request's {int(q_lens.max())} query tokens\"\n            )\n        pages = torch.full((batch_size,), table_width, dtype=torch.int64)\n\n    # partial last pages (request i leaves i % page_size slots unused), never\n    # shorter than the request's own query length\n    kv_lens = torch.maximum(\n        pages * page_size - (torch.arange(batch_size) % page_size), q_lens\n    )\n    assert bool(((kv_lens + page_size - 1) // page_size == pages).all())\n\n    pool_pages = num_pages or int(pages.sum())\n    if pool_pages < int(pages.max()):\n        raise ValueError(\n            f\"num_pages ({pool_pages}) is smaller than the {int(pages.max())} \"\n            \"pages the longest request references\"\n        )\n    perm = torch.randperm(pool_pages)  # scattered page ids\n    # request-ordered pages (wrapping around a small pool); unused dense slots\n    # hold valid pool pages that belong to nobody\n    slots = torch.arange(batch_size * table_width).view(batch_size, table_width)\n    block_tables_cpu = perm[slots % pool_pages].to(torch.int32)\n    kv_page_indices_cpu = torch.cat(\n        [block_tables_cpu[i, : int(pages[i])] for i in range(batch_size)]\n    )\n    qo_indptr_cpu = torch.cat(\n        [torch.zeros(1, dtype=torch.int32), torch.cumsum(q_lens, 0).to(torch.int32)]\n    )\n    kv_lens_cpu = kv_lens.to(torch.int32)\n    common = dict(\n        page_size=page_size,\n        max_q_len=int(q_lens.max()),\n        max_kv_len=int(kv_lens_cpu.max()),\n        qo_indptr_cpu=qo_indptr_cpu,\n        kv_seq_lens_cpu=kv_lens_cpu,\n    )\n    qo_indptr = qo_indptr_cpu.to(device)\n    kv_seq_lens = kv_lens_cpu.to(device)\n    if csr:\n        metadata = PagedAttentionMetadata.csr(\n            qo_indptr, kv_seq_lens, kv_page_indices_cpu.to(device), **common\n        )\n    else:\n        metadata = PagedAttentionMetadata.dense(\n            qo_indptr, kv_seq_lens, block_tables_cpu.to(device), **common\n        )\n    if kv_layout == 0:\n        cache_shape = (pool_pages, num_kv_heads, page_size)\n    else:\n        cache_shape = (pool_pages, page_size, num_kv_heads)\n    dtype = (torch.bfloat16, torch.float16)[q_dtype]\n    kv_dtype = dtype\n    q = torch.randn(total_q, num_qo_heads, head_dim_qk, dtype=dtype, device=device)\n    k_cache = torch.randn(*cache_shape, head_dim_qk, dtype=dtype, device=device)\n    v_cache = torch.randn(*cache_shape, head_dim_vo, dtype=dtype, device=device)\n    run = {\"q\": q, \"kv_cache\": (k_cache, v_cache)}\n    if fp8_kv:\n        kv_dtype = torch.float8_e4m3fn\n        k_scale = float(k_cache.abs().amax().item()) / 448.0\n        v_scale = float(v_cache.abs().amax().item()) / 448.0\n        k_cache = (k_cache.float() / k_scale).to(kv_dtype)\n        v_cache = (v_cache.float() / v_scale).to(kv_dtype)\n        run = {\n            \"q\": q,\n            \"kv_cache\": (k_cache, v_cache),\n            \"k_scale\": k_scale,\n            \"v_scale\": v_scale,\n        }\n    return {\n        \"plan\": {\n            \"metadata\": metadata,\n            \"num_qo_heads\": int(num_qo_heads),\n            \"num_kv_heads\": int(num_kv_heads),\n            \"head_dim_qk\": int(head_dim_qk),\n            \"head_dim_vo\": int(head_dim_vo),\n            \"q_dtype\": dtype,\n            \"kv_dtype\": kv_dtype,\n            \"kv_layout\": (\"HND\", \"NHD\")[kv_layout],\n            \"causal\": bool(causal),\n            \"window_left\": int(window_left),\n            \"lse_mode\": (\"none\", \"base2\", \"basee\")[lse_mode],\n            \"backend\": backend,\n        },\n        \"run\": run,\n    }\n"
+}

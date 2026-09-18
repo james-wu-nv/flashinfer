@@ -127,7 +127,7 @@ trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPU
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
 Experimental APIs are opt-in: FLASHINFER_TRACE_EXAMPLE_EXPERIMENTAL=1 additionally
 emits (unified PagedAttention, fa2, dense block table, NHD, causal, base-2 LSE):
-paged_attention_dense_h32_kv8_dqk128_dvo128_ps16_layout1_causal1_wl-1_lse1.json
+paged_attention_dense_h32_kv8_dqk128_dvo128_ps16_qdtype0_layout1_causal1_wl-1_lse1.json
 """
 
 import contextlib

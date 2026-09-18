@@ -23,7 +23,7 @@ lengths, always causal, base-2 LSE hard-coded).  This module provides:
 - :func:`paged_attention_trace_dispatch` — bound to ``PagedAttention.run``;
   reads the last successful plan through the facade's read-only
   ``_trace_context()`` and returns one stable template per plan identity
-  (paging form, KV layout, causal, window, LSE mode, fp8 KV).
+  (paging form, Q dtype, KV dtype, KV layout, causal, window, LSE mode).
 - :class:`_PagedAttentionTraceTemplate` — normalizes the plan-owned inputs
   into the trace kwargs inside ``build_fi_trace_fn`` (the dispatcher's own
   ``**kwargs`` copy never reaches the base builder).
@@ -31,14 +31,21 @@ lengths, always causal, base-2 LSE hard-coded).  This module provides:
   and an ``init`` that builds a valid ``{"plan": ..., "run": ...}`` bundle.
 
 Identity rules: ``op_type="gqa_paged"`` keeps the category; the name prefix
-``paged_attention_{dense,csr}`` never collides with ``gqa_paged_prefill_*``;
-the plan's semantic knobs are ``Const`` axes with fixed integer values, so
-they enter ``definition_name()`` and the reference signature.  The resolved
-backend is NOT part of the identity: the same mathematical contract must
-compare fa2, fa3, cuDNN and trtllm-gen.
+``paged_attention_{dense,csr}[_fp8kv]`` never collides with
+``gqa_paged_prefill_*``; the plan's semantic knobs — including the paging
+form and the dtypes the prefix spells out — are ``Const`` axes with fixed
+integer values, so they enter ``definition_name()``, the reference signature
+and the exported ``init``: a consumer rebuilds the traced variant from the
+JSON's axes alone.  The resolved backend is NOT part of the identity: the
+same mathematical contract must compare fa2, fa3, cuDNN and trtllm-gen.
 
 Encodings (also documented in every definition's description):
 
+    csr          0 = dense block table (``block_tables``), 1 = flat page ids
+                 (``kv_page_indices``); also the ``dense`` / ``csr`` prefix
+    fp8_kv       0 = K/V in q's dtype, 1 = float8_e4m3fn K/V dequantized by
+                 ``k_scale`` / ``v_scale``; also the ``_fp8kv`` prefix
+    q_dtype      0 = bfloat16, 1 = float16 queries (and output)
     kv_layout    0 = HND ``(pages, num_kv_heads, page_size, head_dim)``
                  1 = NHD ``(pages, page_size, num_kv_heads, head_dim)``
     causal       0 = every query token sees the whole KV prefix
@@ -63,7 +70,8 @@ from ..template import Const, Scalar, Tensor, TraceTemplate, Var
 
 _LAYOUTS = ("HND", "NHD")
 _LSE_MODES = ("none", "base2", "basee")
-_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+_Q_DTYPES = (torch.bfloat16, torch.float16)
+_FP8_KV_DTYPE = torch.float8_e4m3fn
 
 
 # ── reference ────────────────────────────────────────────────────────────────
@@ -86,6 +94,9 @@ def _paged_attention_reference(
     causal,
     window_left,
     lse_mode,
+    csr=None,
+    fp8_kv=None,
+    q_dtype=None,
 ):
     """FP32 paged attention over packed queries; returns ``(output, lse)``.
 
@@ -101,7 +112,23 @@ def _paged_attention_reference(
     0/1/2 = none/base-2/natural log.  ``k_scale`` / ``v_scale`` dequantize an
     fp8 KV cache (``real = stored * scale``).  Output dtype follows ``q``;
     the LSE is fp32 ``(total_q, Hq)`` or ``None`` when ``lse_mode == 0``.
+    The variant axes are optional: ``csr`` 0/1 selects the paging table (the
+    other one is ignored), ``fp8_kv`` 0/1 and ``q_dtype`` 0/1 = bf16/fp16
+    are checked against the tensors so a definition is never evaluated on
+    another variant's inputs.
     """
+    if csr is not None:
+        block_tables, kv_page_indices = (
+            (None, kv_page_indices) if csr else (block_tables, None)
+        )
+    if (block_tables is None) == (kv_page_indices is None):
+        raise ValueError("exactly one of block_tables / kv_page_indices is required")
+    if fp8_kv is not None and bool(fp8_kv) != (k_cache.dtype == torch.float8_e4m3fn):
+        raise ValueError(
+            f"fp8_kv={fp8_kv} does not match the K cache dtype {k_cache.dtype}"
+        )
+    if q_dtype is not None and q.dtype != (torch.bfloat16, torch.float16)[q_dtype]:
+        raise ValueError(f"q_dtype={q_dtype} does not match q's dtype {q.dtype}")
     if kv_layout == 1:  # NHD -> HND view
         k_cache = k_cache.permute(0, 2, 1, 3)
         v_cache = v_cache.permute(0, 2, 1, 3)
@@ -190,6 +217,8 @@ def _paged_attention_init(
     window_left: int = -1,
     lse_mode: int = 0,
     csr: int = 0,
+    fp8_kv: int = 0,
+    q_dtype: int = 0,
     num_pages_per_seq: int = 4,
     backend: str = "auto",
     device: str = "cuda",
@@ -203,8 +232,9 @@ def _paged_attention_init(
     workload.  The Const axes of the definition (heads, dims, page_size, and
     the encoded ``kv_layout`` 0/1 = HND/NHD, ``causal`` 0/1, ``window_left``
     -1/N, ``lse_mode`` 0/1/2 = none/base2/basee, ``csr`` 0/1 = dense block
-    table / flat page ids) select the variant; the Var axes size the workload
-    and are honoured when given (0 = unspecified):
+    table / flat page ids, ``fp8_kv`` 0/1, ``q_dtype`` 0/1 = bf16/fp16)
+    select the variant; the Var axes size the workload and are honoured when
+    given (0 = unspecified):
 
     - ``total_q`` is split evenly over ``batch_size`` requests (or
       ``len_indptr - 1`` when ``len_indptr`` is given); ``total_q >=
@@ -222,8 +252,11 @@ def _paged_attention_init(
 
     Per-request KV lengths never fall below the request's query length, so
     the bundle satisfies the definition's constraints for the causal variant
-    too.  Q/K/V are bf16.  Requires CUDA (the metadata contract is
-    device-resident).
+    too.  Q (and the output) take ``q_dtype``; K/V take q's dtype, or with
+    ``fp8_kv`` are quantized per tensor to float8_e4m3fn (scale = amax / 448)
+    with the ``k_scale`` / ``v_scale`` dequantization scales in the run
+    bundle, and ``plan`` receives the matching ``kv_dtype``.  Requires CUDA
+    (the metadata contract is device-resident).
     """
     del unused
     # The experimental package is imported only when init runs.
@@ -319,10 +352,24 @@ def _paged_attention_init(
         cache_shape = (pool_pages, num_kv_heads, page_size)
     else:
         cache_shape = (pool_pages, page_size, num_kv_heads)
-    dtype = torch.bfloat16
+    dtype = (torch.bfloat16, torch.float16)[q_dtype]
+    kv_dtype = dtype
     q = torch.randn(total_q, num_qo_heads, head_dim_qk, dtype=dtype, device=device)
     k_cache = torch.randn(*cache_shape, head_dim_qk, dtype=dtype, device=device)
     v_cache = torch.randn(*cache_shape, head_dim_vo, dtype=dtype, device=device)
+    run = {"q": q, "kv_cache": (k_cache, v_cache)}
+    if fp8_kv:
+        kv_dtype = torch.float8_e4m3fn
+        k_scale = float(k_cache.abs().amax().item()) / 448.0
+        v_scale = float(v_cache.abs().amax().item()) / 448.0
+        k_cache = (k_cache.float() / k_scale).to(kv_dtype)
+        v_cache = (v_cache.float() / v_scale).to(kv_dtype)
+        run = {
+            "q": q,
+            "kv_cache": (k_cache, v_cache),
+            "k_scale": k_scale,
+            "v_scale": v_scale,
+        }
     return {
         "plan": {
             "metadata": metadata,
@@ -331,13 +378,14 @@ def _paged_attention_init(
             "head_dim_qk": int(head_dim_qk),
             "head_dim_vo": int(head_dim_vo),
             "q_dtype": dtype,
+            "kv_dtype": kv_dtype,
             "kv_layout": ("HND", "NHD")[kv_layout],
             "causal": bool(causal),
             "window_left": int(window_left),
             "lse_mode": ("none", "base2", "basee")[lse_mode],
             "backend": backend,
         },
-        "run": {"q": q, "kv_cache": (k_cache, v_cache)},
+        "run": run,
     }
 
 
@@ -392,13 +440,21 @@ def _identity_from_context(ctx: Dict[str, Any]) -> Dict[str, int]:
             "(kv_len == 0), which the paged_attention trace definition excludes "
             "(min(kv_seq_lens) >= 1); trace a batch without padding rows"
         )
+    q_dtype, kv_dtype = ctx["q_dtype"], ctx["kv_dtype"]
+    if q_dtype not in _Q_DTYPES or kv_dtype not in (q_dtype, _FP8_KV_DTYPE):
+        raise ValueError(
+            f"Tracing PagedAttention.run: the plan's dtypes (q {q_dtype}, kv "
+            f"{kv_dtype}) are not encoded by the paged_attention trace definition "
+            "(q bfloat16 / float16, kv the same or float8_e4m3fn)"
+        )
     return dict(
         csr=int(ctx["kv_input_form"] == "page_indices"),
+        fp8_kv=int(kv_dtype == _FP8_KV_DTYPE),
+        q_dtype=_Q_DTYPES.index(q_dtype),
         kv_layout=_LAYOUTS.index(ctx["kv_layout"]),
         causal=int(bool(ctx["causal"])),
         window_left=int(ctx["window_left"]),
         lse_mode=_LSE_MODES.index(ctx["lse_mode"]),
-        fp8_kv=int(ctx["kv_dtype"] in _FP8_DTYPES),
     )
 
 
@@ -444,7 +500,9 @@ class _PagedAttentionTraceTemplate(TraceTemplate):
         (``qo_indptr[-1]``, as views) — in CUDA-graph mode they are capacity
         buffers with headroom rows the kernel never reads or writes, and the
         definition's ``total_q == qo_indptr[-1]`` constraint describes the
-        live rows only.  A ``q`` with fewer rows than the plan is refused.
+        live rows only.  A ``q`` with fewer rows than the plan, or tensors
+        whose dtypes differ from the planned ``q_dtype`` / ``kv_dtype`` (the
+        schema would then contradict the identity), are refused.
         """
         normalized = dict(kwargs)
         wrapper = normalized.pop("self", None)
@@ -464,6 +522,14 @@ class _PagedAttentionTraceTemplate(TraceTemplate):
             normalized["block_tables"] = ctx["block_tables"]
             normalized["kv_page_indices"] = ctx["kv_page_indices"]
             _require_run_tensors(normalized)
+            got = (normalized["q"].dtype, *(t.dtype for t in normalized["kv_cache"]))
+            want = (ctx["q_dtype"], ctx["kv_dtype"], ctx["kv_dtype"])
+            if got != want:
+                raise ValueError(
+                    "Tracing PagedAttention.run: q / k_cache / v_cache dtypes "
+                    f"{got} differ from the plan's {want}; pass the tensors the "
+                    "plan was made for"
+                )
             live = int(ctx["total_q_tokens"])
             for key in ("q", "out", "lse"):
                 t = normalized.get(key)
@@ -485,8 +551,7 @@ class _PagedAttentionTraceTemplate(TraceTemplate):
                 normalized.setdefault("block_tables", metadata.block_tables)
                 normalized.setdefault("kv_page_indices", metadata.kv_page_indices)
             _require_run_tensors(normalized)
-        for key in ("kv_layout", "causal", "window_left", "lse_mode"):
-            normalized[key] = self.identity[key]
+        normalized.update(self.identity)  # the reference's variant scalars
         return normalized
 
     def build_fi_trace_fn(self, fi_api):
@@ -510,6 +575,7 @@ def _paged_attention_template(
     window_left: int = -1,
     lse_mode: int = 0,
     fp8_kv: int = 0,
+    q_dtype: int = 0,
 ) -> _PagedAttentionTraceTemplate:
     """One stable template object per plan identity.
 
@@ -525,13 +591,14 @@ def _paged_attention_template(
         ("causal", causal, (0, 1)),
         ("lse_mode", lse_mode, (0, 1, 2)),
         ("fp8_kv", fp8_kv, (0, 1)),
+        ("q_dtype", q_dtype, (0, 1)),
     ):
         if type(value) is not int or value not in allowed:
             raise ValueError(f"{key} must be one of {allowed}, got {value!r}")
     if type(window_left) is not int or window_left < -1:
         raise ValueError(f"window_left must be an int >= -1, got {window_left!r}")
     return _build_paged_attention_template(
-        csr, kv_layout, causal, window_left, lse_mode, fp8_kv
+        csr, kv_layout, causal, window_left, lse_mode, fp8_kv, q_dtype
     )
 
 
@@ -543,6 +610,7 @@ def _build_paged_attention_template(
     window_left: int,
     lse_mode: int,
     fp8_kv: int,
+    q_dtype: int,
 ) -> _PagedAttentionTraceTemplate:
     layout_name = _LAYOUTS[kv_layout]
     form = "csr" if csr else "dense"
@@ -557,6 +625,27 @@ def _build_paged_attention_template(
         "head_dim_qk": Const(abbrev="dqk"),
         "head_dim_vo": Const(abbrev="dvo"),
         "page_size": Const(abbrev="ps"),
+        # The variant the name prefix spells out, as values a consumer can
+        # hand to init / the reference (abbrev "" = already in the prefix).
+        "csr": Const(
+            abbrev="",
+            value=csr,
+            description="Paging form fixed by plan(): 0 = dense block table "
+            "(block_tables), 1 = flat page ids (kv_page_indices); also the "
+            "dense / csr name prefix.",
+        ),
+        "fp8_kv": Const(
+            abbrev="",
+            value=fp8_kv,
+            description="0 = K/V cache in q's dtype, 1 = float8_e4m3fn K/V "
+            "dequantized by k_scale / v_scale; also the _fp8kv name prefix.",
+        ),
+        "q_dtype": Const(
+            abbrev="qdtype",
+            value=q_dtype,
+            description="Query and output dtype fixed by plan(): 0 = bfloat16, "
+            "1 = float16.",
+        ),
         "kv_layout": Const(
             abbrev="layout",
             value=kv_layout,
@@ -656,6 +745,22 @@ def _build_paged_attention_template(
                 description="Per-tensor dequantization scale of an fp8 V cache; "
                 "fp8 KV only.",
             ),
+            "csr": Scalar(
+                "int32",
+                optional=True,
+                description="Same encoding as the csr axis; fixed by plan(), "
+                "passed to the reference.",
+            ),
+            "fp8_kv": Scalar(
+                "int32",
+                optional=True,
+                description="Same encoding as the fp8_kv axis; fixed by plan().",
+            ),
+            "q_dtype": Scalar(
+                "int32",
+                optional=True,
+                description="Same encoding as the q_dtype axis; fixed by plan().",
+            ),
             "kv_layout": Scalar(
                 "int32",
                 optional=True,
@@ -722,6 +827,7 @@ def _build_paged_attention_template(
         f"mask:{'causal' if causal else 'noncausal'}",
         f"window:{window_left}",
         f"lse:{_LSE_MODES[lse_mode]}",
+        f"q:{('bf16', 'fp16')[q_dtype]}",
     ]
     if fp8_kv:
         tags.append("kv:fp8")
@@ -730,10 +836,13 @@ def _build_paged_attention_template(
         f"KV cache in the {layout_name} layout, paging metadata from plan() in "
         f"the {'flat page-id (CSR)' if csr else 'dense block-table'} form"
         f"{' with an fp8 KV cache (k_scale/v_scale dequantize)' if fp8_kv else ''}. "
-        "Const axes encode the plan: kv_layout 0=HND/1=NHD, causal 0/1 "
+        "Const axes encode the plan: csr 0=dense block table/1=flat page ids, "
+        "fp8_kv 0=K/V in q's dtype/1=float8_e4m3fn K/V, q_dtype "
+        "0=bfloat16/1=float16, kv_layout 0=HND/1=NHD, causal 0/1 "
         "(bottom-right aligned), window_left -1=unlimited, lse_mode "
         "0=none/1=base-2/2=natural log; the reference takes the same values as "
-        "int scalars. qo_indptr, kv_seq_lens and the page table are plan() "
+        "int scalars and init rebuilds the variant from them. qo_indptr, "
+        "kv_seq_lens and the page table are plan() "
         "inputs, filled from the planned instance by "
         "flashinfer.fi_trace(attn.run, ...). The resolved backend is not part "
         "of this identity."
@@ -751,11 +860,12 @@ def _build_paged_attention_template(
         init=_paged_attention_init,
         identity=dict(
             csr=csr,
+            fp8_kv=fp8_kv,
+            q_dtype=q_dtype,
             kv_layout=kv_layout,
             causal=causal,
             window_left=window_left,
             lse_mode=lse_mode,
-            fp8_kv=fp8_kv,
         ),
     )
 

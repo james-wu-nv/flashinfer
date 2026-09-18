@@ -347,13 +347,19 @@ page table (the dense block table, or the live prefix of the flat page ids)
 from the last successful ``plan()``, so it describes what ``run()`` executes
 even after a rejected re-plan, and in CUDA-graph mode it points at the
 reserved storage a captured ``run()`` reads. The identity of a definition is
-the plan's paging form (``paged_attention_dense`` / ``paged_attention_csr``),
-KV layout, causal flag, sliding window, LSE mode and geometry, encoded as
-integer Const axes so the exported reference can be called with the same
-values: ``kv_layout`` 0/1 = HND/NHD, ``causal`` 0/1, ``window_left`` -1 =
-unlimited, ``lse_mode`` 0/1/2 = none/base-2/natural log. The resolved backend
-is not part of the identity, so fa2, fa3, cuDNN and trtllm-gen traces of one
-plan compare against the same definition. Tracing requires the planned
+the plan's paging form (``paged_attention_dense`` / ``paged_attention_csr``,
+``_fp8kv`` for an fp8 KV cache), Q and KV dtypes, KV layout, causal flag,
+sliding window, LSE mode and geometry, encoded as integer Const axes so the
+exported reference can be called with the same values and the exported
+``init`` rebuilds the traced variant from the JSON alone: ``csr`` 0/1 = dense
+block table / flat page ids, ``fp8_kv`` 0/1 = K/V in q's dtype /
+float8_e4m3fn (the init then plans with that ``kv_dtype`` and puts
+``k_scale`` / ``v_scale`` in its run bundle), ``q_dtype`` 0/1 =
+bfloat16/float16, ``kv_layout`` 0/1 = HND/NHD, ``causal`` 0/1,
+``window_left`` -1 = unlimited, ``lse_mode`` 0/1/2 = none/base-2/natural
+log. The resolved backend is not part of the identity, so fa2, fa3, cuDNN and
+trtllm-gen traces of one plan compare against the same definition. Tracing
+tensors whose dtypes differ from the plan's is refused. Tracing requires the planned
 instance: ``PagedAttention.run.fi_trace(...)`` and a trace before ``plan()``
 raise instead of guessing; a plan that uses ``logits_soft_cap``, a custom
 mask or attention sinks refuses to trace until the definition encodes them,

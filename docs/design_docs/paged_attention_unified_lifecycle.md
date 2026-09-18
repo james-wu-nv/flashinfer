@@ -875,9 +875,14 @@ memcpy counts from the profiler.
 `flashinfer.fi_trace(attn.run, q=q, kv_cache=(k, v))` on a planned instance,
 or `FLASHINFER_TRACE_DUMP=1` during `run()`, exports a definition whose
 identity is the plan's paging form (`paged_attention_dense` /
-`paged_attention_csr`, with a `_fp8kv` schema variant), KV layout, causal
-flag, sliding window and LSE mode as integer `Const` axes plus the geometry
-(heads, head dims, page size). The resolved backend is provenance, not
+`paged_attention_csr`, with a `_fp8kv` schema variant), Q and KV dtypes, KV
+layout, causal flag, sliding window and LSE mode as integer `Const` axes
+(`csr`, `fp8_kv`, `q_dtype`, `kv_layout`, `causal`, `window_left`,
+`lse_mode`) plus the geometry (heads, head dims, page size). The exported
+`init` and `reference` take the same axes, so a consumer rebuilds a CSR,
+fp8-KV or fp16 definition from the JSON alone (the fp8 init plans with
+`kv_dtype=float8_e4m3fn` and carries `k_scale` / `v_scale` in its run
+bundle). The resolved backend is provenance, not
 identity, so fa2, cuDNN and trtllm-gen traces of one plan compare against the
 same definition. The dispatcher reads the controller's read-only
 `trace_context()`: no device-to-host copy, no launch; the tensors are the
