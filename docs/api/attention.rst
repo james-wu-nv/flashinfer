@@ -257,6 +257,14 @@ the fa2 kernel computes it wrong for requests longer than 128 query tokens
 with a history (design doc, known limitation M20), so fa2/fa3 declare it
 unsupported and ``resolve_paged_attention`` reports the reason per backend.
 
+The slots of a request's last page past its ``kv_seq_lens`` entry are never
+attended but must hold finite values: the FA kernels zero that tail before
+the PV product, while trtllm-gen, cake and cuDNN load the whole page and a
+NaN or Inf there reaches the output as ``0 * NaN`` (design doc, known
+limitation M23). Any finite content — stale tokens, zeros — gives the exact
+result; a KV pool allocated with ``torch.empty`` and never written past
+``kv_len`` is not covered by that guarantee until its storage is initialised.
+
 Backend selection and the ``max_q_len`` hint
 --------------------------------------------
 
