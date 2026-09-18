@@ -876,9 +876,17 @@ memcpy counts from the profiler.
 or `FLASHINFER_TRACE_DUMP=1` during `run()`, exports a definition whose
 identity is the plan's paging form (`paged_attention_dense` /
 `paged_attention_csr`, with a `_fp8kv` schema variant), Q and KV dtypes, KV
-layout, causal flag, sliding window and LSE mode as integer `Const` axes
-(`csr`, `fp8_kv`, `q_dtype`, `kv_layout`, `causal`, `window_left`,
-`lse_mode`) plus the geometry (heads, head dims, page size). The exported
+layout, causal flag, sliding window, LSE mode and feature knobs as integer
+`Const` axes (`csr`, `fp8_kv`, `q_dtype`, `kv_layout`, `causal`,
+`window_left`, `lse_mode`, `logits_soft_cap`, `use_sinks`,
+`use_custom_mask`) plus the geometry (heads, head dims, page size). The
+feature axes name the definition only when on (`_cap30`, `_sinks1`,
+`_mask1`); a soft cap is its integer value (a non-integer cap refuses to
+trace), sinks add a `sinks` input `(num_qo_heads,)` fp32 that the trace
+takes like `run()`, and a custom mask adds the plan-owned flattened bool
+`custom_mask` input with a `mask_len` axis. The reference applies them
+(cap * tanh before masking; the sink as one extra logit per head in the
+denominator, included in the LSE; the mask ANDed with the envelope). The exported
 `init` and `reference` take the same axes, so a consumer rebuilds a CSR,
 fp8-KV or fp16 definition from the JSON alone (the fp8 init plans with
 `kv_dtype=float8_e4m3fn` and carries `k_scale` / `v_scale` in its run
@@ -888,10 +896,8 @@ same definition. The dispatcher reads the controller's read-only
 `trace_context()`: no device-to-host copy, no launch; the tensors are the
 ones the planned kernels read (the reserved storage in graph mode), and the
 flat form traces the live prefix of the plan's own page-id list even when
-the chosen backend read a derived dense table. A plan that uses
-`logits_soft_cap`, a custom mask or sinks refuses to trace, because the
-definition does not encode them yet; so does a planned batch that contains
-padding rows (`kv_len == 0`), because the definition constrains
+the chosen backend read a derived dense table. A planned batch that contains
+padding rows (`kv_len == 0`) refuses to trace, because the definition constrains
 `min(kv_seq_lens) >= 1` and its reference has no padding-row convention.
 Requests without query rows (`q_len == 0`) are inside the definition: the
 constraint is `min(q_len) >= 0`, the reference skips them and `init` emits

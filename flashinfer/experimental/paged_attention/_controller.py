@@ -917,7 +917,8 @@ class PagedAttentionController:
         length computed from the host mirrors; this is the plan's source even
         when the chosen backend reads a dense table derived from it).
         ``logits_soft_cap`` / ``has_custom_mask`` / ``use_sinks`` are the
-        plan's feature knobs.  ``backend`` / ``excluded_backends`` /
+        plan's feature knobs and ``custom_mask`` the plan-owned flattened mask
+        tensor (``None`` without one).  ``backend`` / ``excluded_backends`` /
         ``graph_capacity`` are provenance, not part of a trace's mathematical
         identity.
         """
@@ -955,6 +956,7 @@ class PagedAttentionController:
             "lse_mode": m.lse_mode,
             "logits_soft_cap": m.logits_soft_cap,
             "has_custom_mask": m.custom_mask is not None,
+            "custom_mask": m.custom_mask,
             "use_sinks": m.use_sinks,
             "max_q_len": m.max_q_len,
             "max_kv_len": m.max_kv_len,

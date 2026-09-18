@@ -359,11 +359,19 @@ bfloat16/float16, ``kv_layout`` 0/1 = HND/NHD, ``causal`` 0/1,
 ``window_left`` -1 = unlimited, ``lse_mode`` 0/1/2 = none/base-2/natural
 log. The resolved backend is not part of the identity, so fa2, fa3, cuDNN and
 trtllm-gen traces of one plan compare against the same definition. Tracing
-tensors whose dtypes differ from the plan's is refused. Tracing requires the planned
+tensors whose dtypes differ from the plan's is refused. The plan's feature
+knobs are Const axes too: ``logits_soft_cap`` (the integer cap of ``cap *
+tanh(score / cap)``, applied to the scaled scores before masking; 0 = off; a
+non-integer cap refuses to trace), ``use_sinks`` (a ``sinks`` input of
+``(num_qo_heads,)`` fp32 logits, one per head in the softmax denominator with
+no value; the LSE includes it; pass ``sinks=`` to the trace as to ``run()``)
+and ``use_custom_mask`` (the plan-owned flattened bool ``custom_mask`` input
+with a ``mask_len`` axis, ANDed with the causal / window envelope). Each
+enters the name only when on (``_cap30``, ``_sinks1``, ``_mask1``), the
+reference applies them, and ``init`` rebuilds them. Tracing requires the planned
 instance: ``PagedAttention.run.fi_trace(...)`` and a trace before ``plan()``
-raise instead of guessing; a plan that uses ``logits_soft_cap``, a custom
-mask or attention sinks refuses to trace until the definition encodes them,
-and so does a batch with padding rows (``kv_len == 0``), which the
+raise instead of guessing; a batch with padding rows (``kv_len == 0``)
+refuses to trace, which the
 definition's ``min(kv_seq_lens) >= 1`` constraint excludes. Requests without
 query rows (``q_len == 0``, vLLM's padded ``query_start_loc`` tail) are part
 of the definition: its constraint is ``min(q_len) >= 0``, the reference

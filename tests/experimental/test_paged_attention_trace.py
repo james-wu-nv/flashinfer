@@ -13,8 +13,9 @@ so this file exercises the template directly and through the bound entry:
 - auto-dump through the bound ``self`` writes a complete JSON (no unknown
   dtypes, no missing Const values, public fi_api tag);
 - identity encodes the plan (form, q / kv dtype, layout, causal, window, LSE
-  mode) as Const axes the exported init and reference take, so a CSR, fp8-KV
-  or fp16 definition rebuilds from its JSON alone;
+  mode, logits soft cap, sinks, custom mask) as Const axes the exported init
+  and reference take, so a CSR, fp8-KV, fp16 or feature definition rebuilds
+  from its JSON alone;
 - tracing before plan / without an instance raises; a failed re-plan still
   traces the last successful plan; in graph mode the traced metadata is the
   reserved storage; tracing is sync-free and read-only.
@@ -29,6 +30,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from unittest import mock
 
 import pytest
 import torch
@@ -75,6 +77,9 @@ VARIANT_AXES = (
     "causal",
     "window_left",
     "lse_mode",
+    "logits_soft_cap",
+    "use_sinks",
+    "use_custom_mask",
 )
 _SHAPE = dict(
     batch_size=4,
@@ -120,7 +125,16 @@ def _runnable(p, backend, *, causal, window_left, lse_mode):
     return True
 
 
-def _plan(p, backend, *, causal=True, window_left=-1, lse_mode="base2", graph=False):
+def _plan(
+    p,
+    backend,
+    *,
+    causal=True,
+    window_left=-1,
+    lse_mode="base2",
+    graph=False,
+    **plan_extra,
+):
     attn = PagedAttention(torch.device(p["device"]), use_cuda_graph=graph)
     attn.plan(
         make_metadata(p),
@@ -135,6 +149,7 @@ def _plan(p, backend, *, causal=True, window_left=-1, lse_mode="base2", graph=Fa
         window_left=window_left,
         lse_mode=lse_mode,
         backend=backend,
+        **plan_extra,
     )
     return attn
 
@@ -231,6 +246,9 @@ def test_bound_trace_matrix(form, layout, lse_mode, mask):
     assert axes["lse_mode"] == LSE_MODES.index(lse_mode)
     assert axes["csr"] == int(form == "csr")
     assert axes["fp8_kv"] == 0 and axes["q_dtype"] == 0
+    assert axes["logits_soft_cap"] == 0
+    assert axes["use_sinks"] == 0 and axes["use_custom_mask"] == 0
+    assert not any(t.startswith("feature:") for t in defn["tags"])
     assert "_qdtype0_" in defn["name"] and "q:bf16" in defn["tags"]
     assert defn["name"].endswith(
         f"_layout{LAYOUTS.index(layout)}_causal{int(causal)}_wl{window_left}"
@@ -491,6 +509,78 @@ def test_reference_refuses_another_variants_inputs():
         _paged_attention_reference(**kw, csr=0, q_dtype=1)
 
 
+def _diagonal_safe_mask(q_lens, kv_lens, generator):
+    """Random flattened per-request masks whose bottom-right diagonal is
+    allowed, so no query row is fully masked (init uses the same rule)."""
+    blocks = []
+    for lq, lkv in zip(q_lens.tolist(), kv_lens.tolist(), strict=True):
+        block = torch.rand(lq, lkv, generator=generator) < 0.5
+        rows = torch.arange(lq)
+        block[rows, lkv - lq + rows] = True
+        blocks.append(block.flatten())
+    return torch.cat(blocks)
+
+
+@pytest.mark.parametrize("feature", ["softcap", "sinks", "custom_mask", "all"])
+def test_reference_features_match_oracle_cpu(feature):
+    """Soft cap (cap * tanh before masking), sinks (extra per-head logit in
+    the denominator, LSE includes it) and a custom mask (ANDed with the
+    envelope) in the template reference and its exported source agree with
+    the oracle; a feature axis without its input is refused."""
+    c = _cpu_case(21)
+    g = torch.Generator().manual_seed(21)
+    cap = 30 if feature in ("softcap", "all") else 0
+    sinks = torch.randn(8, generator=g) if feature in ("sinks", "all") else None
+    mask = (
+        _diagonal_safe_mask(c["qo_indptr"].diff(), c["kv_seq_lens"], g)
+        if feature in ("custom_mask", "all")
+        else None
+    )
+    kwargs = dict(
+        q=c["q"],
+        k_cache=c["k_hnd"],
+        v_cache=c["v_hnd"],
+        qo_indptr=c["qo_indptr"],
+        kv_seq_lens=c["kv_seq_lens"],
+        block_tables=c["block_tables"],
+        sinks=sinks,
+        custom_mask=mask,
+        kv_layout=0,
+        causal=1,
+        window_left=-1,
+        lse_mode=2,
+        csr=0,
+        logits_soft_cap=cap,
+        use_sinks=int(sinks is not None),
+        use_custom_mask=int(mask is not None),
+    )
+    ref_out, ref_lse = reference_paged_prefill(
+        c["q"],
+        c["k_hnd"],
+        c["v_hnd"],
+        c["qo_indptr"],
+        c["kv_seq_lens"],
+        c["block_tables"],
+        c["page_size"],
+        True,
+        logits_soft_cap=cap or None,
+        custom_mask=mask,
+        sinks=sinks,
+        lse_base="e",
+    )
+    exported = _exec(_render_reference_source(_paged_attention_reference))
+    for fn in (_paged_attention_reference, exported["_paged_attention_reference"]):
+        out, lse = fn(**kwargs)
+        torch.testing.assert_close(out, ref_out, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(lse, ref_lse, atol=1e-5, rtol=1e-5)
+    if sinks is not None:
+        with pytest.raises(ValueError, match="sinks"):
+            _paged_attention_reference(**dict(kwargs, sinks=None))
+    if mask is not None:
+        with pytest.raises(ValueError, match="custom_mask"):
+            _paged_attention_reference(**dict(kwargs, custom_mask=None))
+
+
 # ── exported init / reference round trip on the GPU ──────────────────────────
 
 
@@ -535,6 +625,8 @@ def _rebuild_and_check(defn, init_fn, ref_fn, axes, *, device, backend="fa2"):
         kv_page_indices=ctx["kv_page_indices"],
         k_scale=inputs["run"].get("k_scale"),
         v_scale=inputs["run"].get("v_scale"),
+        sinks=inputs["run"].get("sinks"),
+        custom_mask=inputs["plan"].get("custom_mask"),
         **{k: const[k] for k in VARIANT_AXES},
     )
     torch.testing.assert_close(out.float(), ref_out.float(), **OUT_TOL)
@@ -569,6 +661,7 @@ def _kwargs_from_context(ctx, q, k_cache, v_cache):
         kv_seq_lens=ctx["kv_seq_lens"],
         block_tables=ctx["block_tables"],
         kv_page_indices=ctx["kv_page_indices"],
+        custom_mask=ctx.get("custom_mask"),
         page_size=ctx["page_size"],
     )
 
@@ -593,6 +686,8 @@ def _assert_constraints_hold(defn, kw):
         names["max_pages"] = int(kw["block_tables"].shape[1])
     if kw.get("kv_page_indices") is not None:
         names["num_kv_indices"] = int(kw["kv_page_indices"].shape[0])
+    if kw.get("custom_mask") is not None:
+        names["mask_len"] = int(kw["custom_mask"].numel())
     for constraint in defn["constraints"]:
         assert bool(eval(constraint, {"__builtins__": {}}, names)), constraint  # noqa: S307
 
@@ -786,7 +881,16 @@ def test_dispatch_is_cached_and_publishes_representatives():
     assert tpl is paged_attention_trace_dispatch(self=attn)
     assert tpl is _paged_attention_template(lse_mode=1)
     assert tpl.identity == dict(
-        csr=0, fp8_kv=0, q_dtype=0, kv_layout=0, causal=1, window_left=-1, lse_mode=1
+        csr=0,
+        fp8_kv=0,
+        q_dtype=0,
+        kv_layout=0,
+        causal=1,
+        window_left=-1,
+        lse_mode=1,
+        logits_soft_cap=0,
+        use_sinks=0,
+        use_custom_mask=0,
     )
     labels = [t.name_prefix for t in paged_attention_trace_dispatch.templates]
     assert labels == ["paged_attention_dense", "paged_attention_csr"]
@@ -829,25 +933,135 @@ def test_csr_trace_with_a_dense_table_backend(backend):
     assert _trace(attn, p) == _trace(_plan(p, "fa2"), p)
 
 
+FEATURES = {
+    # feature -> (name marker, Const axis, value, feature input tensor)
+    "softcap": ("_cap30", "logits_soft_cap", 30, None),
+    "sinks": ("_sinks1", "use_sinks", 1, "sinks"),
+    "custom_mask": ("_mask1", "use_custom_mask", 1, "custom_mask"),
+}
+
+
+def _feature_plan(p, feature, seed):
+    """(plan kwargs, run kwargs, oracle kwargs) switching one feature on."""
+    if feature == "softcap":
+        return dict(logits_soft_cap=30.0), {}, dict(logits_soft_cap=30.0)
+    g = torch.Generator().manual_seed(seed)
+    if feature == "sinks":
+        sinks = torch.randn(p["num_qo_heads"], generator=g).to(p["device"])
+        return dict(use_sinks=True), dict(sinks=sinks), dict(sinks=sinks)
+    mask = _diagonal_safe_mask(p["qo_indptr_cpu"].diff(), p["kv_seq_lens_cpu"], g)
+    mask = mask.to(p["device"])
+    return dict(custom_mask=mask), {}, dict(custom_mask=mask)
+
+
 @cuda_only
-def test_plan_features_outside_the_definition_refuse_to_trace():
-    p = _problem(54)
-    attn = PagedAttention(torch.device(p["device"]))
-    attn.plan(
-        make_metadata(p),
-        num_qo_heads=p["num_qo_heads"],
-        num_kv_heads=p["num_kv_heads"],
-        head_dim_qk=p["head_dim_qk"],
-        q_dtype=p["dtype"],
+@pytest.mark.parametrize("feature", list(FEATURES))
+@pytest.mark.parametrize("form", list(FORMS))
+def test_feature_plans_trace_and_rebuild(form, feature):
+    """A plan with a logits soft cap, attention sinks or a custom mask exports
+    a definition that names the feature, whose exported reference reproduces
+    the kernel on the traced tensors and whose exported init rebuilds the
+    feature variant from the JSON alone (on 0f0123c5 these plans refused to
+    trace)."""
+    p = _problem(65, form=form)
+    plan_kw, run_kw, oracle_kw = _feature_plan(p, feature, seed=65)
+    attn = _plan(p, "fa2", **plan_kw)
+    out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]), **run_kw)
+    ref_out, ref_lse = reference_paged_prefill(
+        p["q"],
+        p["k_ref"],
+        p["v_ref"],
+        p["qo_indptr_cpu"],
+        p["kv_seq_lens_cpu"],
+        p["block_tables"] if form == "dense" else None,
+        p["page_size"],
+        True,
         kv_layout=p["kv_layout"],
-        causal=True,
-        lse_mode="base2",
-        logits_soft_cap=30.0,
-        backend="fa2",
+        kv_page_indices=p["kv_page_indices"],
+        lse_base="2",
+        **oracle_kw,
     )
-    assert attn._trace_context()["logits_soft_cap"] == 30.0
-    with pytest.raises(ValueError, match="logits_soft_cap"):
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+    defn = _trace(attn, p, **run_kw)
+    _assert_complete(defn)
+    marker, axis, value, tensor = FEATURES[feature]
+    assert marker in defn["name"] and defn["axes"][axis]["value"] == value
+    assert defn["name"] != _trace(_plan(p, "fa2"), p)["name"]
+    if tensor is not None:
+        assert defn["inputs"][tensor]["dtype"] == (
+            "float32" if tensor == "sinks" else "bool"
+        )
+    if feature == "custom_mask":
+        assert defn["axes"]["mask_len"]["type"] == "var"
+        assert defn["inputs"]["custom_mask"]["optional"]  # owned by plan()
+    ctx = attn._trace_context()
+    _assert_constraints_hold(
+        defn, _kwargs_from_context(ctx, p["q"], p["k_cache"], p["v_cache"])
+    )
+    # the exported reference reproduces the kernel on the traced tensors
+    ref_fn = _exec(defn["reference"])["_paged_attention_reference"]
+    const = {k: v["value"] for k, v in defn["axes"].items() if v["type"] == "const"}
+    r_out, r_lse = ref_fn(
+        p["q"],
+        p["k_cache"],
+        p["v_cache"],
+        ctx["qo_indptr"],
+        ctx["kv_seq_lens"],
+        block_tables=ctx["block_tables"],
+        kv_page_indices=ctx["kv_page_indices"],
+        sinks=run_kw.get("sinks"),
+        custom_mask=ctx["custom_mask"],
+        **{k: const[k] for k in VARIANT_AXES},
+    )
+    torch.testing.assert_close(out.float(), r_out.float(), **OUT_TOL)
+    torch.testing.assert_close(lse, r_lse, **LSE_TOL)
+    # the exported init rebuilds the feature variant from the JSON alone
+    init_fn = _exec(defn["init"])["_paged_attention_init"]
+    inputs, rebuilt = _rebuild_and_check(
+        defn, init_fn, ref_fn, _init_axes("small", form), device=p["device"]
+    )
+    if feature == "softcap":
+        assert inputs["plan"]["logits_soft_cap"] == 30.0
+    elif feature == "sinks":
+        assert inputs["plan"]["use_sinks"] is True
+        assert inputs["run"]["sinks"].shape == (p["num_qo_heads"],)
+    else:
+        mask = inputs["plan"]["custom_mask"]
+        md = inputs["plan"]["metadata"]
+        assert mask.dtype == torch.bool
+        assert mask.numel() == int((md.qo_indptr_cpu.diff() * md.kv_seq_lens_cpu).sum())
+    assert fi_trace(rebuilt.run, **inputs["run"]) == defn
+
+
+@cuda_only
+def test_non_integer_soft_cap_refuses_to_trace():
+    """Const axes are integers: a cap the definition cannot spell is refused
+    before export instead of being rounded."""
+    p = _problem(54)
+    attn = _plan(p, "fa2", logits_soft_cap=30.5)
+    assert attn._trace_context()["logits_soft_cap"] == 30.5
+    with pytest.raises(ValueError, match="not an integer"):
         fi_trace(attn.run, q=p["q"], kv_cache=(p["k_cache"], p["v_cache"]))
+    assert _trace(_plan(p, "fa2", logits_soft_cap=30), p)["axes"][
+        "logits_soft_cap"
+    ] == {"type": "const", "value": 30, "description": mock.ANY}
+
+
+@cuda_only
+def test_sinks_trace_requires_the_sinks_tensor():
+    p = _problem(56)
+    attn = _plan(p, "fa2", use_sinks=True)
+    with pytest.raises(ValueError, match="sinks="):
+        fi_trace(attn.run, q=p["q"], kv_cache=(p["k_cache"], p["v_cache"]))
+    with pytest.raises(ValueError, match="sinks="):
+        fi_trace(
+            attn.run,
+            q=p["q"],
+            kv_cache=(p["k_cache"], p["v_cache"]),
+            sinks=torch.zeros(p["num_qo_heads"], dtype=torch.bfloat16, device="cuda"),
+        )
 
 
 @cuda_only
@@ -975,6 +1189,10 @@ def test_template_factory_rejects_bad_identity():
         _paged_attention_template(kv_layout=True)
     with pytest.raises(ValueError, match="q_dtype"):
         _paged_attention_template(q_dtype=2)
+    with pytest.raises(ValueError, match="logits_soft_cap"):
+        _paged_attention_template(logits_soft_cap=-1)
+    with pytest.raises(ValueError, match="use_sinks"):
+        _paged_attention_template(use_sinks=2)
 
 
 # ── failed re-plan, graph storage, read-only ─────────────────────────────────
@@ -1181,8 +1399,18 @@ def _run_params():
         _paged_attention_template(kv_layout=1, causal=0, lse_mode=2),
         _paged_attention_template(csr=1, window_left=64, lse_mode=1, fp8_kv=1),
         _paged_attention_template(q_dtype=1, fp8_kv=1),
+        _paged_attention_template(logits_soft_cap=30, use_sinks=1),
+        _paged_attention_template(csr=1, use_custom_mask=1, window_left=8),
     ],
-    ids=["dense", "csr", "nhd_noncausal_basee", "csr_window_fp8", "fp16_fp8"],
+    ids=[
+        "dense",
+        "csr",
+        "nhd_noncausal_basee",
+        "csr_window_fp8",
+        "fp16_fp8",
+        "softcap_sinks",
+        "csr_mask_window",
+    ],
 )
 def test_template_schema_is_consistent_with_run(tpl):
     params = _run_params()
