@@ -189,7 +189,19 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         # verification pool (capability-honesty rule)
         cc_majors=frozenset({8, 9, 10, 12}),
         q_dtypes=_F16,
-        head_dims=frozenset({(64, 64), (128, 128), (256, 256)}),
+        # 512: the Ampere+ large-head path (Gemma-4 full attention; CTA tile
+        # 16 / 32 by FA2DetermineCtaTileQ, modelled in fa_backend.py).
+        # Measured on B200 (2026-09-17) through the unified API against the
+        # oracle: H16:2 bf16 q [17, 5, 1, 33] / kv [300, 97, 1000, 40] in
+        # HND and NHD, causal, non-causal, window 64, basee, CSR page 1
+        # (max out err 7.6e-3); bf16 q with e4m3 / e5m2 KV (1.0e-2 /
+        # 9.6e-3); the legacy fp16 fixture (batch 2, q 17, kv 97, H4:4,
+        # NHD; 3.1e-4); fp16 q / e4m3 KV at q = kv = 128 (the CTA-32 shape;
+        # 1.6e-3); the Gemma-4 accuracy shapes q 17 and q 1 over KV 10003
+        # with e4m3 KV, k_scale = v_scale = 0.02, sm_scale 1 (1.1e-3 /
+        # 4.9e-4); q 512 / 300 over kv 2048 / 1024 (1.1e-3).  LSE err
+        # <= 4.8e-6 throughout.
+        head_dims=frozenset({(64, 64), (128, 128), (256, 256), (512, 512)}),
         # fp8 (e4m3 / e5m2) KV + f16 q, per-tensor scales (in-kernel dequant)
         kv_dtypes=_F16 | _FP8,
         page_sizes=None,

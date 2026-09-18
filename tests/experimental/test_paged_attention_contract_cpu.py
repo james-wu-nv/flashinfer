@@ -287,6 +287,13 @@ def _capability_rows():
         ("fa2", "kv-e5m2", dict(kv_dtype=torch.float8_e5m2), None),
         ("fa2", "d64", dict(head_dim_qk=64, head_dim_vo=64), None),
         ("fa2", "d256", dict(head_dim_qk=256, head_dim_vo=256), None),
+        # 512: the Ampere+ large-head path, fa2 only (measured on B200)
+        ("fa2", "d512", dict(head_dim_qk=512, head_dim_vo=512), None),
+        ("fa3", "d512", dict(head_dim_qk=512, head_dim_vo=512), "head dims"),
+        ("cudnn", "d512", dict(head_dim_qk=512, head_dim_vo=512), "head dims"),
+        ("trtllm-gen", "d512", dict(head_dim_qk=512, head_dim_vo=512), "head dims"),
+        ("cake", "d512", dict(head_dim_qk=512, head_dim_vo=512), "head dims"),
+        ("fa2", "d512-256", dict(head_dim_qk=512, head_dim_vo=256), "head dims"),
         ("fa2", "d192-128", dict(head_dim_qk=192, head_dim_vo=128), "head dims"),
         ("fa2", "csr-page1", dict(kv_input_form="page_indices", page_size=1), None),
         ("fa2", "csr-page5", dict(kv_input_form="page_indices", page_size=5), None),

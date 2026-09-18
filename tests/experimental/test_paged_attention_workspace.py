@@ -614,6 +614,48 @@ _SIZING_SHAPES = [
         None,
         -1,
     ),
+    # head_dim 512 (Gemma-4 full attention): CTA tile 16 / 32 by
+    # FA2DetermineCtaTileQ's VO-split branch, modelled in fa_backend.py
+    (
+        "hd512-gemma-eager",
+        dict(
+            q_lens=[17, 300],
+            kv_lens=[10003, 1024],
+            num_qo_heads=16,
+            num_kv_heads=2,
+            head_dim=512,
+        ),
+        False,
+        None,
+        -1,
+    ),
+    (
+        "hd512-gemma-graph",
+        dict(
+            q_lens=[17, 300],
+            kv_lens=[10003, 1024],
+            num_qo_heads=16,
+            num_kv_heads=2,
+            head_dim=512,
+        ),
+        True,
+        None,
+        -1,
+    ),
+    (
+        "hd512-fp8kv-decode-graph",
+        dict(
+            q_lens=[1] * 8,
+            kv_lens=[10003] * 8,
+            num_qo_heads=16,
+            num_kv_heads=2,
+            head_dim=512,
+            kv_dtype=torch.float8_e4m3fn,
+        ),
+        True,
+        None,
+        -1,
+    ),
 ]
 
 

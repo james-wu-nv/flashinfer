@@ -1206,6 +1206,113 @@ def test_paged_attention_wide_head_dims(backend, head_dim, dtype):
     check(p, backend)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "kv_dtype", [None, torch.float8_e4m3fn], ids=["f16kv", "e4m3kv"]
+)
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+@pytest.mark.parametrize("window_left", [-1, 64])
+def test_paged_attention_head_dim_512_fa2(dtype, kv_dtype, kv_layout, window_left):
+    """head_dim 512 on fa2 (the Ampere+ large-head path the legacy
+    ``test_batch_prefill_with_paged_kv_cache_head_dim_512`` and the Gemma-4
+    fp8 tests exercise): H16:2, float and e4m3 KV, both layouts, with and
+    without a sliding window.  Declared by measurement (B200, see
+    ``_capabilities.py``); fa3 / cuDNN / trtllm-gen do not declare it."""
+    p = make_problem(
+        seed=61 + window_left,
+        batch_size=4,
+        max_q=33,
+        max_kv=300,
+        num_qo_heads=16,
+        num_kv_heads=2,
+        head_dim_qk=512,
+        page_size=16,
+        dtype=dtype,
+        kv_dtype=kv_dtype,
+        kv_layout=kv_layout,
+    )
+    check(p, "fa2", window_left=window_left)
+
+
+def _gemma4_problem(q_len, *, kv_dtype=torch.float8_e4m3fn, seed=42):
+    """The Gemma-4 full-attention accuracy shape
+    (tests/attention/test_gemma4_fa2_accuracy.py): one request, KV 10003,
+    16 query / 2 KV heads, head_dim 512, page 16, NHD, fp8 KV quantized
+    with k_scale = v_scale = 0.02, q pre-scaled by 1/16 and sm_scale 1."""
+    device = "cuda:0"
+    hq, hk, d, page, kv_len, scale = 16, 2, 512, 16, 10003, 0.02
+    g = torch.Generator(device=device).manual_seed(seed)
+    pages = (kv_len + page - 1) // page
+    q = torch.randn(q_len, hq, d, dtype=torch.bfloat16, device=device, generator=g) / 16
+    k = torch.randn(
+        pages, page, hk, d, dtype=torch.bfloat16, device=device, generator=g
+    )
+    v = torch.randn(
+        pages, page, hk, d, dtype=torch.bfloat16, device=device, generator=g
+    )
+    k8 = (k.float() / scale).to(kv_dtype)
+    v8 = (v.float() / scale).to(kv_dtype)
+    perm = torch.randperm(pages, generator=torch.Generator().manual_seed(seed))
+    qo_indptr_cpu = torch.tensor([0, q_len], dtype=torch.int32)
+    kv_lens_cpu = torch.tensor([kv_len], dtype=torch.int32)
+    return dict(
+        q=q.to(torch.bfloat16),
+        k_cache=k8,
+        v_cache=v8,
+        k_ref=k8.float() * scale,
+        v_ref=v8.float() * scale,
+        kv_dtype=kv_dtype,
+        k_scale=scale,
+        v_scale=scale,
+        qo_indptr=qo_indptr_cpu.to(device),
+        qo_indptr_cpu=qo_indptr_cpu,
+        kv_seq_lens=kv_lens_cpu.to(device),
+        kv_seq_lens_cpu=kv_lens_cpu,
+        block_tables=perm.to(torch.int32).view(1, pages).to(device),
+        kv_page_indices=perm.to(torch.int32).to(device),
+        kv_layout="NHD",
+        input_form="page_indices",
+        page_size=page,
+        max_q_len=q_len,
+        max_kv_len=kv_len,
+        num_qo_heads=hq,
+        num_kv_heads=hk,
+        head_dim_qk=d,
+        head_dim_vo=d,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+
+@pytest.mark.parametrize("q_len", [17, 1], ids=["chunked-prefill", "decode"])
+@pytest.mark.parametrize("kv_dtype", FP8_KV_DTYPES, ids=["e4m3", "e5m2"])
+def test_paged_attention_gemma4_head_dim_512_fp8_kv(q_len, kv_dtype):
+    """The Gemma-4 accuracy fixtures through the unified API on fa2: q 17
+    (chunked prefill) and q 1 (decode) over a 10003-token e4m3 / e5m2 KV
+    cache with head_dim 512, k_scale = v_scale = 0.02 and sm_scale 1,
+    against the oracle on the dequantized cache (legacy tests
+    ``test_gemma4_fp8_kv_head_dim_512_{chunked_prefill,tensor_core_decode}
+    _matches_torch``)."""
+    p = _gemma4_problem(q_len, kv_dtype=kv_dtype)
+    _resolve_or_skip(p, "fa2")
+    _, out, lse = run_unified(p, "fa2", sm_scale=1.0)
+    ref_out, ref_lse = reference_paged_prefill(
+        p["q"],
+        p["k_ref"],
+        p["v_ref"],
+        p["qo_indptr_cpu"],
+        p["kv_seq_lens_cpu"],
+        None,
+        p["page_size"],
+        True,
+        sm_scale=1.0,
+        kv_layout="NHD",
+        kv_page_indices=p["kv_page_indices"],
+    )
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+
 # NOTE: fa2/fa3 paged (192,128) is NOT declared: the paged kernel requires
 # k_page_stride == v_page_stride ("K and V must have same page stride for
 # sparse attention", batch_prefill_sm90.cu:235), which separately-allocated
