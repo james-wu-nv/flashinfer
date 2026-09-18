@@ -62,7 +62,7 @@ EXPECT_CHUNKED_ATTENTION_KNOB = False  # chunked_attention_size as a plan axis
 # its JIT URI from (q dtype, window, backend) only, so the first sink module a
 # process builds is reused for every head_dim: D64 after D128 returns NaN,
 # D128 after D64 is wrong.  Alone, each head_dim passes.
-EXPECT_SINK_JIT_URI_HAS_HEAD_DIM = False
+EXPECT_SINK_JIT_URI_HAS_HEAD_DIM = True  # fixed on the integration head (7c9b2ac8)
 
 _T = TypeVar("_T")
 

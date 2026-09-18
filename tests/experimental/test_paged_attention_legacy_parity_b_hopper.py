@@ -29,13 +29,17 @@ import torch
 
 from flashinfer.prefill import PagedAttention
 
+from flashinfer.prefill import resolve_paged_attention
+
 from .legacy_parity_b_helpers import (
     DEVICE,
+    EXPECT_FP8_Q,
     EXPECT_MULTI_ITEM_SCORING,
     LSE_TOL,
     OUT_TOL,
     check_legacy_map,
     csr_metadata_from_legacy,
+    gated,
     oracle,
     reference_long,
     resolve_or_skip,
@@ -72,6 +76,35 @@ LEGACY_MAP = [
         "unsupported-by-design",
         "the two-request variant of the row above (per-request prefix lengths and item "
         "position tables); same gap",
+    ),
+    (
+        "tests/attention/test_hopper_fp8_attention.py::test_batch_prefill_paged",
+        ["test_hopper_fp8_q_paged_prefill_unsupported"],
+        "unsupported-by-design",
+        "fp8 (e4m3 / e5m2) QUERY with q/k/v scales on the SM90 fp8 kernel; the unified "
+        "envelope admits fp16/bf16 q only (fp8 is a KV-only axis), so resolve() rejects "
+        "q_dtype float8 for every backend; needs a quantization descriptor (q dtype, "
+        "q_scale, per-head vs per-tensor scales, o_dtype) — EXPECT_FP8_Q",
+    ),
+    (
+        "tests/attention/test_hopper_fp8_attention.py::test_batch_prefill_paged_gqa",
+        ["test_hopper_fp8_q_paged_prefill_unsupported"],
+        "unsupported-by-design",
+        "same fp8-Q kernel with GQA head ratios; same gap (EXPECT_FP8_Q)",
+    ),
+    (
+        "tests/attention/test_hopper_fp8_attention.py::test_batch_prefill_paged_scale_types",
+        ["test_hopper_fp8_q_paged_prefill_unsupported"],
+        "unsupported-by-design",
+        "per-head vs per-tensor fp8 scale tensors; unified run() takes host-float "
+        "k_scale / v_scale only (EXPECT_FP8_Q, EXPECT_DEVICE_SCALES)",
+    ),
+    (
+        "tests/attention/test_hopper_fp8_sliding_window.py::test_fp8_paged_prefill_sliding_window",
+        ["test_hopper_fp8_q_paged_prefill_unsupported"],
+        "unsupported-by-design",
+        "fp8 Q + sliding window on SM90; the window is supported for fp16/bf16 q, the "
+        "fp8 q dtype is the gap (EXPECT_FP8_Q)",
     ),
 ]
 
@@ -230,3 +263,30 @@ def test_hopper_multi_item_scoring_fa3_unsupported():
         pytest.fail(
             "EXPECT_MULTI_ITEM_SCORING flipped: port the two legacy fixtures here"
         )
+
+
+@pytest.mark.parametrize("q_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_hopper_fp8_q_paged_prefill_unsupported(q_dtype):
+    """The legacy SM90 fp8 paged-prefill tests quantize Q (and K/V) to fp8 with
+    per-tensor or per-head scales.  The unified envelope declares fp16/bf16 q
+    only, so the resolution rejects the dtype for every backend with the
+    capability reason; flips with EXPECT_FP8_Q once a quantization descriptor
+    (q dtype, q_scale, o_dtype) is part of the contract."""
+    res = gated(
+        EXPECT_FP8_Q,
+        lambda: resolve_paged_attention(
+            device=torch.device(DEVICE),
+            num_qo_heads=8,
+            num_kv_heads=2,
+            head_dim_qk=128,
+            q_dtype=q_dtype,
+            kv_dtype=q_dtype,
+            page_size=16,
+            causal=True,
+            need_lse=True,
+            window_left=-1,
+        ),
+        match="unsupported q dtype|no backend",
+    )
+    if res is not None:
+        assert res.backends
