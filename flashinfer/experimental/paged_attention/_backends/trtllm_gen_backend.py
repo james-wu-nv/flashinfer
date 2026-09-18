@@ -4,8 +4,8 @@ front door — one class, the product name is the only difference).
 
 Dialect: the unified form natively (this is where the canonical form came
 from); the only derivations are cum_kv_seq_lens and the bmm scale fold
-(bmm1 = sm_scale for unquantized, bmm2 = 1.0).  Attention sinks are a native
-run-time argument.
+(bmm1 = sm_scale * k_scale, bmm2 = v_scale; 1.0 for an omitted scale).
+Attention sinks are a native run-time argument.
 
 Buffers: the controller's scratch workspace (the 128 MiB per-device default
 or the caller's buffer) is ordinary softmax-stats/scratch and is the shared
@@ -194,9 +194,11 @@ class _TrtllmGenBackend:
             meta.kv_seq_lens,
             meta.max_q_len,
             meta.max_kv_len,
-            sm_scale
-            * (k_scale if k_scale is not None else 1.0),  # bmm1 (k descale folds in)
-            v_scale if v_scale is not None else 1.0,  # bmm2 (v descale)
+            # bmm1 = softmax scale with k_scale folded in, bmm2 = the output
+            # scale (v_scale); the kernel applies both for any KV dtype
+            # (float KV k = 0.5 / v = 2.0 measured against the oracle on B200)
+            sm_scale * (k_scale if k_scale is not None else 1.0),
+            v_scale if v_scale is not None else 1.0,
             meta.batch_size,
             meta.qo_indptr,
             derived.require(FORM_CUM_KV_SEQ_LENS),

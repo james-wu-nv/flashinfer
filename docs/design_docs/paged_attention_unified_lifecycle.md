@@ -647,8 +647,9 @@ The controller checks (`_controller.run`):
   `lse_mode != "none"`.
 - Every tensor on the instance's device.
 - `sm_scale`: positive finite host float, default `1 / sqrt(head_dim_qk)`.
-- `k_scale`, `v_scale`: positive finite host floats, only with an fp8
-  `kv_dtype`.
+- `k_scale`, `v_scale`: positive finite host floats, with any `kv_dtype`
+  (dequantization scales of an fp8 cache, multipliers of a float cache; see
+  "K / V scales" under Feature axes).
 - `sinks`: required iff the plan declared `use_sinks=True`; contiguous fp32
   `(num_qo_heads,)` on q's device.
 
@@ -773,6 +774,21 @@ time, and frozen by the first graph-mode plan:
   `_capabilities.py` comment). `k_scale` / `v_scale` are per-tensor host
   floats (`dequant = fp8_value * scale`); omitted scales mean no scaling.
   fp8 q and nvfp4 are undeclared axes.
+- K / V scales on a fp16 / bf16 cache: the same `run(k_scale=, v_scale=)`
+  multiply K and V of a float cache too (the legacy wrapper's
+  `test_kv_scale_forwarding_*` semantics), on every backend and with one
+  rule: `k_scale` folds into the softmax scale the kernel launches with, so
+  the soft cap, the sinks and the returned LSE see the scaled logits exactly
+  as `K * k_scale` would give, and `v_scale` multiplies the output (the
+  whole caller buffer, so a captured graph scales every row the capacity may
+  hold). fa2/fa3 fold in the adapter (the AttentionSink variant's `run()`
+  has no `k_scale` argument), trtllm-gen and cake pass `bmm1 = sm_scale *
+  k_scale` / `bmm2 = v_scale` natively, and cuDNN folds `k_scale` into
+  `attn_scale` and multiplies the output because its f16/bf16 SDPA graph has
+  no descale tensors (passing them is silently ignored; measured on B200).
+  Measured on B200 for fa2, cuDNN, trtllm-gen and cake with k 0.5 / v 2.0 in
+  fp16 and bf16 against the oracle on the scaled K / V (max out err 1.0e-2,
+  bf16; 1.3e-3, fp16).
 
 `sm_scale` is a `run()` argument so one plan serves layers with different
 scales.

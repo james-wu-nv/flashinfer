@@ -6,6 +6,8 @@ fa3 cases skip where the GPU is not SM90a; cuDNN never runs a feature (it is
 capability-excluded); trtllm-gen runs sinks only.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -155,6 +157,26 @@ def test_logits_soft_cap_fp8_kv_fa2():
     _, out, lse = _run(p, "fa2", logits_soft_cap=30.0)
     ref_out, ref_lse = _reference(p, logits_soft_cap=30.0)
     _assert_matches(out, lse, ref_out, ref_lse)
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_logits_soft_cap_sees_the_k_scaled_logits(backend):
+    """k_scale on a bf16 cache folds into the softmax scale BEFORE the soft
+    cap, as K * k_scale would (the legacy wrapper's order): cap 30, k 0.5 /
+    v 2.0 against the oracle on the scaled K / V."""
+    p = make_problem(seed=95, **_SHAPE)
+    _skip_unless_runnable(p, backend, logits_soft_cap=30.0)
+    p["q"] = p["q"] * 4
+    p["k_scale"], p["v_scale"] = 0.5, 2.0
+    _, out, lse = _run(p, backend, logits_soft_cap=30.0)
+    s = 1.0 / math.sqrt(p["head_dim_qk"])
+    scaled = dict(p, v_ref=p["v_ref"].float() * 2.0)
+    ref_out, ref_lse = _reference(scaled, sm_scale=s * 0.5, logits_soft_cap=30.0)
+    _assert_matches(out, lse, ref_out, ref_lse)
+    # the order matters at these magnitudes: capping the unscaled logits
+    # gives another result
+    other_out, _ = _reference(scaled, logits_soft_cap=30.0)
+    assert not torch.allclose(ref_out, other_out, **OUT_TOL)
 
 
 def test_logits_soft_cap_excludes_backends_at_plan():
@@ -426,6 +448,27 @@ def test_attention_sinks_are_a_per_run_value(backend):
         sinks = _sinks(p, seed)
         out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]), sinks=sinks)
         _assert_matches(out, lse, *_reference(p, sinks=sinks))
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3", "trtllm-gen", "cake"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_attention_sinks_with_kv_scales(backend, dtype):
+    """k_scale / v_scale on a float cache together with sinks: the sink
+    logit competes with the k-scaled logits (fa folds k_scale into the sink
+    variant's sm_scale argument, whose run() has no k_scale; trtllm-gen and
+    cake take bmm1 / bmm2), and v_scale multiplies the sink-weighted output."""
+    p = make_problem(seed=117, **dict(_SHAPE, dtype=dtype))
+    _skip_unless_runnable(p, backend, sinks=True)
+    sinks = _sinks(p, seed=5)
+    p["k_scale"], p["v_scale"] = 0.5, 2.0
+    _, out, lse = _run(p, backend, use_sinks=True, sinks=sinks)
+    s = 1.0 / math.sqrt(p["head_dim_qk"])
+    scaled = dict(p, v_ref=p["v_ref"].float() * 2.0)
+    ref_out, ref_lse = _reference(scaled, sm_scale=s * 0.5, sinks=sinks)
+    _assert_matches(out, lse, ref_out, ref_lse)
+    other_out, other_lse = _reference(scaled, sinks=sinks)  # sink vs unscaled logits
+    assert not torch.allclose(ref_out, other_out, **OUT_TOL)
+    assert not torch.allclose(ref_lse, other_lse, **LSE_TOL)
 
 
 def test_sinks_contract():

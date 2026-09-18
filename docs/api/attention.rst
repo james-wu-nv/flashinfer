@@ -220,8 +220,10 @@ declares the LSE base (``lse_mode``) and the feature axes (``window_left``,
 ``logits_soft_cap``, ``custom_mask``, ``use_sinks``), each capability-checked
 so ``backend="auto"`` excludes a backend that cannot apply one instead of
 dropping it; ``run()`` takes the per-layer ``sm_scale``, the ``sinks`` tensor
-when planned, and, for an fp8 (e4m3 or e5m2) KV cache, the per-tensor
-``k_scale`` / ``v_scale``. ``explain()`` prints the chosen backend, every candidate tried
+when planned, and the per-tensor ``k_scale`` / ``v_scale`` (dequantization
+scales of an fp8 e4m3 / e5m2 KV cache, plain multipliers of a fp16 / bf16
+one; ``k_scale`` folds into the softmax scale, ``v_scale`` into the output,
+on every backend). ``explain()`` prints the chosen backend, every candidate tried
 at plan time and the resolve-time exclusion reasons. CUDA graphs follow a
 three-stage lifecycle:
 ``PagedAttention(graph_capacity=GraphCapacity(...))`` reserves the metadata

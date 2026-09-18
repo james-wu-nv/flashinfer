@@ -830,19 +830,19 @@ class PagedAttentionController:
             isinstance(sm_scale, float) and math.isfinite(sm_scale) and sm_scale > 0,
             f"sm_scale must be a positive finite host float, got {sm_scale!r}",
         )
-        kv_is_fp8 = m.kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        # Per-tensor K / V scales for any planned kv_dtype: the dequantization
+        # scales of an fp8 cache, or (legacy wrapper semantics) a plain
+        # multiplier of a fp16 / bf16 cache.  Either way the backend folds
+        # k_scale into the softmax scale it launches with -- so soft cap,
+        # sinks and the LSE see the scaled logits, exactly as K * k_scale
+        # would give -- and multiplies v_scale into the output.
         for nm, sc in (("k_scale", k_scale), ("v_scale", v_scale)):
             if sc is None:
                 continue
             _expect(
-                kv_is_fp8,
-                f"{nm} given but the plan's kv_dtype is {m.kv_dtype}; per-tensor "
-                "KV scales apply to fp8 KV caches only",
-            )
-            _expect(
                 isinstance(sc, float) and math.isfinite(sc) and sc > 0,
-                f"{nm} must be a positive finite host float (dequant = fp8 * scale), "
-                f"got {sc!r}",
+                f"{nm} must be a positive finite host float (K / V are scaled by "
+                f"it: dequant for an fp8 cache, a multiplier otherwise), got {sc!r}",
             )
         if m.use_sinks:
             _expect(

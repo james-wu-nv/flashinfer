@@ -540,6 +540,15 @@ class _FaBackend:
             lse_v = lse[:n] if lse is not None else None
         else:
             q_v, out_v, lse_v = q, out, lse
+        # k_scale (fp8 dequant scale, or a multiplier of a float K cache)
+        # folds into the softmax scale, which is what the legacy wrapper does
+        # for every KV dtype (sm_scale *= k_scale before the launch); doing it
+        # here covers the AttentionSink variant too, whose run() has no
+        # k_scale argument and would otherwise drop it silently.  Soft cap,
+        # sinks and the LSE therefore see the scaled logits, as K * k_scale
+        # would give.  v_scale is applied below, over the caller's whole buffer.
+        if k_scale is not None:
+            sm_scale = sm_scale * k_scale
         if self._use_sinks:
             # AttentionSink variant: the sink tensor and sm_scale are the
             # module's additional run() arguments (positional, in that order)
@@ -562,8 +571,6 @@ class _FaBackend:
             r = self._active.run(
                 q_v,
                 (k_cache, v_cache),
-                k_scale=k_scale,  # fp8 KV: folded into the softmax scale by the wrapper
-                # v_scale is applied below, over the caller's whole buffer
                 out=out_v,
                 lse=lse_v,
                 return_lse=need_lse,
@@ -575,8 +582,8 @@ class _FaBackend:
         # unscaled / in base 2 (review R1).  Rows past the batch are
         # unspecified by contract, so scaling them is harmless.
         out_full = out if out is not None else (r[0] if need_lse else r)
-        if v_scale is not None and not (isinstance(v_scale, float) and v_scale == 1.0):
-            out_full.mul_(v_scale)  # fp8 KV: the wrapper would scale the prefix only
+        if v_scale is not None and v_scale != 1.0:
+            out_full.mul_(v_scale)  # the wrapper would scale the row prefix only
         if not need_lse:
             return out_full, None
         _, lse_t = r

@@ -142,21 +142,6 @@ class _CudnnBackend:
         self._batch_ids: Optional[torch.Tensor] = None
         self._pos: Optional[torch.Tensor] = None
         self._device = device
-        # cuDNN takes fp8 dequant scales as (1,1,1,1) GPU tensors; scales are
-        # per-layer constants, so cache one tensor per distinct value (no H2D
-        # on the hot path after the first call).
-        self._scale_tensors: dict = {}
-
-    def _scale_tensor(self, value):
-        if value is None:
-            return None
-        t = self._scale_tensors.get(value)
-        if t is None:
-            t = torch.tensor([value], dtype=torch.float32, device=self._device).view(
-                1, 1, 1, 1
-            )
-            self._scale_tensors[value] = t
-        return t
 
     def preflight(self, meta: PlanMetadata) -> None:
         """Batch-specific checks; typed unsupported only, no allocation."""
@@ -301,6 +286,15 @@ class _CudnnBackend:
                 stats_offsets = meta.qo_indptr
             else:
                 lse_buf = lse_buf[:b].view(b, 1, meta.num_qo_heads)
+        # K / V scales on the f16 / bf16 SDPA graph: the graph has no descale
+        # tensors (cudnn_batch_prefill_with_kv_cache binds k_scale / v_scale
+        # only into its fp8 graph; on the bf16 graph they are silently
+        # ignored -- measured on B200), so k_scale folds into attn_scale
+        # (which the library keys its graph cache on) and v_scale multiplies
+        # the output below, over the caller's whole buffer so a captured
+        # graph scales every row the capacity may hold.
+        if k_scale is not None:
+            sm_scale = sm_scale * k_scale
         out_t, lse_t = cudnn_batch_prefill_with_kv_cache(
             q,
             k_cache,
@@ -313,8 +307,6 @@ class _CudnnBackend:
             actual_seq_lens_kv=meta.kv_seq_lens.view(b, 1, 1, 1),
             block_tables=self._block_tables,  # width == ceil(max_kv / page)
             causal=meta.causal,
-            k_scale=self._scale_tensor(k_scale),
-            v_scale=self._scale_tensor(v_scale),
             return_lse=meta.need_lse,
             # native stats are natural-log: basee costs nothing, base2 one fold
             lse_base="e" if meta.lse_mode == "basee" else "2",
@@ -324,6 +316,8 @@ class _CudnnBackend:
             out=out,
             lse=lse_buf,
         )
+        if v_scale is not None and v_scale != 1.0:
+            out_t.mul_(v_scale)
         if not meta.need_lse:
             return out_t, None
         if self._lse_path == "direct":

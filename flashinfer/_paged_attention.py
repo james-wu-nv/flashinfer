@@ -47,7 +47,9 @@ Design rules enforced (each traces to a documented failure mode):
 Prototype simplifications (documented, not hidden):
 - dtypes: fp16/bf16 activations; an fp8 (e4m3 or e5m2) KV cache with
   per-tensor ``k_scale`` / ``v_scale`` at ``run()`` where the capability
-  table declares it (fa2).  fp8 Q and nvfp4 are undeclared axes.
+  table declares it (fa2).  The same two scales multiply a fp16/bf16 KV
+  cache on every backend (folded into the softmax scale / the output).
+  fp8 Q and nvfp4 are undeclared axes.
 - Heuristic order is a static per-arch table bucketed by the optional
   ``max_q_len`` hint of ``resolve_paged_attention`` (seeded from the B200
   sweep in the WP-K report; proposal §5.2).  Autotune hook (§5.4) is not
@@ -579,10 +581,16 @@ class PagedAttention:
         - ``sm_scale``: softmax scale for this call (default
           ``1/sqrt(head_dim_qk)``); a per-layer value, so one plan serves
           layers with different scales.
-        - ``k_scale`` / ``v_scale``: per-tensor dequantization scales for an
-          fp8 KV cache (``dequant = fp8_value * scale``), host floats so the
-          call stays sync-free; only valid when the plan's ``kv_dtype`` is
-          fp8, and an omitted scale means no scaling (1.0).
+        - ``k_scale`` / ``v_scale``: per-tensor scales of the K and V caches,
+          positive host floats so the call stays sync-free; an omitted scale
+          means no scaling (1.0).  For an fp8 ``kv_dtype`` they are the
+          dequantization scales (``real = fp8_value * scale``); for a fp16 /
+          bf16 cache they multiply K and V (the legacy wrapper's semantics),
+          which every backend applies alike: ``k_scale`` folds into the
+          softmax scale (so ``logits_soft_cap``, ``sinks`` and the returned
+          LSE see the scaled logits, as ``K * k_scale`` would give) and
+          ``v_scale`` multiplies the output.  Per-layer values like
+          ``sm_scale``; under a captured graph the captured values replay.
         - ``sinks``: per-head attention sinks, a contiguous fp32
           ``(num_qo_heads,)`` device tensor: head ``h`` gets one extra logit
           ``sinks[h]`` in its softmax denominator with no value contribution

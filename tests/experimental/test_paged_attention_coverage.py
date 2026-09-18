@@ -409,9 +409,13 @@ def test_tc02_invalid_scales_rejected_before_launch(backend):
     for bad in (float("nan"), float("inf"), -float("inf"), 0.0, -1.0):
         with pytest.raises(ValueError, match="sm_scale"):
             run(attn, p, sm_scale=bad)
+    # K / V scales are legal on a bf16 cache (multipliers of K and V, see the
+    # float-KV scale tests) but, like sm_scale, must be positive finite host
+    # floats
     for nm in ("k_scale", "v_scale"):
-        with pytest.raises(ValueError, match="fp8 KV caches only"):
-            run(attn, p, **{nm: 1.0})  # bf16 KV plan: scales are meaningless
+        for bad in (float("nan"), float("inf"), 0.0, -0.5, 1, "1.0"):
+            with pytest.raises(ValueError, match=nm):
+                run(attn, p, **{nm: bad})
     assert calls == [], "a rejected call reached the backend"
     out, lse = run(attn, p)  # legal call still works
     assert calls == [1]
@@ -439,6 +443,105 @@ def test_tc02_invalid_scales_rejected_before_launch(backend):
             with pytest.raises(ValueError, match=nm):
                 run(attn8, p8, **{nm: bad})
     assert calls8 == []
+
+
+def _scaled(p, *, v_scale):
+    """``p`` with V multiplied by ``v_scale`` for the oracle; K's scale goes
+    through the oracle's ``sm_scale`` (``sm_scale * k_scale``)."""
+    return dict(p, v_ref=p["v_ref"].float() * v_scale)
+
+
+@pytest.mark.parametrize("backend", EXPLICIT_BACKENDS)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_tc02_float_kv_scales_effect(backend, dtype):
+    """Legacy ``test_kv_scale_forwarding_effect`` (one request, q = kv = 8,
+    page 16) through the unified API on a fp16 / bf16 cache: one plan, k =
+    v = 0.1 then k = v = 2.0 -- the two outputs differ (the scales reached
+    the kernel) and each matches the oracle on the scaled K / V.  H8:2 /
+    D128 instead of the legacy H1:1 / D64 so cuDNN, trtllm-gen and cake
+    run the same fixture."""
+    p = build_problem([8], [8], dtype=dtype, seed=207, **_TC02_SHAPE)
+    _resolve_or_skip(p, backend)
+    attn = plan(PagedAttention(torch.device(DEVICE)), p, backend)
+    s = 1.0 / math.sqrt(p["head_dim_qk"])
+    outs = []
+    for sc in (0.1, 2.0):
+        out, lse = run(attn, p, k_scale=sc, v_scale=sc)
+        assert_matches(
+            out, lse, _scaled(p, v_scale=sc), sm_scale=s * sc, lse_mode="base2"
+        )
+        outs.append(out.clone())
+    assert not torch.allclose(outs[0], outs[1], atol=1e-3), (
+        "k_scale / v_scale did not reach the kernel"
+    )
+
+
+@pytest.mark.parametrize("backend", EXPLICIT_BACKENDS)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_tc02_float_kv_scales_math_property(backend, dtype):
+    """Legacy ``test_kv_scale_forwarding_math_property`` (q = kv = 128) and
+    a ragged batch on a fp16 / bf16 cache: k_scale alone, v_scale alone and
+    both (k 0.5 / v 2.0), each against the oracle on K * k_scale (its
+    softmax scale) and V * v_scale and none equal to the unscaled result;
+    the same plan then runs unscaled again (no scale state in the plan)."""
+    for p in (
+        build_problem([128], [128], dtype=dtype, seed=208, **_TC02_SHAPE),
+        build_problem([7, 20, 1], [64, 30, 100], dtype=dtype, seed=209, **_TC02_SHAPE),
+    ):
+        _resolve_or_skip(p, backend)
+        attn = plan(PagedAttention(torch.device(DEVICE)), p, backend)
+        s = 1.0 / math.sqrt(p["head_dim_qk"])
+        plain_out, plain_lse = reference(p)
+        for ks, vs in ((0.5, None), (None, 2.0), (0.5, 2.0)):
+            out, lse = run(attn, p, k_scale=ks, v_scale=vs)
+            assert_matches(
+                out,
+                lse,
+                _scaled(p, v_scale=vs or 1.0),
+                sm_scale=s * (ks or 1.0),
+                lse_mode="base2",
+            )
+            assert not torch.allclose(out.float(), plain_out, **OUT_TOL)
+            if ks is not None:
+                assert not torch.allclose(lse, plain_lse, **LSE_TOL)  # LSE is k-scaled
+            else:
+                torch.testing.assert_close(lse, plain_lse, **LSE_TOL)  # v leaves it
+        out, lse = run(attn, p)
+        assert_matches(out, lse, p, lse_mode="base2")
+
+
+@pytest.mark.parametrize("backend", EXPLICIT_BACKENDS)
+def test_tc02_graph_bakes_the_captured_kv_scales(backend):
+    """A captured graph keeps the k_scale / v_scale it was captured with on a
+    bf16 cache (a launch scalar and a captured multiply over the whole
+    buffer): an eager run with other scales does not change what the replay
+    computes."""
+    p = build_problem([6, 12], [40, 70], dtype=torch.bfloat16, seed=210, **_TC02_SHAPE)
+    _resolve_or_skip(p, backend)
+    dev = torch.device(DEVICE)
+    attn = plan(PagedAttention(dev, use_cuda_graph=True), p, backend)
+    out = torch.empty(p["q"].shape[0], 8, 128, dtype=torch.bfloat16, device=dev)
+    lse = torch.empty(p["q"].shape[0], 8, dtype=torch.float32, device=dev)
+    s = 1.0 / math.sqrt(128)
+    ks, vs = 0.5, 2.0
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            run(attn, p, out=out, lse=lse, k_scale=ks, v_scale=vs)
+    torch.cuda.current_stream().wait_stream(stream)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        run(attn, p, out=out, lse=lse, k_scale=ks, v_scale=vs)
+    g.replay()
+    torch.cuda.synchronize()
+    assert_matches(out, lse, _scaled(p, v_scale=vs), sm_scale=s * ks, lse_mode="base2")
+    run(attn, p, out=out, lse=lse)  # eager, unscaled
+    torch.cuda.synchronize()
+    assert_matches(out, lse, p, lse_mode="base2")
+    g.replay()  # the graph still computes the captured scales
+    torch.cuda.synchronize()
+    assert_matches(out, lse, _scaled(p, v_scale=vs), sm_scale=s * ks, lse_mode="base2")
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -872,7 +975,8 @@ def test_tc09_run_rejections_before_launch(backend):
             "lse must be contiguous fp32",
         ),
         ("sm_scale_zero", dict(sm_scale=0.0), "sm_scale"),
-        ("k_scale_on_bf16_kv", dict(k_scale=1.0), "fp8 KV caches only"),
+        ("k_scale_zero", dict(k_scale=0.0), "k_scale"),
+        ("v_scale_negative", dict(v_scale=-2.0), "v_scale"),
     ]
     for label, over, match in rows:
         kv = over.pop("kv", (k, v))
