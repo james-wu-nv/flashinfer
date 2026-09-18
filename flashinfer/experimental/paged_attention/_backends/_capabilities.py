@@ -209,6 +209,14 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         supports_lse=True,
         supports_noncausal=True,
         supports_window=True,
+        # M20 (B200, 2026-09-17): the fa2 windowed KV range is trimmed as if
+        # causal (include/flashinfer/attention/prefill.cuh), so non-causal +
+        # sliding window is WRONG once a request has more than 128 query
+        # tokens and a history (q 256 / kv 768 / window 128: rows 0..127 off by
+        # up to 0.4; q 128 exact; causal exact).  Declared unsupported until the
+        # kernel is fixed; the strict xfail in test_paged_attention_features.py
+        # flips then.  fa3 shares the declaration until measured on SM90.
+        supports_window_noncausal=False,
         requires_contiguous_q=False,
         # soft cap and custom mask: the generated fa2 kernels
         # (tests/attention/test_batch_prefill_kernels.py); sinks: the
@@ -231,6 +239,14 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         supports_lse=True,
         supports_noncausal=True,
         supports_window=True,
+        # M20 (B200, 2026-09-17): the fa2 windowed KV range is trimmed as if
+        # causal (include/flashinfer/attention/prefill.cuh), so non-causal +
+        # sliding window is WRONG once a request has more than 128 query
+        # tokens and a history (q 256 / kv 768 / window 128: rows 0..127 off by
+        # up to 0.4; q 128 exact; causal exact).  Declared unsupported until the
+        # kernel is fixed; the strict xfail in test_paged_attention_features.py
+        # flips then.  fa3 shares the declaration until measured on SM90.
+        supports_window_noncausal=False,
         requires_contiguous_q=False,
         # soft cap: tests/attention/test_hopper.py (cap 30); sinks: the
         # AttentionSink JIT variant; custom mask: the SM90 batch prefill

@@ -251,6 +251,12 @@ any of these is the opt-in (an
 `#5007 <https://github.com/flashinfer-ai/flashinfer/issues/5007>`_ for the
 graduation plan.
 
+Non-causal attention with a sliding window has no runnable backend today:
+trtllm-gen and cake ship no such kernel, cuDNN has no sliding window, and
+the fa2 kernel computes it wrong for requests longer than 128 query tokens
+with a history (design doc, known limitation M20), so fa2/fa3 declare it
+unsupported and ``resolve_paged_attention`` reports the reason per backend.
+
 Backend selection and the ``max_q_len`` hint
 --------------------------------------------
 

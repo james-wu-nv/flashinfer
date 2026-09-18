@@ -561,3 +561,62 @@ def test_sink_kernels_are_specialized_per_head_dim():
         _assert_matches(out, lse, *_reference(p, sinks=sinks))
         outs.append(attn._impl._active._active)
     assert outs[0] is not outs[1]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="ledger M20: the fa2 kernel trims the windowed KV range as if causal, so "
+    "non-causal + sliding window is wrong for requests longer than 128 query "
+    "tokens with a history (B200: q 256 / kv 768 / window 128 -> rows 0..127 off "
+    "by up to 0.4).  Flip fa2's supports_window_noncausal back to True when this "
+    "passes.",
+)
+def test_fa2_kernel_noncausal_sliding_window_defect():
+    """Runs the fa2 kernel through the legacy wrapper (the unified capability
+    table declares the combination unsupported, see M20) on the failing shape
+    and compares with the oracle.  Strict xfail: a kernel fix turns it into an
+    XPASS and asks for the capability flip."""
+    from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
+
+    dev = torch.device("cuda:0")
+    hq, hk, d, page = 32, 8, 128, 16
+    q_len, kv_len, window = 256, 768, 128
+    g = torch.Generator(device=dev).manual_seed(2020)
+    q = torch.randn(q_len, hq, d, dtype=torch.float16, device=dev, generator=g)
+    pages = kv_len // page
+    k = torch.randn(pages, hk, page, d, dtype=torch.float16, device=dev, generator=g)
+    v = torch.randn(pages, hk, page, d, dtype=torch.float16, device=dev, generator=g)
+    qo = torch.tensor([0, q_len], dtype=torch.int32)
+    kv_indptr = torch.tensor([0, pages], dtype=torch.int32)
+    ids = torch.arange(pages, dtype=torch.int32, device=dev)
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=dev)
+    w = BatchPrefillWithPagedKVCacheWrapper(ws, "HND", backend="fa2")
+    w.plan(
+        qo,
+        kv_indptr,
+        ids,
+        torch.tensor([page], dtype=torch.int32),
+        hq,
+        hk,
+        d,
+        page,
+        causal=False,
+        window_left=window,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+    )
+    out = w.run(q, (k, v))
+    torch.cuda.synchronize()
+    ref_out, _ = reference_paged_prefill(
+        q,
+        k,
+        v,
+        qo,
+        torch.tensor([kv_len], dtype=torch.int32),
+        None,
+        page,
+        False,
+        window_left=window,
+        kv_page_indices=ids,
+    )
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)

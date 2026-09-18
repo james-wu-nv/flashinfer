@@ -610,7 +610,13 @@ def test_fuzz_reject_or_correct(backend, mutation):
 
 @pytest.mark.parametrize("input_form", ["block_tables", "page_indices"])
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
-def test_fa2_noncausal_sliding_window_matches_oracle(kv_layout, input_form):
+def test_noncausal_sliding_window_is_excluded_everywhere(kv_layout, input_form):
+    """Non-causal + sliding window has no runnable backend: trtllm-gen and
+    cake declare no kernel, cuDNN has no window, and the fa2 kernel computes
+    it wrong for requests longer than 128 tokens with a history (ledger M20;
+    see the strict xfail in test_paged_attention_features.py), so fa2/fa3
+    declare it unsupported until the kernel is fixed.  The fuzzer's sampler
+    must therefore never draw it as a runnable row."""
     cfg = dict(
         batch_size=4,
         max_q=33,
@@ -625,13 +631,8 @@ def test_fa2_noncausal_sliding_window_matches_oracle(kv_layout, input_form):
         lse_mode="basee",
     )
     p = _build(31_000, cfg)
-    if not _backend_runnable(p, "fa2", cfg):
-        pytest.skip("fa2 non-causal + sliding window not runnable on this GPU")
-    repro = f"backend=fa2 seed=31000 cfg={cfg}"
-    outcome, detail = _run_and_check(p, "fa2", cfg, repro)
-    assert outcome == "correct", f"fa2 rejected a declared row: {detail} [{repro}]"
-    for backend in ("trtllm-gen", "cake"):
+    for backend in ("fa2", "fa3", "trtllm-gen", "cake", "cudnn", "auto"):
         assert not _backend_runnable(p, backend, cfg), (
-            f"{backend} declares supports_window_noncausal=False but resolve() "
-            "admits non-causal + sliding window"
+            f"{backend} admits non-causal + sliding window; M20 says the fa2 "
+            "kernel is wrong there and no other backend has a kernel"
         )
