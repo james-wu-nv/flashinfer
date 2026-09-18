@@ -28,6 +28,21 @@ shape the oracle cannot hold, and the rows then say so) — and every
     without an eager run) is refused inside its capture — and prewarming the
     clones does not scale: the eager descriptor pool holds 4096 entries and a
     below-L2 case rotates thousands of copies.
+``update``
+    The engine-facing per-step re-plan of a graph-mode instance: a fresh
+    :class:`PagedAttentionMetadata` plus ``PagedAttention.update(metadata)``
+    on a second instance constructed with an explicit :class:`GraphCapacity`
+    (the case's batch and query rows, the table's full width — the routine's
+    spare columns included — as ``max_kv_len = table_width * page_size``),
+    after ONE ``run()`` on the case's buffers has been captured from it.
+    Synchronized host wall time, like ``plan``.  Legacy rows time the per-step
+    re-arm an engine does for the captured legacy kernel (below).  CUDA
+    graphs only: with ``--no_cuda_graph`` there is no ``update()`` and these
+    rows are absent.
+``update_replay``
+    ``update`` followed by ``graph.replay()`` of that captured ``run()``,
+    synchronized host wall time — the per-layer cost of a graph-mode step, to
+    be read against ``step`` with ``--pa_layers 1`` (plan plus one eager run).
 ``step``
     One ``plan`` followed by N ``run`` calls (N from ``--pa_layers``), eager,
     synchronized host wall time — the per-scheduler-step cost an engine pays
@@ -63,6 +78,14 @@ Legacy rows keep each API's NATIVE LSE contract (fa/trtllm-gen: packed
 base-2; cuDNN: padded ``(batch, max_q, heads)`` in the requested base); the
 oracle comparison normalizes outside the timed region, so with an LSE
 requested the unified/legacy ratio includes the facade's normalization.
+
+For the ``update`` phases the legacy providers do what an engine does per
+step to re-arm its captured legacy kernel: fa2/fa3 re-``plan()`` the
+graph-mode wrapper into its reserved buffers; cuDNN and trtllm-gen/cake have
+no plan call, so their ``update`` is the provider's per-step derivation of
+the device metadata the captured call reads (cuDNN: the per-request length
+tensors; trtllm-gen/cake: the cumulative KV lengths), written into fixed
+buffers so the pointers the capture baked in stay valid.
 """
 
 from collections import defaultdict
@@ -78,6 +101,7 @@ import torch
 import flashinfer
 from flashinfer.prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
+    GraphCapacity,
     PagedAttention,
     PagedAttentionMetadata,
     cudnn_batch_prefill_with_kv_cache,
@@ -263,6 +287,62 @@ def _make_metadata(case, kv_input_form):
     )
 
 
+def _graph_capacity(case, kv_input_form):
+    """The bucket an engine would size for this case: its batch and query
+    rows, and the table's full width (the routine's spare columns included)
+    as the KV bound — ``max_kv_len = table_width * page_size``, the pairing
+    the dense form's width rule requires."""
+    common = dict(
+        batch_size=case["batch_size"],
+        total_q_tokens=case["total_q"],
+        max_q_len=case["max_q_len"],
+        max_kv_len=case["table_width"] * case["page_size"],
+        page_size=case["page_size"],
+    )
+    if kv_input_form == "dense":
+        return GraphCapacity(**common, table_width=case["table_width"])
+    return GraphCapacity(
+        **common,
+        kv_input_form="page_indices",
+        flat_capacity=case["batch_size"] * case["table_width"],
+    )
+
+
+class _GraphStep:
+    """The ``update`` phases of one candidate: a graph of exactly one ``run()``
+    on the case's buffers and the per-step re-arm that precedes its replay.
+
+    ``prepare`` builds and plans the instance the graph is captured from (a
+    no-op for the legacy providers, which are planned already).  The capture
+    is lazy so that a failure lands on the update rows only; it is reported
+    on both of them.
+    """
+
+    def __init__(self, prepare, update, run_once, bufs):
+        self._prepare, self._update = prepare, update
+        self._run_once, self._bufs = run_once, bufs
+        self.graph = None
+        self._failure = None
+
+    def ensure_captured(self):
+        if self._failure is not None:
+            raise self._failure
+        if self.graph is None:
+            try:
+                self._prepare()
+                self.graph = _capture_run(self._run_once, self._bufs)
+            except Exception as exc:  # noqa: BLE001 - reported on both update rows
+                self._failure = exc
+                raise
+
+    def update(self):
+        self._update()
+
+    def update_replay(self):
+        self._update()
+        self.graph.replay()
+
+
 def _error_status(exc):
     first_line = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
     if _is_typed_unsupported(exc):
@@ -340,9 +420,12 @@ class _PhaseRows:
     def __init__(self, args, case, backend, api_variant, timing_metric, head_dim_vo):
         self.label = f"{backend}/{api_variant}"
         self.rows = []
-        for phase, layers in [("plan", ""), ("run", "")] + [
-            ("step", n) for n in args.pa_layers
-        ]:
+        phase_list = [("plan", ""), ("run", "")]
+        if not args.no_cuda_graph:
+            # update() is the graph-mode re-plan; eager instances have none
+            phase_list += [("update", ""), ("update_replay", "")]
+        phase_list += [("step", n) for n in args.pa_layers]
+        for phase, layers in phase_list:
             row = defaultdict(str)
             row["routine"] = args.routine
             row["backend"] = backend
@@ -402,11 +485,14 @@ class _PhaseRows:
         print(f"[INFO] {self.label}: {status}")
 
 
-def _time_candidate(args, phases, case, plan_once, run_once, recheck, ctx):
+def _time_candidate(
+    args, phases, case, plan_once, run_once, recheck, ctx, graph_step=None
+):
     """Fill the timing of every phase row; a failing phase keeps its own status.
 
     ``recheck`` (optional, zero-arg) re-validates the buffers the timed run
-    wrote against the oracle.
+    wrote against the oracle.  ``graph_step`` (a :class:`_GraphStep`) serves
+    the ``update`` / ``update_replay`` rows when the row set has them.
     """
     q, k_cache, v_cache = case["q"], case["k_cache"], case["v_cache"]
     out, lse = case["out"], case["lse"]
@@ -456,6 +542,22 @@ def _time_candidate(args, phases, case, plan_once, run_once, recheck, ctx):
                     problem = recheck()
                     if problem is not None:
                         row["status"] = f"incorrect (timed run): {problem}"
+                        row["refcheck_passed"] = False
+                        print(f"[ERROR] {phases.label} {phase}: {row['status']}")
+                        continue
+            elif phase in ("update", "update_replay"):
+                graph_step.ensure_captured()
+                fn = (
+                    graph_step.update if phase == "update" else graph_step.update_replay
+                )
+                samples = _wall_ms(fn, args.dry_run_iters, args.num_iters)
+                if phase == "update_replay" and recheck is not None:
+                    # the replays wrote the case's buffers through the
+                    # re-armed graph; a drift from the oracle marks the row
+                    torch.cuda.synchronize()
+                    problem = recheck()
+                    if problem is not None:
+                        row["status"] = f"incorrect (timed replay): {problem}"
                         row["refcheck_passed"] = False
                         print(f"[ERROR] {phases.label} {phase}: {row['status']}")
                         continue
@@ -580,6 +682,35 @@ def _bench_unified(args, case, backend, ctx):
     def run_once(q_, k_, v_, out_, lse_):
         return attn.run(q_, (k_, v_), out=out_, lse=lse_, sm_scale=scale)
 
+    # The update phases run on a second instance an engine would build for a
+    # graph bucket: explicit GraphCapacity from the case, planned once, one
+    # run() captured, then update() per step.  Built lazily (its failures
+    # belong to the update rows), sharing the caller-owned workspace.
+    bucket = {}
+
+    def prepare_update():
+        bucket["attn"] = PagedAttention(
+            ctx["device"],
+            graph_capacity=_graph_capacity(case, args.kv_input_form),
+            workspace_buffer=ctx["workspace"],
+        )
+        bucket["attn"].plan(
+            _make_metadata(case, args.kv_input_form), backend=resolution, **plan_kwargs
+        )
+
+    def update_once():
+        bucket["attn"].update(_make_metadata(case, args.kv_input_form))
+
+    def run_bucket(q_, k_, v_, out_, lse_):
+        return bucket["attn"].run(q_, (k_, v_), out=out_, lse=lse_, sm_scale=scale)
+
+    graph_step = _GraphStep(
+        prepare_update,
+        update_once,
+        run_bucket,
+        (case["q"], case["k_cache"], case["v_cache"], case["out"], case["lse"]),
+    )
+
     try:
         ctx["workspace"].zero_()
         plan_once()
@@ -623,7 +754,7 @@ def _bench_unified(args, case, backend, ctx):
         elif args.verbose >= 1:
             print(f"[INFO] {phases.label}: matches the fp32 oracle")
 
-    _time_candidate(args, phases, case, plan_once, run_once, recheck, ctx)
+    _time_candidate(args, phases, case, plan_once, run_once, recheck, ctx, graph_step)
     return phases, resolved
 
 
@@ -723,7 +854,10 @@ class _LegacyCudnnProvider:
 
     The API takes per-request lengths as ``(b, 1, 1, 1)`` device tensors and
     token-unit batch offsets; the LSE is padded ``(b, max_q, h)`` in the
-    requested base.
+    requested base.  ``plan()`` is the per-step derivation of the query
+    lengths from the indptr into a fixed device buffer (the KV lengths are a
+    view of the engine's own tensor), so a captured call keeps reading the
+    same addresses after a re-plan.
     """
 
     name = "cudnn"
@@ -750,13 +884,16 @@ class _LegacyCudnnProvider:
             if args.lse_mode != "none"
             else None
         )
-        self.q_lens4 = self.kv_lens4 = None
+        batch_size = case["batch_size"]
+        self.q_lens4 = torch.empty(
+            batch_size, 1, 1, 1, dtype=torch.int32, device=ctx["device"]
+        )
+        self.kv_lens4 = case["kv_seq_lens"].view(batch_size, 1, 1, 1)
         self.last_lse = None
 
     def plan(self):
-        batch_size = self.case["batch_size"]
-        self.q_lens4 = self.case["qo_indptr"].diff().view(batch_size, 1, 1, 1)
-        self.kv_lens4 = self.case["kv_seq_lens"].view(batch_size, 1, 1, 1)
+        qo_indptr = self.case["qo_indptr"]
+        torch.sub(qo_indptr[1:], qo_indptr[:-1], out=self.q_lens4.view(-1))
 
     def run(self, q, k_cache, v_cache, out, lse):
         args, case = self.args, self.case
@@ -789,7 +926,8 @@ class _LegacyTrtllmProvider:
     """trtllm-gen through ``trtllm_batch_context_with_kv_cache`` (dense table).
 
     The unified metadata is this API's native dialect; the only per-step
-    derivation is the cumulative KV length vector.
+    derivation is the cumulative KV length vector, written into a fixed device
+    buffer so a captured call keeps reading the same address after a re-plan.
     """
 
     def __init__(self, args, case, ctx, product="trtllm-gen"):
@@ -798,14 +936,14 @@ class _LegacyTrtllmProvider:
         # backend of that name makes.
         self.name = product
         self.args, self.case, self.ctx = args, case, ctx
-        self.cum_kv_seq_lens = None
+        self.cum_kv_seq_lens = torch.zeros(
+            case["batch_size"] + 1, dtype=torch.int32, device=ctx["device"]
+        )
         self.last_lse = None
 
     def plan(self):
-        kv_seq_lens = self.case["kv_seq_lens"]
-        zero = torch.zeros(1, dtype=torch.int32, device=kv_seq_lens.device)
-        self.cum_kv_seq_lens = torch.cat(
-            [zero, torch.cumsum(kv_seq_lens, 0, dtype=torch.int32)]
+        torch.cumsum(
+            self.case["kv_seq_lens"], 0, dtype=torch.int32, out=self.cum_kv_seq_lens[1:]
         )
 
     def run(self, q, k_cache, v_cache, out, lse):
@@ -914,7 +1052,16 @@ def _bench_legacy(args, case, backend, ctx):
         elif args.verbose >= 1:
             print(f"[INFO] {phases.label}: matches the fp32 oracle")
 
-    _time_candidate(args, phases, case, provider.plan, run_once, recheck, ctx)
+    # legacy update = the provider's per-step re-arm of its captured call
+    graph_step = _GraphStep(
+        lambda: None,
+        provider.plan,
+        run_once,
+        (case["q"], case["k_cache"], case["v_cache"], case["out"], case["lse"]),
+    )
+    _time_candidate(
+        args, phases, case, provider.plan, run_once, recheck, ctx, graph_step
+    )
     return phases
 
 
@@ -930,7 +1077,8 @@ def testPagedAttention(args):
        auto``); unsupported ones are recorded, not dropped.
     3. Compares output (and requested LSE) against the fp32 oracle before any
        timing (always; ``--pa_skip_refcheck`` opts out).
-    4. Times the ``plan``, ``run`` and ``step`` phases (see module docstring).
+    4. Times the ``plan``, ``run``, ``update`` / ``update_replay`` (CUDA
+       graphs on) and ``step`` phases (see module docstring).
 
     Args:
         args: Parsed command line arguments containing test configuration
