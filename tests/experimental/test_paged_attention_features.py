@@ -637,3 +637,78 @@ def test_attention_sinks_with_fp8_kv(kv_dtype, head_dim):
     attn, out, lse = _run(p, "fa2", sinks=sinks, use_sinks=True)
     assert attn.backend == "fa2"
     _assert_matches(out, lse, *_reference(p, sinks=sinks))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="ledger M21: the fa2 AttentionSink kernel variant is wrong at head_dim 512 "
+    "(B200: max abs err 1.4-1.75 against the sink-aware oracle; D64/128/256 sinks "
+    "and D512 without sinks are exact).  Flip fa2's sinks_head_dims to include "
+    "(512, 512) when this passes.",
+)
+def test_fa2_kernel_sinks_head_dim_512_defect():
+    """Runs the fa2 sink kernel through the legacy wrapper (the unified capability
+    table excludes sinks at (512, 512), see M21) on the XQA-shaped problem that
+    exposed it and compares with the sink-aware oracle.  Strict xfail: a kernel
+    fix turns it into an XPASS and asks for the capability flip."""
+    from flashinfer.attention._core import BatchAttentionWithAttentionSinkWrapper
+
+    dev = torch.device("cuda:0")
+    hq, hk, d, page = 8, 2, 512, 32
+    q_lens, kv_lens = [4, 1, 4], [96, 33, 111]
+    g = torch.Generator(device=dev).manual_seed(2121)
+    total_q = sum(q_lens)
+    pages_per = [(kl + page - 1) // page for kl in kv_lens]
+    npages = sum(pages_per)
+    q = torch.randn(total_q, hq, d, dtype=torch.bfloat16, device=dev, generator=g)
+    k = torch.randn(npages, hk, page, d, dtype=torch.bfloat16, device=dev, generator=g)
+    v = torch.randn(npages, hk, page, d, dtype=torch.bfloat16, device=dev, generator=g)
+    qo = torch.tensor(
+        [0, *torch.cumsum(torch.tensor(q_lens), 0).tolist()], dtype=torch.int32
+    )
+    kvi = torch.tensor(
+        [0, *torch.cumsum(torch.tensor(pages_per), 0).tolist()], dtype=torch.int32
+    )
+    last = torch.tensor([(kl - 1) % page + 1 for kl in kv_lens], dtype=torch.int32)
+    ids = torch.arange(npages, dtype=torch.int32, device=dev)
+    sinks = (torch.rand(hq, device=dev, generator=g) * 5).float()
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=dev)
+    w = BatchAttentionWithAttentionSinkWrapper(
+        ws,
+        "HND",
+        backend="fa2",
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        head_dim_qk=d,
+        head_dim_vo=d,
+        window_left=-1,
+    )
+    w.plan(
+        qo,
+        kvi,
+        ids,
+        last,
+        hq,
+        hk,
+        d,
+        page,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    out, lse = w.run(q, (k, v), sinks, 1.0 / math.sqrt(d), return_lse=True)
+    torch.cuda.synchronize()
+    ref_out, ref_lse = reference_paged_prefill(
+        q,
+        k,
+        v,
+        qo,
+        torch.tensor(kv_lens, dtype=torch.int32),
+        None,
+        page,
+        True,
+        kv_page_indices=ids,
+        sinks=sinks,
+    )
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)

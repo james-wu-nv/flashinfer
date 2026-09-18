@@ -46,10 +46,13 @@ Cannot-cover / partial notes (kept next to the LEGACY_MAP rows):
   time ("not verified"); asserted as the clear rejection behind
   EXPECT_FA2_SINKS_FP8_KV (XQA runs it natively).
 - sinks + head_dim 512 on fa2: WRONG results (55% of the elements off by up
-  to 0.38 vs the sink reference and the oracle) although the capability table
-  admits the pair -- a measured library defect, recorded as a non-strict
-  xfail behind EXPECT_FA2_SINKS_HEAD_DIM_512 (D128 / D256 sinks and D512
-  without sinks are exact).
+  to 0.38 vs the sink reference and the oracle; D128 / D256 sinks and D512
+  without sinks are exact) -- ledger M21.  The capability table now excludes
+  the pair (fa2 ``sinks_head_dims``), so these rows skip with the resolve
+  reason; the kernel defect is pinned by the strict xfail
+  ``test_paged_attention_features.py::test_fa2_kernel_sinks_head_dim_512_defect``,
+  and the non-strict xfail behind EXPECT_FA2_SINKS_HEAD_DIM_512 stays for the
+  day the table admits the pair again.
 - nvfp4 KV (``test_xqa_batch_decode_nvfp4_kv``): packed uint8 KV plus block
   scale factors have no spelling (EXPECT_NVFP4_KV, asserted per id); the
   legacy rows are SM12x-only.
@@ -104,7 +107,8 @@ LEGACY_MAP = [
         "asserts EXPECT_OUTPUT_DTYPE and runs with the q dtype; full + window 127 has "
         "no unified backend (M20) and skips; sinks + fp8 KV assert the fa2 plan-time "
         "rejection (EXPECT_FA2_SINKS_FP8_KV); sinks + D512 on fa2 are WRONG on B200 "
-        "(non-strict xfail, EXPECT_FA2_SINKS_HEAD_DIM_512); the XQA kernel itself "
+        "(M21: excluded by the capability table, rows skip with the resolve reason; "
+        "EXPECT_FA2_SINKS_HEAD_DIM_512); the XQA kernel itself "
         "is not a unified candidate",
     ),
     (
