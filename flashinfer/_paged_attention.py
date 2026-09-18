@@ -80,8 +80,9 @@ CUDA-graph lifecycle — three stages (``experimental/paged_attention/_graph.py`
     ``lse`` are the capture buffers, at most the capacity's rows; the
     smallest row count a ``run()`` sees bounds every later batch (a graph
     captured on those buffers cannot reach past them).  Rows past the batch
-    are not read, ``out`` rows past it are not written, ``lse`` rows past it
-    may be overwritten by some backends.  ``plan()`` and ``update()`` are
+    are not read; ``out`` / ``lse`` rows past it are unspecified and may be
+    written (a backend's whole-buffer post-processing, cuDNN's base
+    conversion, trtllm-gen's ``-inf`` fill).  ``plan()`` and ``update()`` are
     rejected while the current stream is capturing, and after the first
     graph-mode plan they must run on that plan's stream — the stream the
     graph is replayed on, so the staging copies precede the replay.

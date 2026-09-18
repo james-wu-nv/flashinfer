@@ -1554,3 +1554,140 @@ def test_cake_capture_requires_an_eager_run_on_the_captured_tensors():
     q, k, v, _, _ = first
     fresh = (q, k, v, torch.empty_like(first[3]), torch.empty_like(first[4]))
     check(fresh, capture(fresh))
+
+
+# ---------------------------------------------------------------------------
+# Review round 3 (Codex R1 / R2): post-processing after the live rows grow,
+# capacity inference for zero-query and over-declared first batches
+# ---------------------------------------------------------------------------
+
+
+def _single_request_metadata(p, n, dev):
+    qo = torch.tensor([0, n], dtype=torch.int32)
+    kv = p["kv_seq_lens_cpu"][:1].clone()
+    return PagedAttentionMetadata.dense(
+        qo.to(dev),
+        kv.to(dev),
+        p["block_tables"][:1],
+        page_size=p["page_size"],
+        max_q_len=n,
+        max_kv_len=int(kv.max()),
+        qo_indptr_cpu=qo,
+        kv_seq_lens_cpu=kv,
+    )
+
+
+def _one_request_pool(seed, *, kv_len, pages, page_size, hq, hk, d, dtype, kv_dtype):
+    """One request over ``pages`` physical pages (all referenced), K/V random;
+    fp8 KV quantized per tensor the way make_problem() does."""
+    g = torch.Generator(device="cuda:0").manual_seed(seed)
+    dev = torch.device("cuda:0")
+    k = torch.randn(pages, hk, page_size, d, dtype=dtype, device=dev, generator=g)
+    v = torch.randn(pages, hk, page_size, d, dtype=dtype, device=dev, generator=g)
+    k_ref, v_ref, k_scale, v_scale = k, v, None, None
+    if kv_dtype is not None:
+        k_scale = float(k.abs().amax().item()) / 448.0
+        v_scale = 2.0  # a descale the eye can see
+        k = (k.float() / k_scale).to(kv_dtype)
+        v = (v.float() / v_scale).to(kv_dtype)
+        k_ref, v_ref = k.float() * k_scale, v.float() * v_scale
+    kv = torch.tensor([kv_len], dtype=torch.int32)
+    return dict(
+        device="cuda:0",
+        num_qo_heads=hq,
+        num_kv_heads=hk,
+        head_dim_qk=d,
+        head_dim_vo=d,
+        page_size=page_size,
+        dtype=dtype,
+        kv_dtype=kv_dtype,
+        k_cache=k,
+        v_cache=v,
+        k_ref=k_ref,
+        v_ref=v_ref,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kv_seq_lens_cpu=kv,
+        kv_seq_lens=kv.to(dev),
+        block_tables=torch.arange(pages, dtype=torch.int32, device=dev).view(1, pages),
+    )
+
+
+@pytest.mark.parametrize("lse_mode", ["base2", "basee"])
+@pytest.mark.parametrize("kv", ["bf16", "fp8"])
+def test_graph_growth_covers_lse_fold_and_v_scale(kv, lse_mode):
+    """Capture with 2 live rows out of a capacity of 8, update() to 8 rows,
+    replay, then back to 2 and 5: every live row must carry the LSE base fold
+    and the fp8 V descale.  Before the fix both were captured for the first
+    batch's row prefix only, so rows 2..7 came back in base 2 and unscaled
+    (review R1)."""
+    kv_dtype = torch.float8_e4m3fn if kv == "fp8" else None
+    p = _one_request_pool(
+        200,
+        kv_len=64,
+        pages=4,
+        page_size=16,
+        hq=8,
+        hk=2,
+        d=128,
+        dtype=torch.bfloat16,
+        kv_dtype=kv_dtype,
+    )
+    _resolve_or_skip(p, "fa2")
+    dev = torch.device(p["device"])
+    q8 = torch.randn(
+        8, p["num_qo_heads"], p["head_dim_qk"], dtype=p["dtype"], device=dev
+    )
+    cap = GraphCapacity(
+        batch_size=1,
+        total_q_tokens=8,
+        max_q_len=8,
+        max_kv_len=64,
+        page_size=16,
+        table_width=4,
+    )
+    attn = PagedAttention(dev, graph_capacity=cap)
+    attn.plan(
+        _single_request_metadata(p, 2, dev),
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim_qk"],
+        q_dtype=p["dtype"],
+        kv_dtype=p.get("kv_dtype"),
+        causal=True,
+        lse_mode=lse_mode,
+        backend="fa2",
+    )
+    out = torch.full(
+        (8, p["num_qo_heads"], p["head_dim_vo"]), 7.0, dtype=q8.dtype, device=dev
+    )
+    lse = torch.full((8, p["num_qo_heads"]), 7.0, dtype=torch.float32, device=dev)
+    k, v = p["k_cache"], p["v_cache"]
+    run_kw = dict(out=out, lse=lse, k_scale=p.get("k_scale"), v_scale=p.get("v_scale"))
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            attn.run(q8, (k, v), **run_kw)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        attn.run(q8, (k, v), **run_kw)
+    for n in (2, 8, 2, 5):
+        md = _single_request_metadata(p, n, dev)
+        attn.update(md)
+        g.replay()
+        torch.cuda.synchronize()
+        ref_out, ref_lse = reference_paged_prefill(
+            q8[:n],
+            p["k_ref"],
+            p["v_ref"],
+            md.qo_indptr_cpu,
+            md.kv_seq_lens_cpu,
+            p["block_tables"],
+            p["page_size"],
+            True,
+            lse_base="e" if lse_mode == "basee" else "2",
+        )
+        torch.testing.assert_close(out[:n].float(), ref_out, **OUT_TOL)
+        torch.testing.assert_close(lse[:n], ref_lse, **LSE_TOL)

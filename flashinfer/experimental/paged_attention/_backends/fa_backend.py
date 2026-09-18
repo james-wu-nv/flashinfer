@@ -552,17 +552,27 @@ class _FaBackend:
                 q_v,
                 (k_cache, v_cache),
                 k_scale=k_scale,  # fp8 KV: folded into the softmax scale by the wrapper
-                v_scale=v_scale,  # fp8 KV: applied to the output by the kernel path
+                # v_scale is applied below, over the caller's whole buffer
                 out=out_v,
                 lse=lse_v,
                 return_lse=need_lse,
             )
+        # Post-processing (fp8 V descale, LSE base fold) runs over the WHOLE
+        # caller buffer, never the batch's row prefix: under CUDA-graph
+        # capture the prefix is frozen at the first batch's row count, and a
+        # later update() that grows the live rows would leave the new rows
+        # unscaled / in base 2 (review R1).  Rows past the batch are
+        # unspecified by contract, so scaling them is harmless.
+        out_full = out if out is not None else (r[0] if need_lse else r)
+        if v_scale is not None and not (isinstance(v_scale, float) and v_scale == 1.0):
+            out_full.mul_(v_scale)  # fp8 KV: the wrapper would scale the prefix only
         if not need_lse:
-            return (out if out is not None else r), None
-        out_t, lse_t = r
+            return out_full, None
+        _, lse_t = r
+        lse_full = lse if lse is not None else lse_t
         if self._lse_mode == "basee":
-            lse_t.mul_(LN2)  # FA kernels emit base-2 (exp2 softmax); one fold
-        return (out if out is not None else out_t), (lse if lse is not None else lse_t)
+            lse_full.mul_(LN2)  # FA kernels emit base-2 (exp2 softmax); one fold
+        return out_full, lse_full
 
 
 __all__ = ["_FaBackend"]
