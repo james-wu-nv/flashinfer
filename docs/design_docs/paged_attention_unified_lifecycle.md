@@ -677,9 +677,11 @@ with the constraint named.
   under `auto` the walk moves to a backend that walks the table by its
   strides, an explicit backend surfaces a `ValueError` with the
   `.contiguous()` hint. Extra columns past `max_kv_len` are fine. The check
-  runs on the caller's table in both modes (graph mode stages into the
-  reserved buffer only after preflight), so a narrow view is declined under
-  a graph as well — pass a contiguous table.
+  runs on the table the backend is handed: the caller's in eager mode, the
+  reserved contiguous one in graph mode (the caller's table is copied into
+  it at staging), so a narrow view is declined eagerly and accepted under a
+  graph (measured on B200, 2026-09-21; the round-4 M24 note claimed the
+  opposite and was wrong).
 - **fa2 / fa3** (`_FaBackend.plan`): the flat `kv_page_indices` must be
   contiguous (the kernel walks it as a packed int32 array); only the eager
   flat form can fail this, since the reserved graph buffer is contiguous.
