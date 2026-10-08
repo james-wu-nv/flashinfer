@@ -32,7 +32,7 @@ H100 command (repo root): the rows assert the same rejection there (fa3
 excluded by q dtype instead of compute capability):
 
     python -m pytest -q -ra -o faulthandler_timeout=300 \\
-        tests/experimental/test_legacy_unified_hopper_fp8_attention.py
+        tests/experimental/paged_attention/test_legacy_unified_hopper_fp8_attention.py
 
 Cannot-cover / partial notes (kept next to the LEGACY_MAP rows):
 - test_batch_prefill_paged, test_batch_prefill_paged_gqa,

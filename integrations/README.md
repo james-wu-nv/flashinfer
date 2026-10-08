@@ -7,10 +7,10 @@ the follow-up work described in
 
 **Verification status, read this first.** These diffs have NOT been run
 against the live engines. What IS machine-checked, on real GPUs, is the
-data flow they rely on: `tests/experimental/test_paged_attention_engine_shapes.py`
+data flow they rely on: `tests/experimental/paged_attention/test_paged_attention_engine_shapes.py`
 replicates each engine's exact metadata pipeline and drives the unified API
 under a zero-sync guard against an independent fp32 oracle, and
-`tests/experimental/test_paged_attention_coverage.py` replays vLLM-shaped and
+`tests/experimental/paged_attention/test_paged_attention_coverage.py` replays vLLM-shaped and
 sglang-shaped mixed batches (TC04), strided inputs (TC05) and the CUDA-graph
 cross-feature matrix (TC07). The diffs were audited against the pinned engine
 clones (vLLM @ 3bb78262, sglang @ e7f74473); every claim below survived that

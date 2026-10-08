@@ -76,7 +76,8 @@ class PagedAttentionCapabilities:
     # True if the backend addresses q as packed THD (token stride == H*D);
     # False if any view with q.stride(-1) == 1 is addressable (the controller
     # requires the unit inner stride for everyone).  Measured per backend by
-    # tests/experimental/test_paged_attention_strides.py (NATIVE_Q_OUTCOME).
+    # tests/experimental/paged_attention/test_paged_attention_strides.py
+    # (NATIVE_Q_OUTCOME).
     requires_contiguous_q: bool
     # sliding window together with non-causal attention (trtllm-gen ships no
     # such context kernel; irrelevant where either axis is already False)
@@ -191,7 +192,7 @@ def _is_fp8(dtype: torch.dtype) -> bool:
 
 
 # Per the capability-honesty rule: these sets mirror exactly what
-# tests/experimental/test_paged_attention_{prototype,fuzzer,coverage}.py
+# tests/experimental/paged_attention/test_paged_attention_{prototype,fuzzer,coverage}.py
 # exercise.  Production sets are wider (cuDNN head dims beyond those listed,
 # trtllm-gen head dims 256 / 512 and fp8 KV per
 # tests/attention/test_trtllm_gen_attention_prefill.py, ...).

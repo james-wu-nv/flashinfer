@@ -91,8 +91,8 @@ def _packed_lse_supported(device: torch.device, workspace: torch.Tensor) -> bool
     propagates and nothing is cached, so a transient failure costs one
     plan instead of silently routing every later LSE plan of this device to
     the slower gather path.  The numerical agreement of the packed stats
-    with the reference is pinned by tests/experimental on the supported
-    versions, not re-checked here.
+    with the reference is pinned by tests/experimental/paged_attention on
+    the supported versions, not re-checked here.
     """
     hit = _PACKED_LSE_SUPPORTED.get(device)
     if hit is not None:

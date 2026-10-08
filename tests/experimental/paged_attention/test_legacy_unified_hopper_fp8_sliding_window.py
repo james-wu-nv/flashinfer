@@ -24,7 +24,7 @@ H100 command (repo root): same rejection (fa3 excluded by q dtype instead
 of compute capability):
 
     python -m pytest -q -ra -o faulthandler_timeout=300 \\
-        tests/experimental/test_legacy_unified_hopper_fp8_sliding_window.py
+        tests/experimental/paged_attention/test_legacy_unified_hopper_fp8_sliding_window.py
 
 Cannot-cover / partial notes (kept next to the LEGACY_MAP rows):
 - test_fp8_paged_prefill_sliding_window: fp8 q, see above

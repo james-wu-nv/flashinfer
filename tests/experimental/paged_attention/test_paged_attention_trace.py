@@ -1461,7 +1461,7 @@ def test_import_flashinfer_does_not_load_the_experimental_package():
     )
     result = subprocess.run(
         [sys.executable, "-c", script],
-        cwd=Path(__file__).parents[2],
+        cwd=Path(__file__).parents[3],
         env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
         check=False,
         capture_output=True,
@@ -1474,7 +1474,7 @@ def test_import_flashinfer_does_not_load_the_experimental_package():
 # ── committed example fixture ────────────────────────────────────────────────
 
 FIXTURE = (
-    Path(__file__).parents[1]
+    Path(__file__).parents[2]
     / "trace"
     / "fi_trace_out"
     / "paged_attention_dense_h32_kv8_dqk128_dvo128_ps16_qdtype0_layout1_causal1_wl-1_lse1.json"

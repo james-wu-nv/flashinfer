@@ -778,7 +778,7 @@ def legacy_test_functions(legacy_source: str) -> list:
     import ast
     import pathlib
 
-    root = pathlib.Path(__file__).resolve().parents[2]
+    root = pathlib.Path(__file__).resolve().parents[3]
     tree = ast.parse((root / legacy_source).read_text())
     return [
         node.name

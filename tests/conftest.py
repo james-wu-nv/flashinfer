@@ -216,10 +216,10 @@ def pytest_collection_modifyitems(config, items):
         else (0, 0)
     )
 
-    # Legacy-parity grids (tests/experimental/test_legacy_unified_*.py) keep
-    # every legacy parameter point under `slow`; a plain
-    # run executes the default subsets only, FI_PARITY_SLOW=1 opts in to the
-    # full grids (hours on a shared GPU).
+    # Legacy-parity grids (tests/experimental/paged_attention/test_legacy_unified_*.py)
+    # keep every legacy parameter point under `slow`; a plain run executes the
+    # default subsets only, FI_PARITY_SLOW=1 opts in to the full grids (hours
+    # on a shared GPU).
     run_slow = os.environ.get("FI_PARITY_SLOW", "0") == "1"
 
     for item in items:

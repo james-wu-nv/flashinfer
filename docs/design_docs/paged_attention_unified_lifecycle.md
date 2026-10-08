@@ -65,9 +65,9 @@ wrong stride, and a plan path that paid hundreds of microseconds and several
 device-to-host copies per step.
 
 The package answers each with one mechanism, described below, and tests it
-against an independent fp32 oracle (`tests/experimental/paged_attention_reference.py`)
+against an independent fp32 oracle (`tests/experimental/paged_attention/paged_attention_reference.py`)
 with randomized valid and corrupted inputs
-(`tests/experimental/test_paged_attention_fuzzer.py`). The property the package
+(`tests/experimental/paged_attention/test_paged_attention_fuzzer.py`). The property the package
 is built around is reject-or-correct: every call either raises an actionable
 error or returns results matching the oracle.
 
@@ -113,7 +113,7 @@ eagerly from `flashinfer/_paged_attention.py` and exposes the value types
 `PagedAttentionMetadata`, `GraphCapacity`, `Resolution` and
 `PagedAttentionCapabilities` through a module `__getattr__`, so importing
 `flashinfer` never loads the experimental package
-(`tests/experimental/test_paged_attention_contract_cpu.py::test_importing_flashinfer_does_not_load_the_experimental_package`).
+(`tests/experimental/paged_attention/test_paged_attention_contract_cpu.py::test_importing_flashinfer_does_not_load_the_experimental_package`).
 `resolve_paged_attention`, `PagedAttention.plan`, `update` and `run` carry
 `@flashinfer_experimental_api`; calling one is the opt-in and emits an
 `ExperimentalWarning` once.
@@ -451,7 +451,7 @@ storage (`q[:n]`, `out[:n]`, `lse[:n]`), because the legacy wrapper insists
 on `q.shape[0] == qo_indptr[-1]`; cuDNN and trtllm-gen read the row count
 from `qo_indptr`. `sm_scale`, `k_scale` and `v_scale` are launch scalars: a
 captured graph keeps the values it was captured with
-(`tests/experimental/test_paged_attention_coverage.py::test_tc02_graph_bakes_the_captured_sm_scale`).
+(`tests/experimental/paged_attention/test_paged_attention_coverage.py::test_tc02_graph_bakes_the_captured_sm_scale`).
 
 ## Backend selection
 
@@ -598,7 +598,7 @@ The mirrors are trusted to match the device tensors; validating equality
 would cost the sync this path removes. With the mirrors supplied, the eager
 plan on trtllm-gen or cuDNN with a dense table issues zero kernel launches
 and one pinned host-to-device copy (`wp-c.md` §2.2 measurement; pinned by
-`tests/experimental/test_paged_attention_prototype.py::test_warm_plan_uploads_from_pinned_memory_only`).
+`tests/experimental/paged_attention/test_paged_attention_prototype.py::test_warm_plan_uploads_from_pinned_memory_only`).
 
 ### Validation
 
@@ -640,7 +640,7 @@ The controller checks (`_controller.run`):
   head slice of a fused QKV buffer is misaddressed. fa2, fa3 and trtllm-gen
   accept any unit-inner-stride view (a fused-QKV head slice, a padded head
   stride, a storage offset), measured natively in
-  `tests/experimental/test_paged_attention_strides.py`.
+  `tests/experimental/paged_attention/test_paged_attention_strides.py`.
 - `kv_cache`: a `(k_cache, v_cache)` pair, each 4-D in the planned layout
   (`HND`: `(pages, H, page_size, D)`; `NHD`: `(pages, page_size, H, D)`), with
   the planned `kv_dtype`. A transposed pair gets a hint naming the layout.
@@ -703,7 +703,7 @@ derived last-page length of a padding row is `page_size` by the
 its indptr span is empty); the flat-to-dense gather clamps a page-less row to
 a live in-pool id that no kernel reads for that row. Padding rows can be
 toggled live/padding across graph re-plans
-(`tests/experimental/test_paged_attention_cuda_graph.py::test_replan_toggles_padding_rows`).
+(`tests/experimental/paged_attention/test_paged_attention_cuda_graph.py::test_replan_toggles_padding_rows`).
 
 `q_len == 0` rows (`qo_indptr[i] == qo_indptr[i + 1]`, vLLM's padded
 `query_start_loc` tail) are legal as well (ledger M17). Such a row owns no
@@ -720,7 +720,7 @@ LSE shortcut (the padded `(b, 1, h)` stats read as the packed `(b, h)`
 buffer) holds only while every request has exactly one token, so it is taken
 in eager mode only and only when `total_q_tokens == batch_size`; graph-mode
 decode buckets use the gather path
-(`tests/experimental/test_paged_attention_cuda_graph.py::test_decode_bucket_replan_with_zero_q_tail_rows`).
+(`tests/experimental/paged_attention/test_paged_attention_cuda_graph.py::test_decode_bucket_replan_with_zero_q_tail_rows`).
 
 ## Output and LSE contract
 
@@ -939,12 +939,12 @@ because the controller, not the backend, owns the reserved storage.
 | --- | --- | --- |
 | M14 | The 128 MiB shared default workspace overflows the fa2 split-KV planner on a single 2048-token request with 32 heads. | WP-I adds `workspace_requirements()`; pass the engine's buffer meanwhile. |
 | M15 | `flashinfer/cudnn/decode.py` keeps the older graph-cache key and decorator order that the prefill path fixed. | Out of this package; recorded. |
-| M16 | trtllm-gen and cake compute silently wrong results when the V cache's page stride differs from the K cache's (independently allocated pools); cuDNN and fa2 are correct. | Rejected at `run()` in the trtllm-gen backend (a `ValueError` naming the stride constraint); `tests/experimental/test_paged_attention_coverage.py::test_tc05_strided_inputs[trtllm-gen-kv_independent_strides]` pins it. |
-| M18 | Cake creates its TMA descriptors for `q`, `k_cache` and `v_cache` (storage address, shape, strides) eagerly and pins them at capture; a `run()` whose q/k/v binding was never run eagerly raises `RuntimeError("... prewarm each Cake FMHA tensor/layout binding before CUDA Graph capture")` inside the capture. The eager descriptor pool is bounded (`kMaxReusableSlots = kMaxPinnedSlots = 4096` in `csrc/cake_fmha/jit/*_jit_binding.cu`), so a capture over thousands of distinct binding sets — the timing helper's cold-L2 rotating clones for an input far below L2 — cannot be prewarmed into it. | Documented rule, not fixable from `plan()` (it sees no tensors): run the exact `q`, `k_cache`, `v_cache` once eagerly before capturing them; `out` and `lse` may be fresh. The failed capture is clean (no device fault, instance reusable). The benchmark therefore captures one `run()` on fixed buffers and flushes L2 between replays. `tests/experimental/test_paged_attention_cuda_graph.py::test_cake_capture_requires_an_eager_run_on_the_captured_tensors`. |
-| M20 | The fa2 kernel trims the windowed KV range as if the mask were causal (`include/flashinfer/attention/prefill.cuh`), so non-causal + sliding window is wrong once a request has more than 128 query tokens and a history (B200: q 256 / kv 768 / window 128 → rows 0..127 off by up to 0.4, LSE by 0.86; q 128, causal, window −1 and no history are exact). The legacy wrapper has the same defect (`tests/attention/test_attention_sink.py` chunk-prefill xfail). | fa2 and fa3 declare `supports_window_noncausal=False`, so the combination has no runnable backend and `resolve_paged_attention` names the reason for each; `tests/experimental/test_paged_attention_features.py::test_fa2_kernel_noncausal_sliding_window_defect` is a strict xfail on the kernel through the legacy wrapper — a kernel fix turns it into XPASS and asks for the capability flip. |
-| M21 | The fa2 attention-sink kernel variant is wrong at head_dim 512 (B200: max abs err 1.4–1.75, LSE off by ~3; D64/128/256 sinks and D512 without sinks are exact; the legacy `BatchAttentionWithAttentionSinkWrapper` shows the same). Found by the XQA legacy grid once WP-T declared D512. | fa2 declares `sinks_head_dims = {64, 128, 256}`, so `use_sinks=True` at (512, 512) is excluded at resolve with the reason; `tests/experimental/test_paged_attention_features.py::test_fa2_kernel_sinks_head_dim_512_defect` is a strict xfail on the kernel through the legacy sink wrapper — a kernel fix turns it into XPASS and asks for the capability flip; the XQA conversion's D512 + sink rows skip with the resolve reason. |
-| M22 | `_FaBackend.preflight` declined `use_sinks=True` with an fp8 KV cache as "not verified" although the capability table admits both; the XQA legacy suite runs the pair natively. Measured on B200 (e4m3 / e5m2, D128 / D256): the sink variant with `sm_scale * k_scale` and `out * v_scale` matches the sink-aware oracle to 4e-3. | Decline removed; `tests/experimental/test_paged_attention_features.py::test_attention_sinks_with_fp8_kv` pins the pair against the oracle and `EXPECT_FA2_SINKS_FP8_KV = True` runs the XQA fp8 rows. |
-| M23 | trtllm-gen, cake and cuDNN read the slots of a request's last page past `kv_len` (the masked probabilities are 0, but `0 * NaN` reaches the output); fa2 zeroes the tail before the PV product. The TensorSpeed and modular legacy suites poison exactly that tail and expect it ignored. | Input contract (`PagedAttentionMetadata` docstring, "In-page tail"): the tail must be finite, any finite content is exact. Not a backend defect — the legacy TensorSpeed kernel masks it, the shared native kernels do not. `tests/experimental/test_legacy_unified_attention_ts_context.py::test_paged_in_page_tail_past_kv_len_is_masked` records the per-backend outcome behind `EXPECT_INPAGE_TAIL_IGNORED` (stays `False` by design). |
+| M16 | trtllm-gen and cake compute silently wrong results when the V cache's page stride differs from the K cache's (independently allocated pools); cuDNN and fa2 are correct. | Rejected at `run()` in the trtllm-gen backend (a `ValueError` naming the stride constraint); `tests/experimental/paged_attention/test_paged_attention_coverage.py::test_tc05_strided_inputs[trtllm-gen-kv_independent_strides]` pins it. |
+| M18 | Cake creates its TMA descriptors for `q`, `k_cache` and `v_cache` (storage address, shape, strides) eagerly and pins them at capture; a `run()` whose q/k/v binding was never run eagerly raises `RuntimeError("... prewarm each Cake FMHA tensor/layout binding before CUDA Graph capture")` inside the capture. The eager descriptor pool is bounded (`kMaxReusableSlots = kMaxPinnedSlots = 4096` in `csrc/cake_fmha/jit/*_jit_binding.cu`), so a capture over thousands of distinct binding sets — the timing helper's cold-L2 rotating clones for an input far below L2 — cannot be prewarmed into it. | Documented rule, not fixable from `plan()` (it sees no tensors): run the exact `q`, `k_cache`, `v_cache` once eagerly before capturing them; `out` and `lse` may be fresh. The failed capture is clean (no device fault, instance reusable). The benchmark therefore captures one `run()` on fixed buffers and flushes L2 between replays. `tests/experimental/paged_attention/test_paged_attention_cuda_graph.py::test_cake_capture_requires_an_eager_run_on_the_captured_tensors`. |
+| M20 | The fa2 kernel trims the windowed KV range as if the mask were causal (`include/flashinfer/attention/prefill.cuh`), so non-causal + sliding window is wrong once a request has more than 128 query tokens and a history (B200: q 256 / kv 768 / window 128 → rows 0..127 off by up to 0.4, LSE by 0.86; q 128, causal, window −1 and no history are exact). The legacy wrapper has the same defect (`tests/attention/test_attention_sink.py` chunk-prefill xfail). | fa2 and fa3 declare `supports_window_noncausal=False`, so the combination has no runnable backend and `resolve_paged_attention` names the reason for each; `tests/experimental/paged_attention/test_paged_attention_features.py::test_fa2_kernel_noncausal_sliding_window_defect` is a strict xfail on the kernel through the legacy wrapper — a kernel fix turns it into XPASS and asks for the capability flip. |
+| M21 | The fa2 attention-sink kernel variant is wrong at head_dim 512 (B200: max abs err 1.4–1.75, LSE off by ~3; D64/128/256 sinks and D512 without sinks are exact; the legacy `BatchAttentionWithAttentionSinkWrapper` shows the same). Found by the XQA legacy grid once WP-T declared D512. | fa2 declares `sinks_head_dims = {64, 128, 256}`, so `use_sinks=True` at (512, 512) is excluded at resolve with the reason; `tests/experimental/paged_attention/test_paged_attention_features.py::test_fa2_kernel_sinks_head_dim_512_defect` is a strict xfail on the kernel through the legacy sink wrapper — a kernel fix turns it into XPASS and asks for the capability flip; the XQA conversion's D512 + sink rows skip with the resolve reason. |
+| M22 | `_FaBackend.preflight` declined `use_sinks=True` with an fp8 KV cache as "not verified" although the capability table admits both; the XQA legacy suite runs the pair natively. Measured on B200 (e4m3 / e5m2, D128 / D256): the sink variant with `sm_scale * k_scale` and `out * v_scale` matches the sink-aware oracle to 4e-3. | Decline removed; `tests/experimental/paged_attention/test_paged_attention_features.py::test_attention_sinks_with_fp8_kv` pins the pair against the oracle and `EXPECT_FA2_SINKS_FP8_KV = True` runs the XQA fp8 rows. |
+| M23 | trtllm-gen, cake and cuDNN read the slots of a request's last page past `kv_len` (the masked probabilities are 0, but `0 * NaN` reaches the output); fa2 zeroes the tail before the PV product. The TensorSpeed and modular legacy suites poison exactly that tail and expect it ignored. | Input contract (`PagedAttentionMetadata` docstring, "In-page tail"): the tail must be finite, any finite content is exact. Not a backend defect — the legacy TensorSpeed kernel masks it, the shared native kernels do not. `tests/experimental/paged_attention/test_legacy_unified_attention_ts_context.py::test_paged_in_page_tail_past_kv_len_is_masked` records the per-backend outcome behind `EXPECT_INPAGE_TAIL_IGNORED` (stays `False` by design). |
 | — | `auto` is a static order. On SM100 it picks trtllm-gen for a decode-shaped batch (B=32, q=1, kv=4096) that fa2 runs about five times faster in the benchmark smoke run. | Shape-bucket order table is wave-2 work; the benchmark's `resolved_backend` column shows the regret. |
 | — | `custom_mask` with graph mode raises `ValueError`: the FA wrapper's packed-mask storage is not part of `GraphCapacity`. | Follow-up. |
 | — | The generated-FA backend re-plans its wrapper in place; a failure inside that plan can leave backend-internal state ahead of the published metadata. | Same caveat as the MLA generated backends. |

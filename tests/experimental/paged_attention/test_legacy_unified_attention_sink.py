@@ -25,7 +25,7 @@ fa3 rows: collected; on B200 they skip with the resolve reason ("fa3:
 unsupported compute capability sm_10x").  H100 command (repo root):
 
     python -m pytest -q -ra -o faulthandler_timeout=300 \\
-        tests/experimental/test_legacy_unified_attention_sink.py -k fa3
+        tests/experimental/paged_attention/test_legacy_unified_attention_sink.py -k fa3
 
 Cannot-cover / partial notes (kept next to the LEGACY_MAP rows):
 - all four functions: the ragged half (BatchPrefillWithRaggedKVCacheWrapper

@@ -28,8 +28,9 @@ lengths, always causal, base-2 LSE hard-coded).  This module provides:
 - :class:`_PagedAttentionTraceTemplate` — normalizes the plan-owned inputs
   into the trace kwargs inside ``build_fi_trace_fn`` (the dispatcher's own
   ``**kwargs`` copy never reaches the base builder).
-- a pure-torch reference matching ``tests/experimental/paged_attention_reference.py``
-  and an ``init`` that builds a valid ``{"plan": ..., "run": ...}`` bundle.
+- a pure-torch reference matching
+  ``tests/experimental/paged_attention/paged_attention_reference.py`` and an
+  ``init`` that builds a valid ``{"plan": ..., "run": ...}`` bundle.
 
 Identity rules: ``op_type="gqa_paged"`` keeps the category; the name prefix
 ``paged_attention_{dense,csr}[_fp8kv]`` never collides with

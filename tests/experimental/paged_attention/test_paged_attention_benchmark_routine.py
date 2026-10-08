@@ -27,7 +27,7 @@ import sys
 import pytest
 import torch
 
-BENCHMARKS_DIR = pathlib.Path(__file__).resolve().parents[2] / "benchmarks"
+BENCHMARKS_DIR = pathlib.Path(__file__).resolve().parents[3] / "benchmarks"
 if str(BENCHMARKS_DIR) not in sys.path:
     # flashinfer_benchmark.py imports its routines as the ``routines`` package
     sys.path.insert(0, str(BENCHMARKS_DIR))

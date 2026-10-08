@@ -16,7 +16,8 @@ Layout (mirrors ``flashinfer/mla/_batch_mla/``):
 
 Reject-or-correct is the property the whole package is built around: any
 call either raises a clean, actionable error or returns results matching an
-independent reference. ``tests/experimental/test_paged_attention_fuzzer.py``
+independent reference.
+``tests/experimental/paged_attention/test_paged_attention_fuzzer.py``
 enforces it with randomized valid and corrupted inputs.
 """
 

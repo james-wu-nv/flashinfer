@@ -2,7 +2,8 @@
 
 Times the experimental :class:`flashinfer.prefill.PagedAttention` facade on
 ONE set of inputs for every requested backend.  Each candidate is gated on
-the fp32 oracle (``tests/experimental/paged_attention_reference.py``) before
+the fp32 oracle
+(``tests/experimental/paged_attention/paged_attention_reference.py``) before
 it is timed — always, not only with ``--refcheck`` (the oracle is fp32 torch
 on the benchmarked shapes; ``--pa_skip_refcheck`` turns the gate off for a
 shape the oracle cannot hold, and the rows then say so) — and every
@@ -125,7 +126,7 @@ from .flashinfer_benchmark_utils import (
 
 PAGED_ATTENTION_BACKENDS = ("fa2", "fa3", "cudnn", "trtllm-gen", "cake", "auto")
 LN2 = math.log(2.0)
-# Same tolerances as tests/experimental/test_paged_attention_prototype.py.
+# Same tolerances as tests/experimental/paged_attention/test_paged_attention_prototype.py.
 OUT_TOL = dict(rtol=2e-2, atol=2e-2)
 LSE_TOL = dict(rtol=2e-2, atol=3e-2)
 # The dense table is wider than any request needs and the pool has spare
@@ -142,7 +143,8 @@ WORKSPACE_BYTES = 512 * 1024 * 1024
 
 
 def _load_reference_oracle():
-    """Load ``reference_paged_prefill`` from ``tests/experimental`` by path.
+    """Load ``reference_paged_prefill`` from ``tests/experimental/paged_attention``
+    by path.
 
     ``benchmarks/`` is not a package that can import ``tests``; loading the
     oracle by file keeps ONE copy of the math (the one the experimental test
@@ -153,6 +155,7 @@ def _load_reference_oracle():
         pathlib.Path(__file__).resolve().parents[2]
         / "tests"
         / "experimental"
+        / "paged_attention"
         / "paged_attention_reference.py"
     )
     if not path.is_file():

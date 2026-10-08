@@ -28,8 +28,8 @@ Design rules enforced (each traces to a documented failure mode):
     (cuDNN issue 3800 is what guessing looks like).
 3.  Reject-or-correct.  Anything this API returns must match the reference
     semantics; anything it cannot address must raise.  The companion fuzzer
-    (``tests/experimental/test_paged_attention_fuzzer.py``) enforces exactly
-    this property with randomized valid and corrupted inputs.
+    (``tests/experimental/paged_attention/test_paged_attention_fuzzer.py``)
+    enforces exactly this property with randomized valid and corrupted inputs.
 4.  Two-level selection.  ``resolve_paged_attention()`` is a static, tensor-free
     query usable at engine init (before pool allocation / graph capture);
     passing the returned ``Resolution`` to ``plan(backend=...)`` pins the

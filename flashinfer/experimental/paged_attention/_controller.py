@@ -779,7 +779,8 @@ class PagedAttentionController:
         # pass only the token and head strides (the kernels assume a dense
         # head_dim), so a non-unit inner stride is silently misread (native
         # probe: max abs error 1.5 / 1.3 against 0.0025); cuDNN rejects it in
-        # graph construction.  See tests/experimental/test_paged_attention_strides.py.
+        # graph construction.  See
+        # tests/experimental/paged_attention/test_paged_attention_strides.py.
         _expect(
             q.stride(-1) == 1,
             f"q must be dense along head_dim (stride(-1) == 1), got strides "

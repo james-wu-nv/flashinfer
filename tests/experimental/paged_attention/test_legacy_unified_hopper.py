@@ -27,9 +27,9 @@ although their rejection assertions run on any GPU; run this file without
 H100 commands (repo root, the H100 lane):
 
     python -m pytest -q -ra -o faulthandler_timeout=300 \\
-        tests/experimental/test_legacy_unified_hopper.py
+        tests/experimental/paged_attention/test_legacy_unified_hopper.py
     FI_PARITY_SLOW=1 python -m pytest -q -ra -o faulthandler_timeout=300 \\
-        tests/experimental/test_legacy_unified_hopper.py
+        tests/experimental/paged_attention/test_legacy_unified_hopper.py
 
 Cannot-cover / partial notes (kept next to the LEGACY_MAP rows):
 - test_batch_prefill_with_paged_kv_cache_multi_item_scoring_fa3 (+ _bsz2):
