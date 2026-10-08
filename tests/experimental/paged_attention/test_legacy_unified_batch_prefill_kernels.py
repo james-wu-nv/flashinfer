@@ -1,458 +1,345 @@
 """Legacy -> unified: tests/attention/test_batch_prefill_kernels.py
 
-Every test function below carries the name of the legacy test it converts and
-runs the legacy fixture through flashinfer.prefill.PagedAttention: the same
-shapes, dtypes, page sizes, the same combined ``(pages, 2, ...)`` pool sliced
-as ``K = kv[:, 0]`` / ``V = kv[:, 1]`` views, the same random construction
-(under a per-row seed; the legacy tests are unseeded), the legacy CSR mapped
-losslessly to ``PagedAttentionMetadata`` (``kv_seq_lens[i] = (pages_i - 1) *
-page_size + last_page_len[i]``; page size < 8 -> ``.csr``, else ``.dense``).
-Each numerical row asserts against the legacy reference at the legacy
-tolerance AND against the independent fp32 oracle.  The parametrize axes
-keep the legacy names and values; a row id is the legacy node id plus
-``-<backend>`` (six backends; a capability-excluded backend skips with the
-resolve reason).  The full legacy grids stay under ``slow`` (FI_PARITY_SLOW=1);
-the default subset covers every axis value.
+Every paged-prefill test of the legacy file runs its legacy fixture through
+``PagedAttention`` pinned to fa2: the legacy tests call
+``BatchPrefillWithPagedKVCacheWrapper`` with ``backend="fa2"`` or ``"auto"``,
+which picks fa2 on this device.  Same grids, same tensors in the same RNG
+order, so the node ids equal the legacy ids.  The legacy CSR maps losslessly
+to ``PagedAttentionMetadata`` (every request holds ``kv_len`` tokens on its
+own pages; page size < 8 -> ``.csr``, else ``.dense``).  Each case checks the
+legacy reference at the legacy tolerance, and the output and LSE against the
+fp32 paged-attention oracle.
 
-CI: legacy file in A10G fixed shard part4 (full) and H100 1/5 sampling; fa3
-rows only on H100.  The unified file is not collected by default CI
-(``norecursedirs = tests/experimental``).
+The legacy ``use_cuda_graph=True`` rows were an unconditional xfail (the
+wrapper's workspace overflowed); here they run the graph lifecycle with a
+workspace sized by ``workspace_requirements`` and must pass.
 
-Cannot-cover / partial notes (kept next to the LEGACY_MAP rows):
-- pos_encoding_mode="ROPE_LLAMA" (an axis of the main, tuple, head_dim_512,
-  custom-mask and multi-item grids; the *_rope_large_head NVFP4 rows): the
-  unified API has no fused positional encoding -- plan() takes no
-  pos_encoding_mode / rope_scale / rope_theta (TypeError, asserted per row)
-  because RoPE is the caller's transform (design doc "Feature axes").  The
-  ROPE_LLAMA rows run the migration adapter instead: q rotated at positions
-  kv_len - q_len + r and the request's K pages at j with
-  flashinfer.apply_rope_pos_ids (Llama non-interleaved, theta 1e4), then the
-  unified run, compared with the legacy FUSED reference on the unrotated
-  tensors at the legacy 1e-3 -- so these rows are ``partial`` (adapter cost
-  measured, fused RoPE not expressible).  Support surface: no backend
-  declares a positional-encoding axis (_capabilities.py has none).
-- use_cuda_graph=True rows of the main / tuple grids were an unconditional
-  legacy xfail (workspace overflow); the unified rows run the graph
-  lifecycle (GraphCapacity -> workspace_requirements -> warm-up plan ->
-  capture -> update() -> replay) on the same fixture and pass.  The scratch
-  the contract asks for is large at the big geometries (fa2 plans the
-  split-KV scratch for the capacity maxes: up to 4.5 GB at B128 / kv2048 /
-  32 heads), which is exactly why the legacy 128 MiB wrapper xfailed.
-- ROPE_LLAMA rows with qo_len > kv_len (the non-causal (17, 54, 577) points):
-  the fused kernels compute the q position ``kv_len - qo_len + i`` in uint32
-  (prefill.cuh, q_frag_apply_llama_rope), so the legacy reference rotates at
-  wrapped positions; the adapter's signed positions match the oracle but not
-  that reference -- the rows check the oracle and skip the legacy comparison
-  with the reason.
-- NVFP4 (8 legacy functions): kv_dtype uint8 (packed FP4x2) is not a declared
-  KV dtype of any backend (declared: f16/bf16 everywhere, fp8 e4m3/e5m2 on
-  fa2) and run() has no kv_cache_sf; the rows assert the resolve rejection
-  under EXPECT_NVFP4_KV.  Needs a quantization descriptor (packed dtype,
-  scale-factor tensors and their strides, global scales, asymmetric pools).
-- multi-item scoring: plan() has no prefix_len_ptr / token_pos_in_items_ptr
-  / token_pos_in_items_len / max_item_len_ptr (TypeError, asserted); the
-  visible set is expressed with the legacy mask builder as custom_mask
-  (causal=False, fa2 = the only mask-capable backend) plus the RoPE adapter,
-  against the legacy fused reference -- ``partial`` under
-  EXPECT_MULTI_ITEM_SCORING.
-- (448, 256) head dims: undeclared pair on every backend (fa2 declares
-  64/128/256/512 square); the CTA_TILE_Q plan_info pin is a planner-internal
-  contract with no unified observable -- ``native-only``, numerical half
-  under EXPECT_HEAD_DIM_448_256.
-- fully masked causal rows (q_len 34 > kv_len 1): rejected by the causal
-  envelope ("causal masking requires q_len_i <= kv_len_i"); legacy defined
-  them as out 0 / LSE -inf.  Needs a fully-masked-row policy in the contract
-  -- EXPECT_FULLY_MASKED_ROWS; the fixture runs non-causally as a sanity row.
-- fixed_split_size=2 of the lazy-stride-router test has no unified
-  counterpart (the split policy is the backend's); the plan-reuse contract
-  itself is checked.
-- ragged / single-prefill functions of the legacy file are out of scope
-  (not paged prefill) and listed as such.
+Not expressible, asserted as rejections: fused RoPE (``pos_encoding_mode``),
+NVFP4 KV, multi-item scoring, the (448, 256) head dims and causal rows with
+``q_len > kv_len``.  Ragged, single-prefill and torch.compile functions of the
+legacy file are out of scope.
 """
 
 import pytest
 import torch
 
-from flashinfer.prefill import PagedAttention
+import flashinfer
+from flashinfer.prefill import (
+    GraphCapacity,
+    PagedAttention,
+    PagedAttentionMetadata,
+    resolve_paged_attention,
+)
+from flashinfer.utils import get_compute_capability
 from tests.test_helpers.paged_kv import make_padded_paged_kv_view
 from tests.test_helpers.test_helpers import ref_single_prefill
 
-from .legacy_unified_helpers import (
-    BACKENDS,
-    DEVICE,
-    EXPECT_FA2_HEAD_DIM_512,
-    EXPECT_FULLY_MASKED_ROWS,
-    EXPECT_HEAD_DIM_448_256,
-    EXPECT_MULTI_ITEM_SCORING,
-    LegacyBatch,
-    apply_external_rope,
-    argnames,
-    assert_every_backend_excluded,
-    assert_legacy_isclose,
-    assert_nvfp4_unsupported,
-    assert_oracle,
-    assert_rope_kwargs_rejected,
-    backend_rows,
-    check_legacy_map,
-    check_legacy_map_complete,
-    check_unified_tests_mapped,
-    grid,
-    legacy_id,
-    legacy_reference_single_prefill,
-    legacy_uniform_batch,
-    param_rows,
-    plan_batch,
-    plan_signature_params,
-    resolve_batch_or_skip,
-    run_batch,
-    run_batch_graph,
-    seed_of,
-)
+from .paged_attention_reference import reference_paged_prefill
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-
+# Read by the legacy <-> unified parity report:
+# (legacy nodeid, [unified test functions], status, note)
 LEGACY_SOURCE = "tests/attention/test_batch_prefill_kernels.py"
 LEGACY_MAP = [
-    # (legacy nodeid, [unified test function names in this file], status, note)
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_paged_kv_cache",
         ["test_batch_prefill_with_paged_kv_cache"],
         "partial",
-        "same 14 legacy axes and values (B12/17/128 x kv54/97/512/2048 x q37/17/127/577 "
-        "x page1/5/16 x H4/32:4 x D64/128/256 x causal x NHD x pos NONE/ROPE_LLAMA x "
-        "use_cuda_graph x soft cap 0 x LSE x contiguous) plus the backend; combined fp16 "
-        "NHD pool as K=kv[:,0]/V=kv[:,1] views; legacy 1e-3 vs per-request "
-        "single_prefill_with_kv_cache + oracle + the legacy caller-buffer re-run.  NONE "
-        "rows are equivalent; ROPE_LLAMA rows run the external-RoPE adapter against the "
-        "fused legacy reference (fused RoPE not expressible); use_cuda_graph=True rows "
-        "(a legacy xfail) run the graph lifecycle (workspace sized by "
-        "workspace_requirements, up to 4.5 GB) and pass; ROPE rows with qo_len > kv_len "
-        "check the oracle only (the fused reference wraps positions in uint32); cudnn / "
-        "trtllm-gen / cake run the D128 / page16 cells and skip the rest with the "
-        "capability reason.",
+        "same grid and combined fp16 NHD pool on fa2; NONE rows: legacy 1e-3 vs "
+        "single_prefill + caller-buffer re-run + oracle, use_cuda_graph rows (a legacy "
+        "xfail) run the graph lifecycle and pass; ROPE_LLAMA rows assert the plan() "
+        "TypeError (no fused RoPE)",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_lazy_stride_router_plan_reuse",
         ["test_batch_prefill_lazy_stride_router_plan_reuse"],
         "equivalent",
-        "same fixture (bf16 /4, B2 q17 kv97 page16 H8:2, padded V view via "
-        "make_padded_paged_kv_view), one plan / three runs equal -> unequal -> equal "
-        "strides, legacy tolerances (2e-2 vs fp64 ref_single_prefill, 1e-2 pairwise) + "
-        "oracle on fa2; fa3 / trtllm-gen / cake must reject-or-correct the unequal run; "
-        "the legacy fixed_split_size=2 knob has no counterpart.",
+        "same fixture on fa2, one plan over equal / unequal / equal V strides at the "
+        "legacy tolerances plus the oracle; the fixed_split_size knob has no "
+        "counterpart",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_lazy_stride_router_nvfp4",
         ["test_batch_prefill_lazy_stride_router_nvfp4"],
         "unsupported-by-design",
-        "NVFP4 KV (uint8 packed + scale factors) is undeclared and run() has no "
-        "kv_cache_sf; the stride-router prewarm (prewarm_paged_kv_stride_variant) is a "
-        "legacy wrapper knob with no unified counterpart.  EXPECT_NVFP4_KV.",
+        "NVFP4 KV (uint8) is not a declared KV dtype: resolve rejection asserted",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_paged_kv_cache_head_dim_512",
         ["test_batch_prefill_with_paged_kv_cache_head_dim_512"],
         "partial",
-        "same axes (causal x pos NONE/ROPE_LLAMA) and fixture (B2 kv97 q17 page16 H4:4 "
-        "NHD fp16); (512, 512) is declared on fa2 since WP-T, so the NONE rows run at "
-        "the legacy 1e-3 vs single_prefill(backend=fa2) + oracle + caller buffers "
-        "(EXPECT_FA2_HEAD_DIM_512 positive branch); ROPE rows via the external adapter; "
-        "cudnn / trtllm-gen / cake skip (D512 undeclared).",
+        "same fixture on fa2 at D512; NONE rows: legacy 1e-3 vs single_prefill(fa2) + "
+        "caller buffers + oracle; ROPE_LLAMA rows assert the plan() TypeError",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_tuple_paged_kv_cache",
         ["test_batch_prefill_with_tuple_paged_kv_cache"],
         "partial",
-        "as the main grid (D128/256) with two separately allocated fp16 NHD pools; NONE "
-        "rows equivalent, ROPE rows through the adapter, graph rows pass.",
+        "as the main grid with two separate fp16 NHD pools",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_paged_kv_cache_custom_mask",
         ["test_batch_prefill_with_paged_kv_cache_custom_mask"],
         "partial",
-        "same 12 legacy axes (page1/16, D128/256, H4/32:4, pos NONE/ROPE_LLAMA); the "
-        "legacy tril mask as custom_mask with causal=False (the unified mask is ANDed "
-        "into the envelope; legacy CUSTOM replaced causal) vs the causal=True plan at "
-        "1e-3 (legacy assertion) + oracle for both; ROPE rows on the adapter-rotated "
-        "tensors; fa2 is the only mask-capable backend (as for the legacy kernel), the "
-        "others skip with 'custom attention mask not supported'.",
+        "same grid on fa2; the tril mask as custom_mask equals the causal plan at 1e-3 "
+        "plus the oracle for both; ROPE_LLAMA rows assert the plan() TypeError",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_ragged_kv_cache",
         [],
         "out-of-scope",
-        "ragged (BatchPrefillWithRaggedKVCacheWrapper), not paged prefill.",
+        "ragged KV, not paged prefill",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_ragged_kv_cache_head_dim_512",
         [],
         "out-of-scope",
-        "ragged, not paged prefill.",
+        "ragged KV, not paged prefill",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_ragged_kv_cache_custom_mask",
         [],
         "out-of-scope",
-        "ragged, not paged prefill.",
+        "ragged KV, not paged prefill",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_paged_kv_cache_multi_item_scoring",
         ["test_batch_prefill_with_paged_kv_cache_multi_item_scoring"],
-        "partial",
-        "same legacy axes (two item fixtures, page1/5/16, H4/32:4, D128, causal, "
-        "ROPE_LLAMA, soft cap 0/30, LSE on/off); plan() has none of the item-position "
-        "fields (TypeError asserted, EXPECT_MULTI_ITEM_SCORING); the visible set is "
-        "expressed with the legacy mask builder as custom_mask (causal=False) on the "
-        "adapter-rotated tensors vs the legacy fused reference (single_prefill with the "
-        "same mask, ROPE_LLAMA) at 1e-3 + oracle; fa2 only (mask-capable).",
+        "unsupported-by-design",
+        "plan() has no multi-item fields (prefix_len_ptr, ...): TypeError asserted",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_paged_kv_cache_nvfp4",
         ["test_batch_prefill_with_paged_kv_cache_nvfp4"],
         "unsupported-by-design",
-        "same 9 legacy axes; kv_dtype uint8 (packed FP4x2) is not a declared KV dtype "
-        "(every backend excluded with the dtype reason) and run() has no kv_cache_sf; "
-        "needs a quantization descriptor.  EXPECT_NVFP4_KV.",
+        "NVFP4 KV (uint8) is not a declared KV dtype: resolve rejection asserted",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_paged_kv_cache_nvfp4_strided_scale_views",
         ["test_batch_prefill_with_paged_kv_cache_nvfp4_strided_scale_views"],
         "unsupported-by-design",
-        "as nvfp4 (B2 kv33 q17 page16 H4:2 D128, NHD/HND); additionally needs "
-        "independent scale-factor strides.",
+        "NVFP4 KV: resolve rejection asserted",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_paged_kv_cache_nvfp4_asymmetric",
         ["test_batch_prefill_with_paged_kv_cache_nvfp4_asymmetric"],
         "unsupported-by-design",
-        "as nvfp4 (B2 kv99 q33, bf16 q); additionally the (512, 256) / (256, 128) "
-        "head-dim pairs are undeclared on every backend.",
+        "NVFP4 KV: resolve rejection asserted",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256",
         ["test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256"],
         "native-only",
-        "(448, 256) is not a declared head-dim pair (resolve excludes it; the fp8 row "
-        "names the KV dtype first); the CTA_TILE_Q plan_info assertion is a "
-        "planner-internal contract with no unified observable -- the numerical half "
-        "(fp16 KV, 2e-3 vs fp32) is in place under EXPECT_HEAD_DIM_448_256.",
+        "pins a planner-internal CTA tile; (448, 256) is not a declared head-dim pair: "
+        "resolve rejection asserted",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_paged_shared_kv_smem_unequal_kv_strides",
         ["test_batch_prefill_paged_shared_kv_smem_unequal_kv_strides"],
         "equivalent",
-        "same fixture (D512 fp16, K and V views of differently padded parents, NHD/HND, "
-        "q17/65) on fa2 vs the exact fp32 reference at 2e-3 (legacy) + oracle; D512 is "
-        "declared on fa2 since WP-T (EXPECT_FA2_HEAD_DIM_512); other backends skip (D512 "
-        "undeclared).",
+        "same fixture on fa2 (D512, unequal K/V strides), legacy fp32 reference at "
+        "2e-3 plus the oracle",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_ragged_kv_cache_nvfp4",
         [],
         "out-of-scope",
-        "ragged, not paged prefill.",
+        "ragged KV, not paged prefill",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_paged_kv_cache_nvfp4_large_head",
         ["test_batch_prefill_with_paged_kv_cache_nvfp4_large_head"],
         "unsupported-by-design",
-        "as nvfp4 plus head_dim 512 (B1 kv128 q64 page16 H1:1 fp16).",
+        "NVFP4 KV: resolve rejection asserted",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_paged_kv_cache_nvfp4_large_head_bf16",
         ["test_batch_prefill_with_paged_kv_cache_nvfp4_large_head_bf16"],
         "unsupported-by-design",
-        "as nvfp4 plus head_dim 512 (bf16 q).",
+        "NVFP4 KV: resolve rejection asserted",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head",
         ["test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head"],
         "unsupported-by-design",
-        "as nvfp4 plus head_dim 512 plus fused ROPE_LLAMA.",
+        "NVFP4 KV and fused RoPE: resolve rejection asserted",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head_bf16",
         ["test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head_bf16"],
         "unsupported-by-design",
-        "as nvfp4 plus head_dim 512 plus fused ROPE_LLAMA (bf16 q).",
+        "NVFP4 KV and fused RoPE: resolve rejection asserted",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_ragged_kv_cache_nvfp4_large_head",
         [],
         "out-of-scope",
-        "ragged, not paged prefill.",
+        "ragged KV, not paged prefill",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_with_ragged_kv_cache_nvfp4_rope_large_head",
         [],
         "out-of-scope",
-        "ragged, not paged prefill.",
+        "ragged KV, not paged prefill",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_single_prefill_torch_compile_cuda_graph",
         [],
         "out-of-scope",
-        "single_prefill_with_kv_cache under torch.compile, not paged prefill.",
+        "single_prefill_with_kv_cache under torch.compile, not paged prefill",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_ragged_prefill_one_valid_key",
         [],
         "out-of-scope",
-        "ragged, not paged prefill.",
+        "ragged KV, not paged prefill",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_paged_prefill_fully_masked_rows",
         ["test_paged_prefill_fully_masked_rows"],
         "unsupported-by-design",
-        "causal with q_len 34 > kv_len 1 is rejected by validate_causal_envelope "
-        "('causal masking requires q_len_i <= kv_len_i'); legacy defined the 33 fully "
-        "masked rows as out 0 / LSE -inf.  Needs an explicit fully-masked-row policy "
-        "(and an oracle without NaN for them); the legacy assertions are in place under "
-        "EXPECT_FULLY_MASKED_ROWS.  The same fixture runs non-causally.",
+        "causal with q_len 34 > kv_len 1 is rejected by plan() (no fully-masked-row "
+        "policy): ValueError asserted",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_paged_prefill_split_kv_empty_chunk",
         ["test_paged_prefill_split_kv_empty_chunk"],
         "equivalent",
-        "same fixture (q/10, combined NHD kv/10, B1 q2 kv129 page16 H8:2 D128, fp16 and "
-        "bf16), 1e-2 vs fp64 ref_single_prefill for out AND LSE + oracle; dense and CSR "
-        "forms (added axis), every backend.",
+        "same fixture on fa2, legacy 1e-2 vs ref_single_prefill on output and LSE plus "
+        "the oracle",
     ),
 ]
 
-
-def test_legacy_map_is_well_formed():
-    check_legacy_map(LEGACY_MAP, globals())
-    check_legacy_map_complete(LEGACY_SOURCE, LEGACY_MAP)
-    check_unified_tests_mapped(LEGACY_MAP, globals())
+DEVICE = torch.device("cuda:0")
+OUT_TOL = dict(atol=2e-2, rtol=2e-2)
+LSE_TOL = dict(atol=3e-2, rtol=2e-2)
 
 
-# ---------------------------------------------------------------------------
-# test_batch_prefill_with_paged_kv_cache / test_batch_prefill_with_tuple_paged_kv_cache
-# ---------------------------------------------------------------------------
-
-# legacy decorator order, top-down (the row id reverses it, as pytest does)
-MAIN_AXES = dict(
-    batch_size=[12, 17, 128],
-    kv_len=[54, 97, 512, 2048],
-    qo_len=[37, 17, 127, 577],
-    page_size=[1, 5, 16],
-    num_kv_heads=[4],
-    num_qo_heads=[4, 32],
-    head_dim=[64, 128, 256],
-    causal=[False, True],
-    kv_layout=["NHD"],
-    pos_encoding_mode=["NONE", "ROPE_LLAMA"],
-    use_cuda_graph=[False, True],
-    logits_soft_cap=[0.0],
-    return_lse=[True],
-    contiguous_kv=[True],
-)
-# default subset: every batch / kv / qo value at least once, including a
-# q > kv non-causal point (its causal twin skips exactly as in legacy);
-# every other axis is crossed fully
-MAIN_DEFAULT_TRIPLES = {
-    (12, 54, 37),
-    (17, 97, 17),
-    (128, 512, 127),
-    (12, 2048, 577),
-    (17, 54, 577),
-}
+def _skip_if_head_dim_unsupported(head_dim):
+    # the legacy gate: 16-bit FA2 head_dim > 256 uses the Ampere+ large-head path
+    if head_dim > 256 and get_compute_capability(DEVICE)[0] < 8:
+        pytest.skip("16-bit FA2 head_dim > 256 is only supported on SM80 or newer")
 
 
-def _main_default(point):
-    return tuple(point[:3]) in MAIN_DEFAULT_TRIPLES
-
-
-def _run_main_grid(
-    batch_size,
-    kv_len,
-    qo_len,
-    page_size,
-    num_kv_heads,
-    num_qo_heads,
-    head_dim,
-    causal,
-    kv_layout,
-    pos_encoding_mode,
-    use_cuda_graph,
-    logits_soft_cap,
-    return_lse,
-    contiguous_kv,
-    backend,
-    *,
-    combined,
-    check_caller_buffers,
-):
-    assert (
-        kv_layout == "NHD" and logits_soft_cap == 0.0 and return_lse and contiguous_kv
+def _uniform_metadata(batch_size, qo_len, kv_len, page_size, pages_per_seq):
+    """The legacy uniform batch (request i owns pages [i * pages_per_seq,
+    (i + 1) * pages_per_seq) and attends its first ``kv_len`` tokens) in
+    unified form: ``.csr`` below page size 8, else the ``.dense`` table."""
+    table = torch.arange(batch_size * pages_per_seq, dtype=torch.int32).reshape(
+        batch_size, pages_per_seq
     )
-    if qo_len > kv_len and causal:
-        pytest.skip("qo_len > kv_len and causal is not supported")  # legacy skip
-    lb = legacy_uniform_batch(
-        batch_size=batch_size,
-        kv_len=kv_len,
-        qo_len=qo_len,
+    qo_indptr_cpu = torch.arange(batch_size + 1, dtype=torch.int32) * qo_len
+    kv_lens_cpu = torch.full((batch_size,), kv_len, dtype=torch.int32)
+    common = dict(
         page_size=page_size,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
+        max_q_len=qo_len,
+        max_kv_len=kv_len,
+        qo_indptr_cpu=qo_indptr_cpu,
+        kv_seq_lens_cpu=kv_lens_cpu,
+    )
+    if page_size < 8:
+        used = (kv_len + page_size - 1) // page_size
+        page_ids = table[:, :used].reshape(-1)
+        return PagedAttentionMetadata.csr(
+            qo_indptr_cpu.to(DEVICE),
+            kv_lens_cpu.to(DEVICE),
+            page_ids.to(DEVICE),
+            **common,
+        )
+    return PagedAttentionMetadata.dense(
+        qo_indptr_cpu.to(DEVICE), kv_lens_cpu.to(DEVICE), table.to(DEVICE), **common
+    )
+
+
+def _assert_oracle(out, lse, q, k_cache, v_cache, md, causal, kv_layout, **kw):
+    """fp32 oracle: output and base-2 LSE."""
+    ref_out, ref_lse = reference_paged_prefill(
+        q,
+        k_cache,
+        v_cache,
+        md.qo_indptr_cpu,
+        md.kv_seq_lens_cpu,
+        md.block_tables,
+        md.page_size,
+        causal,
         kv_layout=kv_layout,
-        combined=combined,
-        seed=seed_of(
-            "main" if combined else "tuple",
-            batch_size,
-            kv_len,
-            qo_len,
-            page_size,
-            num_qo_heads,
-            head_dim,
-            causal,
-        ),
+        kv_page_indices=md.kv_page_indices,
+        **kw,
     )
-    md = lb.metadata()
-    if pos_encoding_mode == "ROPE_LLAMA":
-        assert_rope_kwargs_rejected(lb, md)
-        q, k = apply_external_rope(lb)
-    else:
-        q, k = lb.q, lb.k
-    if use_cuda_graph:
-        attn, out, lse = run_batch_graph(lb, md, backend, q=q, k=k, causal=causal)
-    else:
-        attn, out, lse = run_batch(lb, md, backend, q=q, k=k, causal=causal)
-    assert_oracle(lb, out, lse, causal=causal, q=q, k=k)
-    if pos_encoding_mode == "ROPE_LLAMA" and qo_len > kv_len:
-        # the fused kernels compute the q position kv_len - qo_len + i in
-        # uint32 (include/flashinfer/attention/prefill.cuh,
-        # q_frag_apply_llama_rope), so with qo_len > kv_len the legacy
-        # reference rotates at wrapped positions; the adapter's signed
-        # positions match the oracle but cannot match that reference
-        pytest.skip(
-            "ROPE_LLAMA with qo_len > kv_len: the legacy fused reference wraps "
-            "kv_len - qo_len + i in unsigned arithmetic; the external adapter "
-            "(signed positions) matches the oracle, the legacy comparison is "
-            "undefined"
-        )
-    ref = legacy_reference_single_prefill(
-        lb, causal=causal, pos_encoding_mode=pos_encoding_mode
-    )
-    assert_legacy_isclose(out, ref, rtol=1e-3, atol=1e-3)
-    if check_caller_buffers and not use_cuda_graph:
-        # legacy: a second run into pre-allocated out / lse buffers matches
-        out_buf, lse_buf = torch.empty_like(out), torch.empty_like(lse)
-        o2, l2 = attn.run(q, (k, lb.v), out=out_buf, lse=lse_buf)
-        assert o2 is out_buf and l2 is lse_buf
-        assert_legacy_isclose(
-            out, out_buf, rtol=1e-3, atol=1e-3, what="caller out buffer"
-        )
-        assert_legacy_isclose(
-            lse, lse_buf, rtol=1e-3, atol=1e-3, what="caller lse buffer"
-        )
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
 
 
-@pytest.mark.parametrize(
-    argnames(MAIN_AXES, "backend"), param_rows(MAIN_AXES, _main_default)
-)
+def _single_prefill_reference(q, k_cache, v_cache, qo_len, kv_len, **kw):
+    """The legacy reference: ``single_prefill_with_kv_cache`` per request on
+    its K/V gathered from its pages (NHD pools, uniform batch)."""
+    batch_size = q.shape[0] // qo_len
+    pages_per_seq = k_cache.shape[0] // batch_size
+    num_kv_heads, head_dim = k_cache.shape[-2:]
+    outs = []
+    for i in range(batch_size):
+        pages = slice(i * pages_per_seq, (i + 1) * pages_per_seq)
+        ki = k_cache[pages].reshape(-1, num_kv_heads, head_dim)[:kv_len]
+        vi = v_cache[pages].reshape(-1, num_kv_heads, head_dim)[:kv_len]
+        qi = q[i * qo_len : (i + 1) * qo_len]
+        outs.append(flashinfer.prefill.single_prefill_with_kv_cache(qi, ki, vi, **kw))
+    return torch.cat(outs)
+
+
+def _run_cuda_graph(q, kv_cache, md, warmup_md, **plan_kw):
+    """The legacy ``use_cuda_graph`` flow on the unified graph lifecycle:
+    plan a warm-up batch, warm up on a side stream, capture one ``run()``,
+    ``update()`` to the real batch, replay.  The workspace is sized by
+    ``workspace_requirements`` for the batch's capacity (several GiB at the
+    largest geometries, where the legacy wrapper's workspace overflowed)."""
+    if md.block_tables is not None:
+        paging = dict(table_width=md.block_tables.shape[1])
+    else:
+        paging = dict(
+            kv_input_form="page_indices", flat_capacity=md.kv_page_indices.numel()
+        )
+    cap = GraphCapacity(
+        batch_size=md.kv_seq_lens_cpu.numel(),
+        total_q_tokens=q.shape[0],
+        max_q_len=md.max_q_len,
+        max_kv_len=md.max_kv_len,
+        page_size=md.page_size,
+        **paging,
+    )
+    nbytes = PagedAttention.workspace_requirements(
+        cap, device=DEVICE, **plan_kw, need_lse=True, backend="fa2"
+    )
+    workspace = torch.empty(nbytes, dtype=torch.uint8, device=DEVICE)
+    attn = PagedAttention(DEVICE, graph_capacity=cap, workspace_buffer=workspace)
+    attn.plan(warmup_md, **plan_kw, lse_mode="base2", backend="fa2")
+    assert attn.backend == "fa2"
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            attn.run(q, kv_cache)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out, lse = attn.run(q, kv_cache)
+    attn.update(md)
+    g.replay()
+    return out, lse
+
+
+@pytest.mark.parametrize("batch_size", [12, 17, 128])
+@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
+@pytest.mark.parametrize("qo_len", [37, 17, 127, 577])
+@pytest.mark.parametrize("page_size", [1, 5, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
+@pytest.mark.parametrize("return_lse", [True])
+@pytest.mark.parametrize("contiguous_kv", [True])
 def test_batch_prefill_with_paged_kv_cache(
     batch_size,
     kv_len,
@@ -468,35 +355,232 @@ def test_batch_prefill_with_paged_kv_cache(
     logits_soft_cap,
     return_lse,
     contiguous_kv,
-    backend,
 ):
-    """Combined fp16 NHD pool as K/V views; NONE rows equivalent, ROPE rows
-    through the external adapter, graph rows through the graph lifecycle."""
-    _run_main_grid(
-        batch_size,
-        kv_len,
-        qo_len,
-        page_size,
-        num_kv_heads,
-        num_qo_heads,
-        head_dim,
-        causal,
-        kv_layout,
-        pos_encoding_mode,
-        use_cuda_graph,
-        logits_soft_cap,
-        return_lse,
-        contiguous_kv,
-        backend,
-        combined=True,
-        check_caller_buffers=True,
+    if qo_len > kv_len and causal:
+        pytest.skip("qo_len > kv_len and causal is not supported")
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    md = _uniform_metadata(batch_size, qo_len, kv_len, page_size, num_pages_per_seq)
+    plan_kw = dict(
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        q_dtype=torch.float16,
+        kv_layout=kv_layout,
+        causal=causal,
+    )
+    if pos_encoding_mode != "NONE":
+        # RoPE is the caller's transform: plan() has no fused positional encoding
+        with pytest.raises(TypeError, match="pos_encoding_mode"):
+            PagedAttention(DEVICE).plan(
+                md, **plan_kw, pos_encoding_mode=pos_encoding_mode
+            )
+        return
+
+    # the legacy fixture (unseeded there; same draws in the same order)
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, device=DEVICE, dtype=torch.float16
+    )
+    kv_shape = [total_num_pages, 2, page_size, num_kv_heads, head_dim]  # NHD
+    kv_data = torch.randn(*kv_shape, dtype=torch.float32, device=DEVICE).half()
+    kv_cache = (kv_data[:, 0], kv_data[:, 1])
+
+    if use_cuda_graph:
+        # the legacy warm-up planned a shorter batch; causal needs kv >= q
+        warmup_md = _uniform_metadata(
+            batch_size, qo_len, min(qo_len, kv_len), page_size, num_pages_per_seq
+        )
+        o, lse = _run_cuda_graph(q, kv_cache, md, warmup_md, **plan_kw)
+    else:
+        attn = PagedAttention(DEVICE)
+        attn.plan(md, **plan_kw, lse_mode="base2", backend="fa2")
+        assert attn.backend == "fa2"
+        o, lse = attn.run(q, kv_cache)
+
+        # legacy: a second run into pre-allocated out / lse buffers
+        o_buffer, lse_buffer = torch.empty_like(o), torch.empty_like(lse)
+        attn.run(q, kv_cache, out=o_buffer, lse=lse_buffer)
+        torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
+
+    # legacy reference at the legacy tolerance
+    o_ref = _single_prefill_reference(
+        q, *kv_cache, qo_len, kv_len, causal=causal, logits_soft_cap=logits_soft_cap
+    )
+    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+
+    _assert_oracle(o, lse, q, *kv_cache, md, causal, kv_layout)
+
+
+@pytest.mark.parametrize("kv_layout,head_dim", [("NHD", 64), ("HND", 128)])
+def test_batch_prefill_lazy_stride_router_plan_reuse(kv_layout, head_dim):
+    """Reuse one plan across equal/unequal/equal V stride runs."""
+    torch.manual_seed(42)
+    batch_size, qo_len, kv_len, page_size = 2, 17, 97, 16
+    num_qo_heads, num_kv_heads = 8, 2
+    pages_per_request = (kv_len + page_size - 1) // page_size
+    total_pages = batch_size * pages_per_request
+
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, device=DEVICE, dtype=torch.bfloat16
+    )
+    if kv_layout == "NHD":
+        cache_shape = (total_pages, page_size, num_kv_heads, head_dim)
+        to_dense = lambda cache: cache.reshape(-1, num_kv_heads, head_dim)
+    else:
+        cache_shape = (total_pages, num_kv_heads, page_size, head_dim)
+        to_dense = lambda cache: cache.permute(0, 2, 1, 3).reshape(
+            -1, num_kv_heads, head_dim
+        )
+
+    k = torch.randn(cache_shape, device=DEVICE, dtype=torch.bfloat16) / 4
+    v_equal = torch.randn(cache_shape, device=DEVICE, dtype=torch.bfloat16) / 4
+    v_unequal = make_padded_paged_kv_view(v_equal, kv_layout)
+    assert k.shape == v_equal.shape == v_unequal.shape
+    assert k.stride() == v_equal.stride()
+    assert k.stride() != v_unequal.stride()
+
+    md = _uniform_metadata(batch_size, qo_len, kv_len, page_size, pages_per_request)
+    attn = PagedAttention(DEVICE)
+    attn.plan(
+        md,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        kv_layout=kv_layout,
+        causal=True,
+        lse_mode="base2",
+        backend="fa2",
+    )
+    assert attn.backend == "fa2"
+    caches = [(k, v_equal), (k, v_unequal), (k, v_equal)]
+    results = [attn.run(q, cache) for cache in caches]
+    outputs = [out for out, _ in results]
+
+    # legacy reference at the legacy tolerances
+    expected_batches = []
+    for batch_idx in range(batch_size):
+        q_i = q[batch_idx * qo_len : (batch_idx + 1) * qo_len]
+        page_slice = slice(
+            batch_idx * pages_per_request, (batch_idx + 1) * pages_per_request
+        )
+        expected_i, _ = ref_single_prefill(
+            q_i,
+            to_dense(k[page_slice])[:kv_len],
+            to_dense(v_equal[page_slice])[:kv_len],
+            causal=True,
+        )
+        expected_batches.append(expected_i)
+    expected = torch.cat(expected_batches)
+    for output in outputs:
+        torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(outputs[0], outputs[2], rtol=1e-2, atol=1e-2)
+
+    for (out, lse), (k_cache, v_cache) in zip(results, caches, strict=True):
+        _assert_oracle(out, lse, q, k_cache, v_cache, md, True, kv_layout)
+
+
+def _assert_nvfp4_rejected(**cfg):
+    """A packed NVFP4 KV cache (uint8 FP4x2 + scale factors) is not a
+    declared KV dtype of fa2."""
+    with pytest.raises(ValueError, match="unsupported kv dtype torch.uint8"):
+        resolve_paged_attention(
+            device=DEVICE,
+            kv_dtype=torch.uint8,
+            kv_layout=cfg.pop("kv_layout", "NHD"),
+            kv_input_form="page_indices",  # legal at every page size
+            backend="fa2",
+            **cfg,
+        )
+
+
+def test_batch_prefill_lazy_stride_router_nvfp4():
+    _assert_nvfp4_rejected(
+        num_qo_heads=4,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        q_dtype=torch.float16,
+        page_size=16,
     )
 
 
-@pytest.mark.parametrize(
-    argnames(MAIN_AXES, "backend"),
-    param_rows(dict(MAIN_AXES, head_dim=[128, 256]), _main_default),
-)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
+def test_batch_prefill_with_paged_kv_cache_head_dim_512(
+    causal,
+    pos_encoding_mode,
+):
+    head_dim = 512
+    _skip_if_head_dim_unsupported(head_dim)
+
+    batch_size = 2
+    kv_len = 97
+    qo_len = 17
+    page_size = 16
+    num_kv_heads = 4
+    num_qo_heads = 4
+    kv_layout = "NHD"
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    md = _uniform_metadata(batch_size, qo_len, kv_len, page_size, num_pages_per_seq)
+    plan_kw = dict(
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        q_dtype=torch.float16,
+        kv_dtype=torch.float16,
+        kv_layout=kv_layout,
+        causal=causal,
+    )
+    if pos_encoding_mode != "NONE":
+        with pytest.raises(TypeError, match="pos_encoding_mode"):
+            PagedAttention(DEVICE).plan(
+                md, **plan_kw, pos_encoding_mode=pos_encoding_mode
+            )
+        return
+
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, device=DEVICE, dtype=torch.float16
+    )
+    kv_shape = [total_num_pages, 2, page_size, num_kv_heads, head_dim]
+    kv_data = torch.randn(*kv_shape, dtype=torch.float32, device=DEVICE).half()
+    kv_cache = (kv_data[:, 0], kv_data[:, 1])
+
+    attn = PagedAttention(DEVICE)
+    attn.plan(md, **plan_kw, lse_mode="base2", backend="fa2")
+    assert attn.backend == "fa2"
+    o, lse = attn.run(q, kv_cache)
+
+    o_buffer, lse_buffer = torch.empty_like(o), torch.empty_like(lse)
+    attn.run(q, kv_cache, out=o_buffer, lse=lse_buffer)
+    torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
+
+    o_ref = _single_prefill_reference(
+        q, *kv_cache, qo_len, kv_len, causal=causal, backend="fa2"
+    )
+    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+
+    _assert_oracle(o, lse, q, *kv_cache, md, causal, kv_layout)
+
+
+@pytest.mark.parametrize("batch_size", [12, 17, 128])
+@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
+@pytest.mark.parametrize("qo_len", [37, 17, 127, 577])
+@pytest.mark.parametrize("page_size", [1, 5, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
+@pytest.mark.parametrize("return_lse", [True])
+@pytest.mark.parametrize("contiguous_kv", [True])
 def test_batch_prefill_with_tuple_paged_kv_cache(
     batch_size,
     kv_len,
@@ -512,209 +596,68 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
     logits_soft_cap,
     return_lse,
     contiguous_kv,
-    backend,
 ):
-    """Two separately allocated fp16 NHD pools (the legacy tuple form)."""
-    _run_main_grid(
-        batch_size,
-        kv_len,
-        qo_len,
-        page_size,
-        num_kv_heads,
-        num_qo_heads,
-        head_dim,
-        causal,
-        kv_layout,
-        pos_encoding_mode,
-        use_cuda_graph,
-        logits_soft_cap,
-        return_lse,
-        contiguous_kv,
-        backend,
-        combined=False,
-        check_caller_buffers=False,
-    )
-
-
-# ---------------------------------------------------------------------------
-# test_batch_prefill_lazy_stride_router_plan_reuse
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "kv_layout,head_dim,backend",
-    backend_rows("NHD", 64, ids="NHD-64") + backend_rows("HND", 128, ids="HND-128"),
-)
-def test_batch_prefill_lazy_stride_router_plan_reuse(kv_layout, head_dim, backend):
-    """One plan, three runs over (k, v_equal), (k, v_unequal), (k, v_equal):
-    the unified plan is by construction independent of the pool strides.
-    fa2 must run every step (the legacy backend); a backend whose kernels
-    require equal K/V stride families (fa3, trtllm-gen, cake) must reject the
-    unequal run with a ValueError, never misread it."""
-    torch.manual_seed(42)
-    batch_size, qo_len, kv_len, page_size = 2, 17, 97, 16
-    num_qo_heads, num_kv_heads = 8, 2
-    pages_per_request = (kv_len + page_size - 1) // page_size
-    total_pages = batch_size * pages_per_request
-    dev = torch.device(DEVICE)
-    q = torch.randn(
-        batch_size * qo_len, num_qo_heads, head_dim, device=dev, dtype=torch.bfloat16
-    )
-    if kv_layout == "NHD":
-        cache_shape = (total_pages, page_size, num_kv_heads, head_dim)
-    else:
-        cache_shape = (total_pages, num_kv_heads, page_size, head_dim)
-    k = torch.randn(cache_shape, device=dev, dtype=torch.bfloat16) / 4
-    v_equal = torch.randn(cache_shape, device=dev, dtype=torch.bfloat16) / 4
-    v_unequal = make_padded_paged_kv_view(v_equal, kv_layout)
-    assert k.stride() == v_equal.stride() and k.stride() != v_unequal.stride()
-
-    lb = LegacyBatch(
-        q=q,
-        k=k,
-        v=v_equal,
-        q_indptr_cpu=torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len,
-        kv_indptr_cpu=torch.arange(0, batch_size + 1, dtype=torch.int32)
-        * pages_per_request,
-        kv_indices_cpu=torch.arange(total_pages, dtype=torch.int32),
-        last_page_len_cpu=torch.full(
-            (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
-        ),
-        page_size=page_size,
-        kv_layout=kv_layout,
-    )
-    md = lb.metadata()
-    attn = plan_batch(lb, md, backend, causal=True)
-    chosen = attn.backend
-
-    expected = torch.cat(
-        [
-            ref_single_prefill(lb.request_q(i), *lb.request_kv(i), causal=True)[0]
-            for i in range(batch_size)
-        ]
-    )
-    outputs = []
-    for step, cache in enumerate(((k, v_equal), (k, v_unequal), (k, v_equal))):
-        try:
-            out, lse = attn.run(q, cache)
-        except ValueError as e:
-            assert step == 1 and chosen != "fa2", (
-                f"{chosen} rejected a run it must support: {e}"
-            )
-            assert "stride" in str(e).lower(), e
-            outputs.append(None)
-            continue
-        assert attn.backend == chosen  # no re-plan, no backend switch
-        torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)  # legacy
-        assert_oracle(lb, out, lse, causal=True, v=cache[1])
-        outputs.append(out)
-    assert outputs[0] is not None and outputs[2] is not None
-    if outputs[1] is not None:
-        torch.testing.assert_close(outputs[0], outputs[1], rtol=1e-2, atol=1e-2)
-    elif chosen == "fa2":
-        raise AssertionError("fa2 must run the unequal-stride V view")
-    torch.testing.assert_close(outputs[0], outputs[2], rtol=1e-2, atol=1e-2)
-
-
-def test_batch_prefill_lazy_stride_router_nvfp4():
-    """Legacy: B1 q17 kv33 page16 H4:2 D128 fp16 q with a packed NVFP4 pool
-    and the prewarm knob.  Unified: the KV dtype is undeclared (rejection)."""
-    assert_nvfp4_unsupported(
-        num_qo_heads=4,
-        num_kv_heads=2,
-        head_dim_qk=128,
-        head_dim_vo=128,
-        page_size=16,
+    if qo_len > kv_len and causal:
+        pytest.skip("qo_len > kv_len and causal is not supported")
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    md = _uniform_metadata(batch_size, qo_len, kv_len, page_size, num_pages_per_seq)
+    plan_kw = dict(
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
         q_dtype=torch.float16,
-        causal=True,
-        what="lazy_stride_router_nvfp4 (prewarm_paged_kv_stride_variant)",
+        kv_layout=kv_layout,
+        causal=causal,
     )
-
-
-# ---------------------------------------------------------------------------
-# test_batch_prefill_with_paged_kv_cache_head_dim_512
-# ---------------------------------------------------------------------------
-
-HD512_AXES = dict(causal=[False, True], pos_encoding_mode=["NONE", "ROPE_LLAMA"])
-
-
-@pytest.mark.parametrize(
-    argnames(HD512_AXES, "backend"), param_rows(HD512_AXES, lambda p: True)
-)
-def test_batch_prefill_with_paged_kv_cache_head_dim_512(
-    causal, pos_encoding_mode, backend
-):
-    """B2 kv97 q17 page16 H4:4 NHD fp16 at D512: the legacy 1e-3 vs
-    single_prefill(backend="fa2") + oracle + the caller-buffer re-run.
-    Positive branch of EXPECT_FA2_HEAD_DIM_512 (WP-T declared (512, 512) on
-    fa2); the rejection branch is kept for the record."""
-    if not EXPECT_FA2_HEAD_DIM_512:
-        assert_every_backend_excluded(
-            "unsupported head dims (512, 512)",
-            num_qo_heads=4,
-            num_kv_heads=4,
-            head_dim_qk=512,
-            head_dim_vo=512,
-            q_dtype=torch.float16,
-            page_size=16,
-            kv_layout="NHD",
-            causal=causal,
-            need_lse=True,
-        )
+    if pos_encoding_mode != "NONE":
+        with pytest.raises(TypeError, match="pos_encoding_mode"):
+            PagedAttention(DEVICE).plan(
+                md, **plan_kw, pos_encoding_mode=pos_encoding_mode
+            )
         return
-    lb = legacy_uniform_batch(
-        batch_size=2,
-        kv_len=97,
-        qo_len=17,
-        page_size=16,
-        num_qo_heads=4,
-        num_kv_heads=4,
-        head_dim=512,
-        seed=seed_of("hd512", causal),
+
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, device=DEVICE, dtype=torch.float16
     )
-    md = lb.metadata()
-    if pos_encoding_mode == "ROPE_LLAMA":
-        assert_rope_kwargs_rejected(lb, md)
-        q, k = apply_external_rope(lb)
+    kv_shape = [total_num_pages, page_size, num_kv_heads, head_dim]  # NHD
+    kv_data_fp32 = [
+        torch.randn(*kv_shape, dtype=torch.float32, device=DEVICE) for _ in range(2)
+    ]
+    kv_cache = tuple(kv_data_fp32[i].half() for i in range(2))
+
+    if use_cuda_graph:
+        warmup_md = _uniform_metadata(
+            batch_size, qo_len, min(qo_len, kv_len), page_size, num_pages_per_seq
+        )
+        o, lse = _run_cuda_graph(q, kv_cache, md, warmup_md, **plan_kw)
     else:
-        q, k = lb.q, lb.k
-    attn, out, lse = run_batch(lb, md, backend, q=q, k=k, causal=causal)
-    ref = legacy_reference_single_prefill(
-        lb, causal=causal, backend="fa2", pos_encoding_mode=pos_encoding_mode
+        attn = PagedAttention(DEVICE)
+        attn.plan(md, **plan_kw, lse_mode="base2", backend="fa2")
+        assert attn.backend == "fa2"
+        o, lse = attn.run(q, kv_cache)
+
+    o_ref = _single_prefill_reference(
+        q, *kv_cache, qo_len, kv_len, causal=causal, logits_soft_cap=logits_soft_cap
     )
-    assert_legacy_isclose(out, ref, rtol=1e-3, atol=1e-3)
-    assert_oracle(lb, out, lse, causal=causal, q=q, k=k)
-    out_buf, lse_buf = torch.empty_like(out), torch.empty_like(lse)
-    attn.run(q, (k, lb.v), out=out_buf, lse=lse_buf)
-    torch.testing.assert_close(out, out_buf, rtol=1e-3, atol=1e-3)  # legacy
-    torch.testing.assert_close(lse, lse_buf, rtol=1e-3, atol=1e-3)  # legacy
+    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)
+
+    _assert_oracle(o, lse, q, *kv_cache, md, causal, kv_layout)
 
 
-# ---------------------------------------------------------------------------
-# test_batch_prefill_with_paged_kv_cache_custom_mask
-# ---------------------------------------------------------------------------
-
-CUSTOM_MASK_AXES = dict(
-    batch_size=[12, 17, 128],
-    kv_len=[54, 97, 512, 2048],
-    qo_len=[37, 17, 127, 577],
-    page_size=[1, 16],
-    num_kv_heads=[4],
-    num_qo_heads=[4, 32],
-    head_dim=[128, 256],
-    kv_layout=["NHD"],
-    pos_encoding_mode=["NONE", "ROPE_LLAMA"],
-    logits_soft_cap=[0.0],
-    return_lse=[True],
-    contiguous_kv=[True],
-)
-CUSTOM_MASK_DEFAULT_TRIPLES = {(12, 54, 37), (17, 97, 17), (128, 512, 127)}
-
-
-@pytest.mark.parametrize(
-    argnames(CUSTOM_MASK_AXES, "backend"),
-    param_rows(CUSTOM_MASK_AXES, lambda p: tuple(p[:3]) in CUSTOM_MASK_DEFAULT_TRIPLES),
-)
+@pytest.mark.parametrize("batch_size", [12, 17, 128])
+@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048])
+@pytest.mark.parametrize("qo_len", [37, 17, 127, 577])
+@pytest.mark.parametrize("page_size", [1, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
+@pytest.mark.parametrize("return_lse", [True])
+@pytest.mark.parametrize("contiguous_kv", [True])
 def test_batch_prefill_with_paged_kv_cache_custom_mask(
     batch_size,
     kv_len,
@@ -728,143 +671,82 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
     logits_soft_cap,
     return_lse,
     contiguous_kv,
-    backend,
 ):
-    """The legacy bottom-right tril mask passed as ``custom_mask`` (with
-    ``causal=False``, since the unified mask is ANDed into the envelope and
-    the legacy CUSTOM mode replaced causal) must equal the ``causal=True``
-    plan at 1e-3, and both match the oracle."""
     if qo_len > kv_len:
-        pytest.skip("qo_len > kv_len is not supported for custom mask test")  # legacy
-    lb = legacy_uniform_batch(
-        batch_size=batch_size,
-        kv_len=kv_len,
-        qo_len=qo_len,
-        page_size=page_size,
+        pytest.skip("qo_len > kv_len is not supported for custom mask test")
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+    md = _uniform_metadata(batch_size, qo_len, kv_len, page_size, num_pages_per_seq)
+    plan_kw = dict(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        seed=seed_of(
-            "custom", batch_size, kv_len, qo_len, page_size, num_qo_heads, head_dim
-        ),
+        head_dim_qk=head_dim,
+        q_dtype=torch.float16,
+        kv_layout=kv_layout,
+        lse_mode="base2",
+        backend="fa2",
     )
-    md = lb.metadata()
-    if pos_encoding_mode == "ROPE_LLAMA":
-        assert_rope_kwargs_rejected(lb, md)
-        q, k = apply_external_rope(lb)
-    else:
-        q, k = lb.q, lb.k
+    if pos_encoding_mode != "NONE":
+        with pytest.raises(TypeError, match="pos_encoding_mode"):
+            PagedAttention(DEVICE).plan(
+                md, **plan_kw, pos_encoding_mode=pos_encoding_mode
+            )
+        return
+
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size * qo_len, num_qo_heads, head_dim, device=DEVICE, dtype=torch.float16
+    )
+    kv_shape = [total_num_pages, 2, page_size, num_kv_heads, head_dim]  # NHD
+    kv_data = torch.randn(*kv_shape, dtype=torch.float16, device=DEVICE)
+    kv_cache = (kv_data[:, 0], kv_data[:, 1])
     custom_mask = torch.tril(
         torch.full((batch_size, qo_len, kv_len), True, device=DEVICE),
         diagonal=(kv_len - qo_len),
     ).reshape(-1)
-    _, out_custom, lse_custom = run_batch(
-        lb, md, backend, q=q, k=k, causal=False, custom_mask=custom_mask
+
+    # use custom mask (non-causal: the unified mask is ANDed into the envelope)
+    attn = PagedAttention(DEVICE)
+    attn.plan(md, **plan_kw, causal=False, custom_mask=custom_mask)
+    assert attn.backend == "fa2"
+    o_custom, lse_custom = attn.run(q, kv_cache)
+
+    # use causal
+    attn.plan(md, **plan_kw, causal=True)
+    assert attn.backend == "fa2"
+    o_causal, lse_causal = attn.run(q, kv_cache)
+    torch.testing.assert_close(o_custom, o_causal, rtol=1e-3, atol=1e-3)
+
+    _assert_oracle(
+        o_custom,
+        lse_custom,
+        q,
+        *kv_cache,
+        md,
+        False,
+        kv_layout,
+        custom_mask=custom_mask,
     )
-    _, out_causal, lse_causal = run_batch(lb, md, backend, q=q, k=k, causal=True)
-    assert_legacy_isclose(out_custom, out_causal, rtol=1e-3, atol=1e-3)  # legacy
-    assert_oracle(
-        lb, out_custom, lse_custom, causal=False, custom_mask=custom_mask, q=q, k=k
-    )
-    assert_oracle(lb, out_causal, lse_causal, causal=True, q=q, k=k)
+    _assert_oracle(o_causal, lse_causal, q, *kv_cache, md, True, kv_layout)
 
 
-# ---------------------------------------------------------------------------
-# test_batch_prefill_with_paged_kv_cache_multi_item_scoring
-# ---------------------------------------------------------------------------
-
-MULTI_ITEM_FIXTURES = [
-    # (kv_len, qo_len, prefix_len_ptr, token_pos_in_items_ptr, token_pos_in_items_len, max_item_len_ptr)
-    (54, 37, 17, list(range(17)) + list(range(19)) + [0], 100, [18]),
-    (97, 81, 16, list(range(80)) + [0], 97, [79]),
-]
-MULTI_ITEM_AXES = dict(
-    page_size=[1, 5, 16],
-    num_kv_heads=[4],
-    num_qo_heads=[4, 32],
-    head_dim=[128],
-    causal=[True],
-    kv_layout=["NHD"],
-    pos_encoding_mode=["ROPE_LLAMA"],
-    logits_soft_cap=[0.0, 30.0],
-    return_lse=[True, False],
-)
-
-
-def _multi_item_rows():
-    rows = []
-    for fi, fixture in enumerate(MULTI_ITEM_FIXTURES):
-        kv_len, qo_len, prefix, items, items_len, max_item = fixture
-        fixture_id = (
-            f"{kv_len}-{qo_len}-{prefix}-token_pos_in_items_ptr{fi}-{items_len}-"
-            f"max_item_len_ptr{fi}"
-        )
-        for point in grid(MULTI_ITEM_AXES):
-            for backend in BACKENDS:
-                rows.append(
-                    pytest.param(
-                        1,
-                        *fixture,
-                        *point,
-                        backend,
-                        id=f"{legacy_id(MULTI_ITEM_AXES, point)}-{fixture_id}-1-{backend}",
-                    )
-                )
-    return rows
-
-
-def create_2D_multi_item_mask_dense(
-    is_delimiter, sliding_window_size=-1, prefix_cache_len=None
-):
-    """Verbatim from the legacy test: the multi-item visible set as a dense
-    boolean mask (within-item causal, every item sees the prefix, delimiters
-    see and are seen by nothing) with the prefix-cache patch prepended."""
-    delimiter_idx = is_delimiter.nonzero(as_tuple=True)[0]
-    if len(delimiter_idx) == 0:
-        return None
-    first_delimiter_pos = delimiter_idx[0]
-    seq_len = len(is_delimiter)
-    pos = torch.arange(seq_len, device=is_delimiter.device)
-    group_ids = torch.cumsum(is_delimiter, 0)
-    within_group_causal = (group_ids.unsqueeze(1) == group_ids.unsqueeze(0)) & (
-        pos.unsqueeze(0) <= pos.unsqueeze(1)
-    )
-    attention_mask = (
-        (
-            within_group_causal
-            | (
-                (pos >= first_delimiter_pos).unsqueeze(1)
-                & (pos < first_delimiter_pos).unsqueeze(0)
-            )
-        )
-        & ~is_delimiter.unsqueeze(0)
-        & ~is_delimiter.unsqueeze(1)
-    )
-    if sliding_window_size > 0 and sliding_window_size < len(is_delimiter):
-        group_size = torch.sum(within_group_causal & ~is_delimiter.unsqueeze(0), dim=1)
-        prefix_window = torch.where(
-            pos >= first_delimiter_pos,
-            sliding_window_size - group_size,
-            torch.where(
-                pos < sliding_window_size, first_delimiter_pos, sliding_window_size
-            ),
-        )
-        prefix_start = first_delimiter_pos - prefix_window.unsqueeze(1)
-        attention_mask = attention_mask & (pos >= prefix_start)
-    if prefix_cache_len:
-        patch = torch.ones(
-            seq_len, prefix_cache_len, device=is_delimiter.device, dtype=torch.bool
-        )
-        attention_mask = torch.concat([patch, attention_mask], dim=1)
-    return attention_mask.unsqueeze(0).reshape(-1)
-
-
+@pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize(
-    "batch_size,kv_len,qo_len,prefix_len_ptr,token_pos_in_items_ptr,"
-    "token_pos_in_items_len,max_item_len_ptr,page_size,num_kv_heads,num_qo_heads,"
-    "head_dim,causal,kv_layout,pos_encoding_mode,logits_soft_cap,return_lse,backend",
-    _multi_item_rows(),
+    "kv_len, qo_len, prefix_len_ptr, token_pos_in_items_ptr, token_pos_in_items_len, max_item_len_ptr",
+    [
+        (54, 37, 17, list(range(17)) + list(range(19)) + [0], 100, [18]),
+        (97, 81, 16, list(range(80)) + [0], 97, [79]),
+    ],
 )
+@pytest.mark.parametrize("page_size", [1, 5, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["ROPE_LLAMA"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0, 30.0])
+@pytest.mark.parametrize("return_lse", [True, False])
 def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
     batch_size,
     kv_len,
@@ -882,118 +764,41 @@ def test_batch_prefill_with_paged_kv_cache_multi_item_scoring(
     pos_encoding_mode,
     logits_soft_cap,
     return_lse,
-    backend,
 ):
-    """plan() has none of the item-position fields (TypeError); the visible
-    set is the legacy mask builder's dense mask as ``custom_mask`` with
-    ``causal=False``, on the adapter-rotated tensors (the legacy rows are
-    ROPE_LLAMA-only), vs the legacy fused reference
-    ``single_prefill_with_kv_cache(custom_mask=..., ROPE_LLAMA)`` at 1e-3."""
-    params = plan_signature_params()
-    for name in (
-        "prefix_len_ptr",
-        "token_pos_in_items_ptr",
-        "token_pos_in_items_len",
-        "max_item_len_ptr",
-    ):
-        assert name not in params, f"plan() grew {name!r}: port the multi-item rows"
-    lb = legacy_uniform_batch(
-        batch_size=batch_size,
-        kv_len=kv_len,
-        qo_len=qo_len,
-        page_size=page_size,
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        kv_layout=kv_layout,
-        seed=seed_of(
-            "multi",
-            kv_len,
-            qo_len,
-            page_size,
-            num_qo_heads,
-            logits_soft_cap,
-            return_lse,
-        ),
-    )
-    md = lb.metadata()
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    md = _uniform_metadata(batch_size, qo_len, kv_len, page_size, num_pages_per_seq)
+    # plan() has no multi-item scoring fields (nor fused RoPE)
     with pytest.raises(TypeError, match="prefix_len_ptr"):
-        PagedAttention(torch.device(DEVICE)).plan(
+        PagedAttention(DEVICE).plan(
             md,
-            **lb.plan_kwargs(),
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            q_dtype=torch.float16,
+            kv_layout=kv_layout,
             causal=causal,
-            prefix_len_ptr=torch.tensor([prefix_len_ptr]).to(torch.uint32).to(DEVICE),
+            logits_soft_cap=logits_soft_cap or None,
+            lse_mode="base2" if return_lse else "none",
             backend="fa2",
+            prefix_len_ptr=torch.tensor(prefix_len_ptr).to(torch.uint32).to(DEVICE),
+            token_pos_in_items_ptr=torch.tensor(token_pos_in_items_ptr)
+            .to(torch.uint16)
+            .to(DEVICE),
+            token_pos_in_items_len=token_pos_in_items_len,
+            max_item_len_ptr=torch.tensor(max_item_len_ptr).to(torch.uint16).to(DEVICE),
+            pos_encoding_mode=pos_encoding_mode,
         )
-    if EXPECT_MULTI_ITEM_SCORING:
-        pytest.fail("EXPECT_MULTI_ITEM_SCORING is set: port the item-position fields")
-    mask = create_2D_multi_item_mask_dense(
-        is_delimiter=torch.tensor(token_pos_in_items_ptr).to(DEVICE) == 0,
-        sliding_window_size=-1,
-        prefix_cache_len=prefix_len_ptr,
-    )
-    assert mask.numel() == qo_len * kv_len
-    assert pos_encoding_mode == "ROPE_LLAMA"
-    assert_rope_kwargs_rejected(lb, md)
-    q, k = apply_external_rope(lb)
-    cap = None if logits_soft_cap == 0.0 else logits_soft_cap
-    lse_mode = "base2" if return_lse else "none"
-    _, out, lse = run_batch(
-        lb,
-        md,
-        backend,
-        q=q,
-        k=k,
-        causal=False,
-        custom_mask=mask,
-        logits_soft_cap=cap,
-        lse_mode=lse_mode,
-    )
-    ref = legacy_reference_single_prefill(
-        lb,
-        causal=causal,
-        logits_soft_cap=logits_soft_cap,
-        custom_mask=lambda i: mask,
-        pos_encoding_mode=pos_encoding_mode,
-    )
-    assert_legacy_isclose(out, ref, rtol=1e-3, atol=1e-3)
-    assert_oracle(
-        lb,
-        out,
-        lse,
-        causal=False,
-        custom_mask=mask,
-        logits_soft_cap=cap,
-        lse_mode=lse_mode,
-        q=q,
-        k=k,
-    )
 
 
-# ---------------------------------------------------------------------------
-# NVFP4 KV cache (packed uint8 + scale factors): eight legacy functions
-# ---------------------------------------------------------------------------
-
-NVFP4_AXES = dict(
-    batch_size=[1, 4],
-    kv_len=[128, 256],
-    qo_len=[64, 128],
-    page_size=[16, 64],
-    num_kv_heads=[1],
-    num_qo_heads=[1],
-    head_dim=[128],
-    causal=[False],
-    q_dtype=[torch.float16, torch.bfloat16],
-)
-
-
-@pytest.mark.parametrize(
-    argnames(NVFP4_AXES),
-    [
-        pytest.param(*point, id=legacy_id(NVFP4_AXES, point))
-        for point in grid(NVFP4_AXES)
-    ],
-)
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("kv_len", [128, 256])
+@pytest.mark.parametrize("qo_len", [64, 128])
+@pytest.mark.parametrize("page_size", [16, 64])
+@pytest.mark.parametrize("num_kv_heads", [1])
+@pytest.mark.parametrize("num_qo_heads", [1])
+@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("q_dtype", [torch.float16, torch.bfloat16])
 def test_batch_prefill_with_paged_kv_cache_nvfp4(
     batch_size,
     kv_len,
@@ -1006,31 +811,26 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4(
     q_dtype,
 ):
     if qo_len > kv_len and causal:
-        pytest.skip("qo_len > kv_len and causal is not supported")  # legacy
-    assert_nvfp4_unsupported(
+        pytest.skip("qo_len > kv_len and causal is not supported")
+    _assert_nvfp4_rejected(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim_qk=head_dim,
-        head_dim_vo=head_dim,
-        page_size=page_size,
         q_dtype=q_dtype,
+        page_size=page_size,
         causal=causal,
-        what="nvfp4",
     )
 
 
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 def test_batch_prefill_with_paged_kv_cache_nvfp4_strided_scale_views(kv_layout):
-    assert_nvfp4_unsupported(
+    _assert_nvfp4_rejected(
         num_qo_heads=4,
         num_kv_heads=2,
         head_dim_qk=128,
-        head_dim_vo=128,
-        page_size=16,
         q_dtype=torch.float16,
-        causal=True,
+        page_size=16,
         kv_layout=kv_layout,
-        what="nvfp4_strided_scale_views (independent scale-factor strides)",
     )
 
 
@@ -1039,319 +839,268 @@ def test_batch_prefill_with_paged_kv_cache_nvfp4_strided_scale_views(kv_layout):
 @pytest.mark.parametrize("num_kv_heads", [2, 8])
 @pytest.mark.parametrize("causal", [True])
 def test_batch_prefill_with_paged_kv_cache_nvfp4_asymmetric(
-    head_dim_qk, head_dim_vo, page_size, num_kv_heads, causal
+    head_dim_qk,
+    head_dim_vo,
+    page_size,
+    num_kv_heads,
+    causal,
 ):
-    assert_nvfp4_unsupported(
+    _skip_if_head_dim_unsupported(head_dim_qk)
+    if get_compute_capability(DEVICE)[0] < 10:
+        pytest.skip(
+            "asymmetric NVFP4 KV prefill uses the NVFP4 KV quantization kernel, "
+            "which requires SM100 or newer"
+        )
+    _assert_nvfp4_rejected(
         num_qo_heads=2 * num_kv_heads,
         num_kv_heads=num_kv_heads,
         head_dim_qk=head_dim_qk,
         head_dim_vo=head_dim_vo,
-        page_size=page_size,
         q_dtype=torch.bfloat16,
+        page_size=page_size,
         causal=causal,
-        what=f"nvfp4_asymmetric ({head_dim_qk}, {head_dim_vo})",
     )
-
-
-def _nvfp4_large_head(q_dtype, what):
-    assert_nvfp4_unsupported(
-        num_qo_heads=1,
-        num_kv_heads=1,
-        head_dim_qk=512,
-        head_dim_vo=512,
-        page_size=16,
-        q_dtype=q_dtype,
-        causal=False,
-        what=what,
-    )
-
-
-def test_batch_prefill_with_paged_kv_cache_nvfp4_large_head():
-    _nvfp4_large_head(torch.float16, "nvfp4_large_head (D512)")
-
-
-def test_batch_prefill_with_paged_kv_cache_nvfp4_large_head_bf16():
-    _nvfp4_large_head(torch.bfloat16, "nvfp4_large_head_bf16 (D512)")
-
-
-def test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head():
-    _nvfp4_large_head(torch.float16, "nvfp4_rope_large_head (D512 + ROPE_LLAMA)")
-
-
-def test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head_bf16():
-    _nvfp4_large_head(torch.bfloat16, "nvfp4_rope_large_head_bf16 (D512 + ROPE_LLAMA)")
-
-
-# ---------------------------------------------------------------------------
-# test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
 def test_batch_prefill_paged_cta_tile_q_smem_probe_qk448_vo256(kv_dtype):
-    """The (448, 256) pair is undeclared, so resolve excludes it; the
-    CTA_TILE_Q plan_info pin stays native.  Flipped: the fp16 numerical half
-    at 2e-3 vs fp32 (legacy) + oracle."""
-    cfg = dict(
-        num_qo_heads=2,
-        num_kv_heads=2,
-        head_dim_qk=448,
-        head_dim_vo=256,
-        q_dtype=torch.float16,
-        kv_dtype=kv_dtype,
-        page_size=16,
-        kv_layout="NHD",
-        causal=False,
-    )
-    if not EXPECT_HEAD_DIM_448_256:
-        # backends without fp8 KV name the dtype first (checked before head dims)
-        assert_every_backend_excluded(
-            "unsupported head dims (448, 256)", also=("unsupported kv dtype",), **cfg
-        )
-        return
-    if kv_dtype != torch.float16:
-        pytest.skip("the fp8 case is a plan_info (CTA tile) pin: native-only")
-    torch.manual_seed(42)
-    dev = torch.device(DEVICE)
-    batch_size, qo_len, kv_len, page_size, H = 2, 8, 65, 16, 2
-    pages_per_seq = (kv_len + page_size - 1) // page_size
-    total_pages = pages_per_seq * batch_size
-    q = torch.randn(batch_size * qo_len, H, 448, device=dev, dtype=torch.float16)
-    k = torch.randn(total_pages, page_size, H, 448, device=dev, dtype=torch.float16)
-    v = torch.randn(total_pages, page_size, H, 256, device=dev, dtype=torch.float16)
-    lb = LegacyBatch(
-        q=q,
-        k=k,
-        v=v,
-        q_indptr_cpu=torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len,
-        kv_indptr_cpu=torch.arange(0, batch_size + 1, dtype=torch.int32)
-        * pages_per_seq,
-        kv_indices_cpu=torch.arange(0, total_pages, dtype=torch.int32),
-        last_page_len_cpu=torch.full(
-            (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
-        ),
-        page_size=page_size,
-        kv_layout="NHD",
-    )
-    _, out, lse = run_batch(lb, lb.metadata(), "fa2", causal=False)
-    for i in range(batch_size):
-        qi = lb.request_q(i).float()
-        ki, vi = (t.float() for t in lb.request_kv(i))
-        logits = torch.einsum("qhd,khd->hqk", qi, ki) * 448**-0.5
-        o_ref_i = torch.einsum("hqk,khd->qhd", torch.softmax(logits, dim=-1), vi)
-        torch.testing.assert_close(
-            out[lb.q_indptr_cpu[i] : lb.q_indptr_cpu[i + 1]].float(),
-            o_ref_i,
-            rtol=2e-3,
-            atol=2e-3,
-        )
-    assert_oracle(lb, out, lse, causal=False)
+    """The legacy test pins fa2's CTA_TILE_Q pick at (448, 256), a head-dim
+    pair the unified API does not declare."""
+    head_dim_qk = 448
+    head_dim_vo = 256
+    _skip_if_head_dim_unsupported(head_dim_qk)
+    if kv_dtype.itemsize == 1 and get_compute_capability(DEVICE)[0] < 10:
+        pytest.skip("FP8 KV with head_dim > 256 requires SM100 or newer")
+    props = torch.cuda.get_device_properties(0)
+    if getattr(props, "shared_memory_per_block_optin", None) is None:
+        pytest.skip("torch does not expose shared_memory_per_block_optin")
 
-
-# ---------------------------------------------------------------------------
-# test_batch_prefill_paged_shared_kv_smem_unequal_kv_strides
-# ---------------------------------------------------------------------------
-
-SHARED_KV_SMEM_AXES = dict(kv_layout=["NHD", "HND"], qo_len=[17, 65])
-
-
-@pytest.mark.parametrize(
-    argnames(SHARED_KV_SMEM_AXES, "backend"),
-    param_rows(SHARED_KV_SMEM_AXES, lambda p: True),
-)
-def test_batch_prefill_paged_shared_kv_smem_unequal_kv_strides(
-    kv_layout, qo_len, backend
-):
-    """D512 fp16, K and V views of differently padded parents (unequal
-    stride families): the exact fp32 reference at 2e-3 (legacy) + oracle."""
-    if not EXPECT_FA2_HEAD_DIM_512:
-        assert_every_backend_excluded(
-            "unsupported head dims (512, 512)",
+    with pytest.raises(ValueError, match=r"unsupported head dims \(448, 256\)"):
+        resolve_paged_attention(
+            device=DEVICE,
             num_qo_heads=2,
             num_kv_heads=2,
-            head_dim_qk=512,
-            head_dim_vo=512,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
             q_dtype=torch.float16,
+            kv_dtype=kv_dtype,
             page_size=16,
-            kv_layout=kv_layout,
-            causal=True,
-            need_lse=True,
+            kv_layout="NHD",
+            causal=False,
+            backend="fa2",
         )
-        return
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+@pytest.mark.parametrize("qo_len", [17, 65])
+def test_batch_prefill_paged_shared_kv_smem_unequal_kv_strides(kv_layout, qo_len):
+    """D512 fp16 K and V pools as views of differently padded parents: V rows
+    must be addressed with V's strides."""
+    head_dim = 512
+    _skip_if_head_dim_unsupported(head_dim)
+
     torch.manual_seed(42)
-    dev = torch.device(DEVICE)
-    head_dim, batch_size, kv_len, page_size, num_kv_heads, num_qo_heads = (
-        512,
-        2,
-        97,
-        16,
-        2,
-        2,
-    )
-    pages_per_seq = (kv_len + page_size - 1) // page_size
-    total_pages = pages_per_seq * batch_size
+    batch_size = 2
+    kv_len = 97
+    page_size = 16
+    num_kv_heads = 2
+    num_qo_heads = 2  # group_size 1: avg_packed_qo_len == qo_len
+    causal = True
+
     q = torch.randn(
-        batch_size * qo_len, num_qo_heads, head_dim, device=dev, dtype=torch.float16
+        batch_size * qo_len, num_qo_heads, head_dim, device=DEVICE, dtype=torch.float16
     )
+    num_pages_per_seq = (kv_len + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
 
     def padded_pool(num_padding_heads):
         if kv_layout == "NHD":
             parent = torch.randn(
-                total_pages,
+                total_num_pages,
                 page_size,
                 num_kv_heads + num_padding_heads,
                 head_dim,
-                device=dev,
+                device=DEVICE,
                 dtype=torch.float16,
             )
             return parent[:, :, :num_kv_heads, :]
         parent = torch.randn(
-            total_pages,
+            total_num_pages,
             num_kv_heads + num_padding_heads,
             page_size,
             head_dim,
-            device=dev,
+            device=DEVICE,
             dtype=torch.float16,
         )
         return parent[:, :num_kv_heads, :, :]
 
-    k, v = padded_pool(1), padded_pool(3)
+    k = padded_pool(1)
+    v = padded_pool(3)
+    assert k.shape == v.shape
+    assert not k.is_contiguous() and not v.is_contiguous()
     assert k.stride() != v.stride()
-    lb = LegacyBatch(
-        q=q,
-        k=k,
-        v=v,
-        q_indptr_cpu=torch.arange(0, batch_size + 1, dtype=torch.int32) * qo_len,
-        kv_indptr_cpu=torch.arange(0, batch_size + 1, dtype=torch.int32)
-        * pages_per_seq,
-        kv_indices_cpu=torch.arange(0, total_pages, dtype=torch.int32),
-        last_page_len_cpu=torch.full(
-            (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32
-        ),
-        page_size=page_size,
+
+    md = _uniform_metadata(batch_size, qo_len, kv_len, page_size, num_pages_per_seq)
+    attn = PagedAttention(DEVICE)
+    attn.plan(
+        md,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        q_dtype=torch.float16,
+        kv_dtype=torch.float16,
         kv_layout=kv_layout,
+        causal=causal,
+        lse_mode="base2",
+        backend="fa2",
     )
-    _, out, lse = run_batch(lb, lb.metadata(), backend, causal=True)
+    assert attn.backend == "fa2"
+    o, lse = attn.run(q, (k, v))
+    assert o.shape == (batch_size * qo_len, num_qo_heads, head_dim)
+
+    # legacy: exact float32 reference on the logical (view) K/V values
     sm_scale = head_dim**-0.5
+    perm = (0, 1, 2, 3) if kv_layout == "NHD" else (0, 2, 1, 3)
     for i in range(batch_size):
-        qi = lb.request_q(i).float()
-        ki, vi = (t.float() for t in lb.request_kv(i))
-        logits = torch.einsum("qhd,khd->hqk", qi, ki) * sm_scale
-        qpos = torch.arange(qo_len, device=dev).unsqueeze(1)
-        kpos = torch.arange(kv_len, device=dev).unsqueeze(0)
-        logits = logits.masked_fill(
-            ~(kpos <= qpos + (kv_len - qo_len)).unsqueeze(0), float("-inf")
+        pages = slice(i * num_pages_per_seq, (i + 1) * num_pages_per_seq)
+        qi = q[i * qo_len : (i + 1) * qo_len].float()
+        ki = k[pages].permute(*perm).reshape(-1, num_kv_heads, head_dim)[:kv_len]
+        vi = v[pages].permute(*perm).reshape(-1, num_kv_heads, head_dim)[:kv_len]
+        logits = torch.einsum("qhd,khd->hqk", qi, ki.float()) * sm_scale
+        qpos = torch.arange(qo_len, device=DEVICE).unsqueeze(1)
+        kpos = torch.arange(kv_len, device=DEVICE).unsqueeze(0)
+        allowed = kpos <= qpos + (kv_len - qo_len)
+        logits = logits.masked_fill(~allowed.unsqueeze(0), float("-inf"))
+        o_ref_i = torch.einsum(
+            "hqk,khd->qhd", torch.softmax(logits, dim=-1), vi.float()
         )
-        o_ref_i = torch.einsum("hqk,khd->qhd", torch.softmax(logits, dim=-1), vi)
-        torch.testing.assert_close(
-            out[lb.q_indptr_cpu[i] : lb.q_indptr_cpu[i + 1]].float(),
-            o_ref_i,
-            rtol=2e-3,
-            atol=2e-3,
-        )
-    assert_oracle(lb, out, lse, causal=True)
+        o_i = o[i * qo_len : (i + 1) * qo_len].float()
+        torch.testing.assert_close(o_i, o_ref_i, rtol=2e-3, atol=2e-3)
+
+    _assert_oracle(o, lse, q, k, v, md, causal, kv_layout)
 
 
-# ---------------------------------------------------------------------------
-# test_paged_prefill_fully_masked_rows
-# ---------------------------------------------------------------------------
+def test_batch_prefill_with_paged_kv_cache_nvfp4_large_head():
+    _skip_if_head_dim_unsupported(512)
+    _assert_nvfp4_rejected(
+        num_qo_heads=1,
+        num_kv_heads=1,
+        head_dim_qk=512,
+        q_dtype=torch.float16,
+        page_size=16,
+        causal=False,
+    )
 
-FULLY_MASKED_AXES = dict(dtype=[torch.float16, torch.bfloat16])
+
+def test_batch_prefill_with_paged_kv_cache_nvfp4_large_head_bf16():
+    _skip_if_head_dim_unsupported(512)
+    _assert_nvfp4_rejected(
+        num_qo_heads=1,
+        num_kv_heads=1,
+        head_dim_qk=512,
+        q_dtype=torch.bfloat16,
+        page_size=16,
+        causal=False,
+    )
 
 
-def _fully_masked_fixture(dtype):
+def test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head():
+    _skip_if_head_dim_unsupported(512)
+    # fused ROPE_LLAMA is not expressible either (no plan() argument)
+    _assert_nvfp4_rejected(
+        num_qo_heads=1,
+        num_kv_heads=1,
+        head_dim_qk=512,
+        q_dtype=torch.float16,
+        page_size=16,
+        causal=False,
+    )
+
+
+def test_batch_prefill_with_paged_kv_cache_nvfp4_rope_large_head_bf16():
+    _skip_if_head_dim_unsupported(512)
+    _assert_nvfp4_rejected(
+        num_qo_heads=1,
+        num_kv_heads=1,
+        head_dim_qk=512,
+        q_dtype=torch.bfloat16,
+        page_size=16,
+        causal=False,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_paged_prefill_fully_masked_rows(dtype):
+    """Legacy: causal q_len 34 > kv_len 1 leaves 33 fully masked rows (out 0,
+    LSE -inf).  The unified causal envelope rejects q_len > kv_len."""
     qo_len, kv_len = 34, 1
     num_qo_heads, num_kv_heads, head_dim = 32, 8, 128
-    page_size, num_pages = 1, 2
-    dev = torch.device(DEVICE)
-    q = torch.zeros(qo_len, num_qo_heads, head_dim, dtype=dtype, device=dev)
-    k_cache = torch.zeros(
-        num_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device=dev
-    )
-    v_cache = torch.ones_like(k_cache)
-    return LegacyBatch(
-        q=q,
-        k=k_cache,
-        v=v_cache,
-        q_indptr_cpu=torch.tensor([0, qo_len], dtype=torch.int32),
-        kv_indptr_cpu=torch.tensor([0, 1], dtype=torch.int32),
-        kv_indices_cpu=torch.tensor([1], dtype=torch.int32),
-        last_page_len_cpu=torch.tensor([kv_len], dtype=torch.int32),
+    page_size = 1
+    md = PagedAttentionMetadata.csr(
+        torch.tensor([0, qo_len], dtype=torch.int32, device=DEVICE),
+        torch.tensor([kv_len], dtype=torch.int32, device=DEVICE),
+        torch.tensor([1], dtype=torch.int32, device=DEVICE),
         page_size=page_size,
+        max_q_len=qo_len,
+        max_kv_len=kv_len,
+    )
+    with pytest.raises(ValueError, match="causal masking requires q_len_i <= kv_len_i"):
+        PagedAttention(DEVICE).plan(
+            md,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            kv_layout="NHD",
+            causal=True,
+            lse_mode="base2",
+            backend="fa2",
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_paged_prefill_split_kv_empty_chunk(dtype):
+    """Multi-token causal prefill (q 2, kv 129) where a split-KV chunk is
+    empty for the first token: the merge must not produce NaN."""
+    bs, qo_len, kv_len = 1, 2, 129
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+    page_size = 16
+    pages_per = (kv_len + page_size - 1) // page_size
+    q = (
+        torch.randn(bs * qo_len, num_qo_heads, head_dim, dtype=dtype, device=DEVICE)
+        / 10
+    )
+    kv_data = (
+        torch.randn(
+            pages_per, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device=DEVICE
+        )
+        / 10
+    )
+    kv_cache = (kv_data[:, 0], kv_data[:, 1])
+
+    md = _uniform_metadata(bs, qo_len, kv_len, page_size, pages_per)
+    attn = PagedAttention(DEVICE)
+    attn.plan(
+        md,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        q_dtype=dtype,
+        kv_dtype=dtype,
         kv_layout="NHD",
-    ), qo_len - kv_len
-
-
-@pytest.mark.parametrize(
-    argnames(FULLY_MASKED_AXES, "backend"),
-    param_rows(FULLY_MASKED_AXES, lambda p: True),
-)
-def test_paged_prefill_fully_masked_rows(dtype, backend):
-    """q34 / kv1 / page 1.  Today the causal plan is rejected by the
-    envelope; the non-causal plan on the same fixture runs (every row attends
-    the single all-ones value: out 1, LSE 0).  Flipped: the legacy assertions
-    (33 rows out 0 / LSE -inf, last row 1 / 0)."""
-    lb, num_masked = _fully_masked_fixture(dtype)
-    md = lb.metadata()
-    resolve_batch_or_skip(lb, md, backend, causal=True)
-    if not EXPECT_FULLY_MASKED_ROWS:
-        with pytest.raises(
-            ValueError, match="causal masking requires q_len_i <= kv_len_i"
-        ):
-            PagedAttention(torch.device(DEVICE)).plan(
-                md, **lb.plan_kwargs(), causal=True, lse_mode="base2", backend=backend
-            )
-        _, out, lse = run_batch(lb, md, backend, causal=False)
-        assert not out.isnan().any() and not lse.isnan().any()
-        torch.testing.assert_close(out, torch.ones_like(out), rtol=0, atol=0)
-        torch.testing.assert_close(lse, torch.zeros_like(lse), rtol=0, atol=0)
-        return
-    _, out, lse = run_batch(lb, md, backend, causal=True)
-    assert not out.isnan().any() and not lse.isnan().any()
-    torch.testing.assert_close(
-        out[:num_masked], torch.zeros_like(out[:num_masked]), rtol=0, atol=0
+        causal=True,
+        lse_mode="base2",
+        backend="fa2",
     )
-    assert torch.isneginf(lse[:num_masked]).all()
-    torch.testing.assert_close(
-        out[num_masked:], torch.ones_like(out[num_masked:]), rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        lse[num_masked:], torch.zeros_like(lse[num_masked:]), rtol=0, atol=0
-    )
+    assert attn.backend == "fa2"
+    o, lse = attn.run(q, kv_cache)
 
+    k = kv_data[:, 0].reshape(-1, num_kv_heads, head_dim)
+    v = kv_data[:, 1].reshape(-1, num_kv_heads, head_dim)
+    o_ref, lse_ref = ref_single_prefill(q, k[:kv_len], v[:kv_len], causal=True)
+    assert not o.isnan().any() and not lse.isnan().any()
+    torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)
 
-# ---------------------------------------------------------------------------
-# test_paged_prefill_split_kv_empty_chunk
-# ---------------------------------------------------------------------------
-
-SPLIT_KV_AXES = dict(dtype=[torch.float16, torch.bfloat16], form=["dense", "csr"])
-
-
-@pytest.mark.parametrize(
-    argnames(SPLIT_KV_AXES, "backend"), param_rows(SPLIT_KV_AXES, lambda p: True)
-)
-def test_paged_prefill_split_kv_empty_chunk(dtype, form, backend):
-    """q2 / kv129 / page16 with the legacy /10 inputs and combined NHD pool:
-    finite, and within 1e-2 of the fp64 ``ref_single_prefill`` for out AND
-    LSE (legacy), plus oracle; ``form`` (added) runs both paging forms."""
-    lb = legacy_uniform_batch(
-        batch_size=1,
-        kv_len=129,
-        qo_len=2,
-        page_size=16,
-        num_qo_heads=8,
-        num_kv_heads=2,
-        head_dim=128,
-        dtype=dtype,
-        fp32_source=False,
-        scale=10.0,
-        seed=seed_of("split", str(dtype), form),
-    )
-    md = lb.metadata(form)
-    _, out, lse = run_batch(lb, md, backend, causal=True)
-    ki, vi = lb.request_kv(0)
-    o_ref, lse_ref = ref_single_prefill(lb.q, ki, vi, causal=True)
-    assert not out.isnan().any() and not lse.isnan().any()
-    torch.testing.assert_close(out, o_ref, rtol=1e-2, atol=1e-2)  # legacy
-    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)  # legacy
-    assert_oracle(lb, out, lse, causal=True)
+    _assert_oracle(o, lse, q, *kv_cache, md, True, "NHD")

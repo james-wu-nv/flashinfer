@@ -354,7 +354,8 @@ def _capability_rows():
             dict(causal=False, window_left=16),
             "non-causal",
         ),
-        ("trtllm-gen", "d64", dict(head_dim_qk=64, head_dim_vo=64), "head dims"),
+        ("trtllm-gen", "d64", dict(head_dim_qk=64, head_dim_vo=64), None),
+        ("cake", "d64", dict(head_dim_qk=64, head_dim_vo=64), "head dims"),
         (
             "trtllm-gen",
             "fp8-kv",

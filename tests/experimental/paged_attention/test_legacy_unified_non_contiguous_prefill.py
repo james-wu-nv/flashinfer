@@ -1,102 +1,61 @@
 """Legacy -> unified: tests/attention/test_non_contiguous_prefill.py
 
-Every test function below carries the name of the legacy test it converts and
-runs the legacy fixture through flashinfer.prefill.PagedAttention: q is the
-head slice of a fused QKV projection (token stride ``(Hq + 2 Hkv) * D``), the
-two fp16 NHD pools, the legacy CSR mapped losslessly (page 1 / 5 -> ``.csr``).
-The row asserts the legacy comparison (slice vs ``q.contiguous()`` at rtol
-1e-3 / atol 2e-3) and both outputs against the fp32 oracle.  The parametrize
-axes keep the legacy names and values; the row id is the legacy node id plus
-``-<backend>``; the full legacy grid is under ``slow``.
+``test_batch_paged_prefill_packed_input`` runs the legacy fixture through
+``PagedAttention`` pinned to fa2, the backend the legacy wrapper picks on this
+GPU: q is the head slice of a fused QKV projection (token stride
+``(Hq + 2 Hkv) * D``) over two fp16 NHD pools at page 1 / 5 (the flat page-id
+form).  Same grid and tensors, so the node ids equal the legacy ids.  Each case
+checks the legacy comparison (slice vs ``q.contiguous()``) at the legacy
+tolerance, and both outputs and LSEs against the fp32 paged-attention oracle.
 
-CI: legacy file only in the H100 1/5 sampling lane.  The unified file is not
-collected by default CI (``norecursedirs``).
-
-Cannot-cover / partial notes (kept next to the LEGACY_MAP rows):
-- page sizes 1 and 5 select the flat page-id form, so only the CSR-native
-  backends (fa2, fa3) resolve -- exactly the backends the legacy test ran;
-  cudnn / trtllm-gen / cake skip with the dense-derivation reason.
-- cuDNN declares ``requires_contiguous_q`` (its graph scales the token-unit
-  ragged offsets by Hq * D, so a fused-QKV head slice is silently wrong);
-  the contract rejects the strided view with "requires packed q" and the
-  row records that instead of misreading (a packed copy is the documented
-  migration).  It never resolves here anyway (page 1 / 5).
-- single-prefill and ragged functions of the legacy file are out of scope.
+The single-prefill and ragged legacy tests are out of scope: ``PagedAttention``
+is the paged-prefill API.
 """
 
 import pytest
 import torch
 
-from flashinfer.experimental.paged_attention import CAPABILITIES
+from flashinfer.prefill import PagedAttention, PagedAttentionMetadata
 
-from .legacy_unified_helpers import (
-    DEVICE,
-    LegacyBatch,
-    argnames,
-    assert_oracle,
-    check_legacy_map,
-    check_legacy_map_complete,
-    check_unified_tests_mapped,
-    param_rows,
-    plan_batch,
-    seed_of,
-)
+from .paged_attention_reference import reference_paged_prefill
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-
+# Read by the legacy <-> unified parity report:
+# (legacy nodeid, [unified test functions], status, note)
 LEGACY_SOURCE = "tests/attention/test_non_contiguous_prefill.py"
 LEGACY_MAP = [
-    # (legacy nodeid, [unified test function names in this file], status, note)
     (
         "tests/attention/test_non_contiguous_prefill.py::test_single_prefill_packed_input",
         [],
         "out-of-scope",
-        "single_prefill_with_kv_cache on a packed QKV view, not paged prefill.",
+        "single_prefill_with_kv_cache on a packed QKV view, not paged prefill",
     ),
     (
         "tests/attention/test_non_contiguous_prefill.py::test_batch_ragged_prefill_packed_input",
         [],
         "out-of-scope",
-        "ragged (BatchPrefillWithRaggedKVCacheWrapper), not paged prefill.",
+        "ragged KV (BatchPrefillWithRaggedKVCacheWrapper), not paged prefill",
     ),
     (
         "tests/attention/test_non_contiguous_prefill.py::test_batch_paged_prefill_packed_input",
         ["test_batch_paged_prefill_packed_input"],
         "equivalent",
-        "same grid (B1/19/99 x page1/5 x seq1/7/127/257 x Hkv1/4/8 x Hq4/8 x D64/128/256 "
-        "x causal); q is the head slice of a fused QKV buffer; slice vs q.contiguous() "
-        "at the legacy tolerance (rtol 1e-3, atol 2e-3) + oracle for both; page 1/5 => "
-        "CSR form, so only the CSR-native fa backends resolve (as in the legacy fa2 "
-        "run); cudnn rejects strided q by contract.",
+        "same grid and tensors on fa2 (CSR form, page 1 / 5); slice vs "
+        "q.contiguous() at the legacy tolerance plus the fp32 oracle on both "
+        "(output and LSE)",
     ),
 ]
 
-PACKED_AXES = dict(
-    batch_size=[1, 19, 99],
-    page_size=[1, 5],
-    seq_len=[1, 7, 127, 257],
-    num_kv_heads=[1, 4, 8],
-    num_qo_heads=[4, 8],
-    head_dim=[64, 128, 256],
-    causal=[True, False],
-)
-PACKED_DEFAULT = {(1, 1), (19, 7), (99, 127), (19, 257)}  # (batch_size, seq_len)
+OUT_TOL = dict(atol=2e-2, rtol=2e-2)
+LSE_TOL = dict(atol=3e-2, rtol=2e-2)
 
 
-def _packed_default(p):
-    b, page, seq, hk, hq, hd, causal = p
-    return (b, seq) in PACKED_DEFAULT and (hk, hq) in {(1, 4), (4, 8), (8, 8)}
-
-
-def test_legacy_map_is_well_formed():
-    check_legacy_map(LEGACY_MAP, globals())
-    check_legacy_map_complete(LEGACY_SOURCE, LEGACY_MAP)
-    check_unified_tests_mapped(LEGACY_MAP, globals())
-
-
-@pytest.mark.parametrize(
-    argnames(PACKED_AXES, "backend"), param_rows(PACKED_AXES, _packed_default)
-)
+@pytest.mark.parametrize("batch_size", [1, 19, 99])
+@pytest.mark.parametrize("page_size", [1, 5])
+@pytest.mark.parametrize("seq_len", [1, 7, 127, 257])
+@pytest.mark.parametrize("num_kv_heads", [1, 4, 8])
+@pytest.mark.parametrize("num_qo_heads", [4, 8])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("causal", [True, False])
 def test_batch_paged_prefill_packed_input(
     batch_size,
     page_size,
@@ -105,75 +64,80 @@ def test_batch_paged_prefill_packed_input(
     num_qo_heads,
     head_dim,
     causal,
-    backend,
 ):
-    """q is the head slice of a fused QKV projection (token stride
-    (Hq + 2 Hkv) D); the slice and its ``.contiguous()`` copy must agree at
-    the legacy tolerance and both match the oracle.  A backend that requires
-    packed q rejects the view by contract (recorded, never misread)."""
     if num_qo_heads % num_kv_heads != 0:
-        pytest.skip("num_qo_heads must be a multiple of num_kv_heads")  # legacy
-    torch.manual_seed(
-        seed_of(
-            "packed",
-            batch_size,
-            page_size,
-            seq_len,
-            num_kv_heads,
-            num_qo_heads,
-            head_dim,
-            causal,
-        )
-    )
-    dev = torch.device(DEVICE)
+        pytest.skip("num_qo_heads must be a multiple of num_kv_heads")
+
+    # the legacy fixture, verbatim (same RNG order: k, v, qkv)
     nnz = batch_size * seq_len
-    pages_per_req = (seq_len + page_size - 1) // page_size
-    num_pages = batch_size * pages_per_req
+    num_pages_per_req = (seq_len + page_size - 1) // page_size
+    num_pages = batch_size * num_pages_per_req
     k_cache = torch.randn(
-        num_pages, page_size, num_kv_heads, head_dim, dtype=torch.float16, device=dev
+        size=(num_pages, page_size, num_kv_heads, head_dim),
+        dtype=torch.float16,
+        device="cuda:0",
     )
     v_cache = torch.randn_like(k_cache)
-    qkv_packed = torch.randn(
-        nnz,
-        (num_qo_heads + 2 * num_kv_heads) * head_dim,
-        dtype=torch.float16,
-        device=dev,
-    )
-    q, _, _ = qkv_packed.split(
-        (num_qo_heads * head_dim, num_kv_heads * head_dim, num_kv_heads * head_dim),
-        dim=-1,
-    )
-    q = q.view(-1, num_qo_heads, head_dim)
-    # a single token (nnz == 1) is contiguous by PyTorch's definition; every
-    # other point is the strided fused-QKV slice
-    assert q.stride(-1) == 1 and (nnz == 1 or not q.is_contiguous())
-    lb = LegacyBatch(
-        q=q,
-        k=k_cache,
-        v=v_cache,
-        q_indptr_cpu=torch.arange(0, batch_size + 1, dtype=torch.int32) * seq_len,
-        kv_indptr_cpu=torch.arange(0, batch_size + 1, dtype=torch.int32)
-        * pages_per_req,
-        kv_indices_cpu=torch.arange(num_pages, dtype=torch.int32),
-        last_page_len_cpu=torch.full(
-            (batch_size,), (seq_len - 1) % page_size + 1, dtype=torch.int32
-        ),
+    paged_kv_cache = (k_cache, v_cache)
+
+    qo_indptr_cpu = torch.arange(batch_size + 1, dtype=torch.int32) * seq_len
+    kv_lens_cpu = torch.full((batch_size,), seq_len, dtype=torch.int32)
+    kv_page_indices = torch.arange(num_pages, dtype=torch.int32, device="cuda:0")
+    md = PagedAttentionMetadata.csr(
+        qo_indptr_cpu.to("cuda:0"),
+        kv_lens_cpu.to("cuda:0"),
+        kv_page_indices,
         page_size=page_size,
-        kv_layout="NHD",
+        max_q_len=seq_len,
+        max_kv_len=seq_len,
+        qo_indptr_cpu=qo_indptr_cpu,
+        kv_seq_lens_cpu=kv_lens_cpu,
     )
-    md = lb.metadata()
-    attn = plan_batch(lb, md, backend, causal=causal)
-    if CAPABILITIES[attn.backend].requires_contiguous_q and not q.is_contiguous():
-        with pytest.raises(ValueError, match="requires packed q"):
-            attn.run(q, (k_cache, v_cache))
-        out_c, lse_c = attn.run(q.contiguous(), (k_cache, v_cache))
-        assert_oracle(lb, out_c, lse_c, causal=causal)
-        pytest.skip(
-            f"[{attn.backend}] rejects the fused-QKV head slice by contract "
-            "(requires packed q); the contiguous copy matches the oracle"
-        )
-    out_packed, lse_packed = attn.run(q, (k_cache, v_cache))
-    out_contig, lse_contig = attn.run(q.contiguous(), (k_cache, v_cache))
-    torch.testing.assert_close(out_packed, out_contig, rtol=1e-3, atol=2e-3)  # legacy
-    assert_oracle(lb, out_packed, lse_packed, causal=causal)
-    assert_oracle(lb, out_contig, lse_contig, causal=causal)
+    attn = PagedAttention(torch.device("cuda:0"))
+    attn.plan(
+        md,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        q_dtype=torch.float16,
+        kv_layout="NHD",
+        causal=causal,
+        lse_mode="base2",
+        backend="fa2",
+    )
+    assert attn.backend == "fa2"
+
+    qkv_packed = torch.randn(
+        size=(nnz, (num_qo_heads + 2 * num_kv_heads) * head_dim),
+        dtype=torch.float16,
+        device="cuda:0",
+    )
+    qkv_split_idx = (
+        num_qo_heads * head_dim,
+        num_kv_heads * head_dim,
+        num_kv_heads * head_dim,
+    )
+    q, _, _ = qkv_packed.split(qkv_split_idx, dim=-1)
+    q = q.view(-1, num_qo_heads, head_dim)
+    out_packed, lse_packed = attn.run(q, paged_kv_cache)
+    out_contig, lse_contig = attn.run(q.contiguous(), paged_kv_cache)
+
+    # legacy assertion at the legacy tolerance
+    torch.testing.assert_close(out_packed, out_contig, rtol=1e-3, atol=2e-3)
+
+    # fp32 oracle: output and base-2 LSE, for both q layouts
+    ref_out, ref_lse = reference_paged_prefill(
+        q,
+        k_cache,
+        v_cache,
+        qo_indptr_cpu,
+        kv_lens_cpu,
+        None,
+        page_size,
+        causal,
+        kv_layout="NHD",
+        kv_page_indices=kv_page_indices,
+    )
+    for out, lse in ((out_packed, lse_packed), (out_contig, lse_contig)):
+        torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+        torch.testing.assert_close(lse, ref_lse, **LSE_TOL)

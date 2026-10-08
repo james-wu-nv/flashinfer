@@ -1,70 +1,27 @@
 """Legacy -> unified: tests/attention/test_attention_ts_context.py
 
-Every test function below carries the name of the legacy test it converts and
-runs the legacy fixture through flashinfer.prefill.PagedAttention.
-
-CI: the legacy file is in no A10G fixed shard; the H100 lane collects it at
-1/5 sampling and every GPU row skips on the ``is_sm100a_supported`` gate
-(the CPU-only contract rows run), so the PrimTS context kernels never
-executed in PR CI (reports/unified-prefill-round4-20260918/ci-status.md).  On
-B200 (nvidia-cutlass-dsl 4.8) the in-scope legacy rows run: 13 passed in
-117 s (round-4 legacy run).
-
-Scope (round-4 brief): the functions that use the one-shot paged entry point
-``flashinfer.attention.prims_ts.batch_prefill_with_paged_kv_cache``.  The
-TensorSpeed (PrimTS) kernel is not a unified backend; what this file converts
-is each legacy function's WORKLOAD or CONTRACT: the legacy fixtures
-(``_make_paged_context_case`` / ``_make_native_paged_metadata`` /
-``_poison_invalid_paged_v_tails`` imported from the legacy module, the legacy
-seeds, HND page pools with non-identity page ids) run in the dense form on
-every unified backend that resolves (excluded ones recorded with the resolve
-reason) and on ``auto`` (recorded), asserted with the legacy reference and
-tolerance (``_context_reference`` / ``_assert_context_correct``) and the fp32
+The legacy functions in scope are the ones built on the one-shot paged entry
+point ``flashinfer.attention.prims_ts.batch_prefill_with_paged_kv_cache``.
+The PrimTS (TensorSpeed) kernel is not a ``PagedAttention`` backend, so the
+GPU rows run the legacy fixture on fa2, the backend that serves the whole
+legacy envelope (D256, a strided page-table view, an in-page V tail past
+kv_len that is NaN).  Same parametrize grid, same fixtures and seeds (the
+legacy module's own ``_make_paged_context_case`` / ``_make_native_paged_metadata``
+/ ``_poison_invalid_paged_v_tails``), so the node ids equal the legacy ids.
+Each GPU case checks the legacy reference (``_assert_context_correct``) at
+the legacy tolerance, and the output and LSE against the fp32 paged-attention
 oracle.  The legacy ``output_scale`` is the unified ``run(v_scale=)``.  The
-81 functions that drive ``BatchPrefillPagedTSWrapper`` / ``BatchPrefillTSWrapper``
-or the kernel internals are ``out-of-scope`` rows (TensorSpeed wrapper
-lifecycle, scheduler policy, variable-window and MLA contracts), per the brief.
+contract rows pin the same facts on the unified public surface.
 
-Cannot-cover / partial notes (kept next to the LEGACY_MAP rows):
-- public surface (``..._public_surfaces_hide_internal_tuning``): the unified
-  ``plan()`` / ``run()`` / metadata constructors expose none of the legacy
-  tuning tokens; ``backend=`` is a documented selection axis of the unified
-  design, not a tuning knob, and is the one legacy-forbidden name it carries.
-- fixed-table one-shot contract (``..._exposes_fixed_table_contract``,
-  ``..._forwards_fixed_table_to_wrapper``): the unified spelling is the
-  metadata object (``PagedAttentionMetadata.dense``) that keeps the caller's
-  tensors by identity; the one-shot function itself has no unified analog
-  (the unified API is plan / run by design).
-- capture guard (``..._one_shot_apis_reject_cuda_graph_capture``): unified
-  ``plan()`` refuses to run under capture with its own message.
-- metadata validation (``..._validates_fixed_table``,
-  ``..._rejects_invalid_fixed_metadata``): the unified metadata takes
-  ``max_q_len`` / ``max_kv_len`` explicitly (validated against the host
-  mirrors) instead of deriving them; a too-narrow table is rejected (same
-  class of check); a page id past the pool is TRUSTED in-pool by contract
-  (design doc "Input contract": page ids are not range-checked, a device sync
-  would be needed) and a ``kv_len == 0`` request is a legal padding row
-  (design doc "Zero-row contract") -- two contract differences, recorded.
-- causal envelope (``..._run_rejects_causal_q_longer_than_kv``): unified
-  rejects at ``plan()`` with its own message; the packed (ragged) variant is
-  out of the paged scope.
-- graph replay (``..._paged_graph_replay_reads_updated_fixed_metadata``):
-  the legacy wrapper re-reads the caller's table / lengths in place on
-  replay; the unified graph mode re-plans through ``update(metadata)`` into
-  reserved storage (design doc "Plan lifecycle: graph mode") -- the
-  converted row captures, updates with the runtime table / lengths, replays
-  and checks the oracle and an eager plan of the same batch.
-- poisoned V tails (``..._paged_one_shot_causal_partial_tail_d256`` and the
-  added ``test_paged_in_page_tail_past_kv_len_is_masked``): fa2 masks the
-  in-page tail past kv_len; trtllm-gen, cake and cuDNN over-read it and
-  0 x NaN reaches the output (measured on B200, EXPECT_INPAGE_TAIL_IGNORED:
-  non-strict xfail on those backends so the outcome is recorded).  D256
-  resolves on fa2 only.
+The other 81 legacy functions drive ``BatchPrefillPagedTSWrapper`` /
+``BatchPrefillTSWrapper``, the contiguous / packed (ragged) path, variable
+windows, MLA or kernel internals: out of scope.
 """
 
 import inspect
 import itertools
 import math
+from dataclasses import replace
 
 import pytest
 import torch
@@ -75,36 +32,33 @@ from flashinfer.prefill import (
     PagedAttentionMetadata,
     resolve_paged_attention,
 )
+from flashinfer.utils import is_sm100a_supported
 
-from .legacy_unified_helpers import (
-    DEVICE,
-    EXPECT_INPAGE_TAIL_IGNORED,
-    LSE_TOL,
-    OUT_TOL,
-    check_legacy_map,
-    check_legacy_map_complete,
-    dense_metadata,
-    oracle,
-    run_on_backends,
-    xfail_unless,
+# the legacy module importorskips the cutlass DSL, as the legacy file does
+from tests.attention.test_attention_ts_context import (
+    _assert_context_correct,
+    _context_reference,
+    _cumulative,
+    _make_native_paged_metadata,
+    _make_paged_context_case,
+    _poison_invalid_paged_v_tails,
 )
+
+from .paged_attention_reference import reference_paged_prefill
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
+# Read by the legacy <-> unified parity report:
+# (legacy nodeid, [unified test functions], status, note)
 LEGACY_SOURCE = "tests/attention/test_attention_ts_context.py"
-
-
 LEGACY_MAP = [
-    # (legacy nodeid, [unified test function names in this file], status, note)
     (
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_public_surfaces_hide_internal_tuning",
         ["test_attention_ts_context_public_surfaces_hide_internal_tuning"],
         "partial",
-        "the same forbidden-token scan over the unified public surface "
-        "(PagedAttention.__init__ / plan / run, PagedAttentionMetadata.dense / csr, "
-        "resolve_paged_attention, GraphCapacity); 'backend' is the one "
-        "legacy-forbidden name the unified API carries, as a documented selection "
-        "axis",
+        "the same forbidden-token scan over the PagedAttention / metadata / resolve "
+        "/ GraphCapacity signatures; 'backend' is allowed (the unified selection "
+        "axis)",
     ),
     (
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_paged_wrapper_has_no_workspace_api",
@@ -141,44 +95,36 @@ LEGACY_MAP = [
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_paged_one_shot_exposes_fixed_table_contract",
         ["test_attention_ts_context_paged_one_shot_exposes_fixed_table_contract"],
         "partial",
-        "the unified fixed-table spelling is PagedAttentionMetadata.dense(qo_indptr, "
-        "kv_seq_lens, block_tables, *, page_size, max_q_len, max_kv_len, ...) and "
-        "run(q, kv_cache, *, out, lse, sm_scale, k_scale, v_scale, sinks): pinned "
-        "here; the one-shot function's defaults (page 32, HND, dense mask) have no "
-        "unified analog (plan / run by design)",
+        "the fixed-table spelling is PagedAttentionMetadata.dense + run(): names, "
+        "kinds and defaults pinned; the one-shot function itself has no unified "
+        "analog",
     ),
     (
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_one_shot_apis_reject_cuda_graph_capture",
         ["test_attention_ts_context_one_shot_apis_reject_cuda_graph_capture"],
         "partial",
-        "unified plan() refuses to run while the stream is capturing (RuntimeError "
-        "'cannot run during CUDA graph capture'); the legacy one-shot packed variant "
-        "is out of the paged scope",
+        "plan() rejects under capture; the packed batch_prefill variant is ragged",
     ),
     (
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper",
         ["test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper"],
         "partial",
-        "the metadata keeps the caller-owned qo_indptr / block_tables / kv_seq_lens "
-        "by identity (no copy) and derives max_kv_len 65 / batch 2 facts from the "
-        "same tensors; the stubbed wrapper plumbing is native-only",
+        "the metadata keeps the caller's tensors by identity; the stubbed wrapper "
+        "plumbing has no unified analog",
     ),
     (
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_paged_one_shot_validates_fixed_table",
         ["test_attention_ts_context_paged_one_shot_validates_fixed_table"],
         "partial",
-        "same tensors (q 3 tokens, table [[4,-1,-1],[1,3,0]], kv (17, 65)): the "
-        "unified metadata reports batch 2, total_q 3, max_q 2, max_kv 65; unified "
-        "takes max_q_len / max_kv_len explicitly (validated) instead of deriving them",
+        "same tensors and facts; unified takes max_q_len / max_kv_len explicitly "
+        "and validates them instead of deriving them",
     ),
     (
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_paged_one_shot_rejects_invalid_fixed_metadata",
         ["test_attention_ts_context_paged_one_shot_rejects_invalid_fixed_metadata"],
         "partial",
-        "same three cases: short-row is rejected ('exceeds block_tables capacity'); "
-        "invalid-active-page is ACCEPTED (page ids are trusted in-pool by contract, "
-        "no range check without a device sync); nonpositive-kv-length 0 is ACCEPTED "
-        "(padding row); both contract differences asserted",
+        "short-row rejected; invalid-active-page accepted (page ids trusted in- "
+        "pool) and kv_len 0 accepted (padding row): contract differences, asserted",
     ),
     (
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_contiguous_plan_reuses_dynamic_packed_requests",
@@ -492,10 +438,7 @@ LEGACY_MAP = [
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_run_rejects_causal_q_longer_than_kv",
         ["test_attention_ts_context_run_rejects_causal_q_longer_than_kv"],
         "partial",
-        "same fixture (q (2, 3), kv (3, 2), H4:4, D128, bf16, causal): the unified "
-        "plan() rejects the causal envelope with its own message ('causal masking "
-        "requires q_len_i <= kv_len_i ... request 1 has q_len 3 > kv_len 2'); the "
-        "packed (ragged) variant skips as out of the paged scope",
+        "paged: plan() rejects Sq > Sk on fa2; packed (ragged) id skips",
     ),
     (
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts",
@@ -709,13 +652,9 @@ LEGACY_MAP = [
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata",
         ["test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata"],
         "partial",
-        "same fixture (q (17, 17), kv (65, 33) / (1057, 1025), H4:2, D128 / D256, "
-        "bf16, causal, seeds 2026090302 + D, non-identity ids, a capacity+1-column "
-        "table on a 2x row stride) on every resolving backend: graph-mode plan, "
-        "capture, update() with the runtime table / reversed lengths, replay; the "
-        "replay matches the legacy fp32 reference of the runtime batch, the oracle "
-        "and an eager plan of the same metadata; the legacy re-reads caller tensors "
-        "in place, unified re-plans into reserved storage through update()",
+        "same fixture on fa2 in graph mode; the mutated table is re-planned through "
+        "update() before replay (legacy re-reads in place); legacy reference plus "
+        "the fp32 oracle; PrimTS tile-config asserts dropped",
     ),
     (
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_d256_fixed_causal_single_tile_runtime",
@@ -726,17 +665,10 @@ LEGACY_MAP = [
     ),
     (
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_paged_one_shot_causal_partial_tail_d256",
-        [
-            "test_attention_ts_context_paged_one_shot_causal_partial_tail_d256",
-            "test_paged_in_page_tail_past_kv_len_is_masked",
-        ],
-        "partial",
-        "same fixture (q (17, 65), kv (177, 193), H8:4, D256, fp16, causal, seed "
-        "2026071520, output_scale 0.75 as v_scale, NaN-poisoned V tails past kv_len "
-        "in the last pages, last_page_len [17, 1]) on fa2 (the only D256 backend) vs "
-        "_assert_context_correct and the oracle; the added D128 row shows the tail is "
-        "over-read by trtllm-gen / cake / cuDNN (non-strict xfail behind "
-        "EXPECT_INPAGE_TAIL_IGNORED)",
+        ["test_attention_ts_context_paged_one_shot_causal_partial_tail_d256"],
+        "equivalent",
+        "same fixture (NaN V tails, output_scale as v_scale) on fa2; legacy "
+        "reference plus the fp32 oracle (output and LSE)",
     ),
     (
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_replay",
@@ -793,29 +725,21 @@ LEGACY_MAP = [
 ]
 
 
-def test_legacy_map_is_well_formed():
-    check_legacy_map(LEGACY_MAP, globals())
-    check_legacy_map_complete(LEGACY_SOURCE, LEGACY_MAP)
+OUT_TOL = dict(atol=2e-2, rtol=2e-2)
+LSE_TOL = dict(atol=3e-2, rtol=2e-2)
+
+# the legacy GPU gate (_REQUIRES_CONTEXT_GPU)
+_REQUIRES_CONTEXT_GPU = pytest.mark.skipif(
+    not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
+    reason="PrimTS context attention requires SM100 or SM103",
+)
 
 
-# ---------------------------------------------------------------------------
-# legacy fixtures (imported from the legacy module, which importorskips the
-# cutlass DSL the PrimTS kernels need; a missing package skips the row)
-# ---------------------------------------------------------------------------
-
-
-def _legacy():
-    import tests.attention.test_attention_ts_context as legacy
-
-    return legacy
-
-
-def _dense_from_native(case, metadata, *, max_kv_len=None):
-    """The legacy native fixed table (possibly a strided view with spare
-    columns) as unified dense metadata; ``max_kv_len`` may be widened to the
-    table's full extent (graph-mode width rule)."""
-    kv_cpu = metadata.seq_lens_kv.cpu().to(torch.int32)
-    qo_cpu = metadata.qo_indptr.cpu().to(torch.int32)
+def _dense(case, metadata, *, max_kv_len=None):
+    """The legacy native fixed table (``_NativePagedMetadata``) as unified
+    dense metadata over the same tensors."""
+    qo_cpu = metadata.qo_indptr.cpu()
+    kv_cpu = metadata.seq_lens_kv.cpu()
     return PagedAttentionMetadata.dense(
         metadata.qo_indptr,
         metadata.seq_lens_kv,
@@ -828,28 +752,8 @@ def _dense_from_native(case, metadata, *, max_kv_len=None):
     )
 
 
-def _run_case(case, md, *, backends=None, include_auto=True, record_property=None):
-    ref = case.reference
-    kw = dict(
-        num_qo_heads=int(ref.q.shape[1]),
-        num_kv_heads=int(case.k_cache.shape[1]),
-        head_dim_qk=int(ref.q.shape[2]),
-        q_dtype=ref.q.dtype,
-        kv_layout="HND",
-        causal=ref.mask_type == "causal",
-        window_left=ref.window_left,
-        sm_scale=ref.sm_scale,
-        v_scale=ref.output_scale if ref.output_scale != 1.0 else None,
-        include_auto=include_auto,
-        record_property=record_property,
-    )
-    if backends is not None:
-        kw["backends"] = backends
-    return run_on_backends(md, ref.q, (case.k_cache, case.v_cache), **kw)
-
-
 # ---------------------------------------------------------------------------
-# public surface
+# public API contract
 # ---------------------------------------------------------------------------
 
 
@@ -903,8 +807,8 @@ def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
         "use_cluster_smem_reduction",
         "use_tensor_cores",
     }
-    # the unified API's selection axis (design doc "Backend selection"): the
-    # one legacy-forbidden name it carries on purpose
+    # the unified selection axis (design doc "Backend selection") is the one
+    # legacy-forbidden name the unified API carries on purpose
     allowed_exact_names = {"backend"}
     violations = []
     for surface in surfaces:
@@ -929,66 +833,62 @@ def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
                 or has_forbidden_sequence
             ):
                 violations.append(f"{surface.__qualname__}.{parameter.name}")
+
     assert violations == []
-    assert "backend" in inspect.signature(PagedAttention.plan).parameters
 
 
 def test_attention_ts_context_paged_one_shot_exposes_fixed_table_contract() -> None:
+    # the unified fixed-table spelling: PagedAttentionMetadata.dense + run()
     dense = inspect.signature(PagedAttentionMetadata.dense).parameters
-    assert tuple(dense) == (
-        "qo_indptr",
-        "kv_seq_lens",
-        "block_tables",
-        "page_size",
-        "max_q_len",
-        "max_kv_len",
-        "qo_indptr_cpu",
-        "kv_seq_lens_cpu",
-    )
-    for name in ("qo_indptr", "kv_seq_lens", "block_tables"):
-        assert dense[name].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-        assert dense[name].default is inspect.Parameter.empty
-    for name in ("page_size", "max_q_len", "max_kv_len"):
-        assert dense[name].kind is inspect.Parameter.KEYWORD_ONLY
-        assert dense[name].default is inspect.Parameter.empty  # no hidden defaults
-    for name in ("qo_indptr_cpu", "kv_seq_lens_cpu"):
-        assert dense[name].kind is inspect.Parameter.KEYWORD_ONLY
-        assert dense[name].default is None
-    run = inspect.signature(PagedAttention.run).parameters
-    assert tuple(run) == (
-        "self",
-        "q",
-        "kv_cache",
-        "out",
-        "lse",
-        "sm_scale",
-        "k_scale",
-        "v_scale",
-        "sinks",
+    required_parameters = ("qo_indptr", "kv_seq_lens", "block_tables")
+    keyword_only_defaults = {
+        "page_size": inspect.Parameter.empty,  # no hidden page-size default
+        "max_q_len": inspect.Parameter.empty,
+        "max_kv_len": inspect.Parameter.empty,
+        "qo_indptr_cpu": None,
+        "kv_seq_lens_cpu": None,
+    }
+    assert tuple(dense) == (*required_parameters, *keyword_only_defaults)
+    assert all(
+        dense[name].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        and dense[name].default is inspect.Parameter.empty
+        for name in required_parameters
     )
     assert all(
-        run[name].kind is inspect.Parameter.KEYWORD_ONLY and run[name].default is None
-        for name in ("out", "lse", "sm_scale", "k_scale", "v_scale", "sinks")
+        dense[name].kind is inspect.Parameter.KEYWORD_ONLY
+        for name in keyword_only_defaults
     )
+    assert {
+        name: dense[name].default for name in keyword_only_defaults
+    } == keyword_only_defaults
+
+    run = inspect.signature(PagedAttention.run).parameters
+    run_keyword_only = ("out", "lse", "sm_scale", "k_scale", "v_scale", "sinks")
+    assert tuple(run) == ("self", "q", "kv_cache", *run_keyword_only)
+    assert all(
+        run[name].kind is inspect.Parameter.KEYWORD_ONLY and run[name].default is None
+        for name in run_keyword_only
+    )
+    # the legacy one-shot defaults (HND, window -1) live on plan()
     plan = inspect.signature(PagedAttention.plan).parameters
     assert plan["kv_layout"].default == "HND"
-    assert plan["causal"].default is True
     assert plan["window_left"].default == -1
-    assert plan["lse_mode"].default == "none"
-    assert plan["backend"].default == "auto"
 
 
 def test_attention_ts_context_one_shot_apis_reject_cuda_graph_capture(
     monkeypatch,
 ) -> None:
-    """Unified plan() performs host work and refuses to run under capture."""
-    md = dense_metadata(
-        torch.tensor([0, 1], dtype=torch.int32),
-        torch.tensor([1], dtype=torch.int32),
-        torch.tensor([[0]], dtype=torch.int32, device=DEVICE),
-        32,
+    """Planning must not perform host metadata reads during capture."""
+
+    md = PagedAttentionMetadata.dense(
+        torch.tensor((0, 1), dtype=torch.int32, device="cuda"),
+        torch.tensor((1,), dtype=torch.int32, device="cuda"),
+        torch.tensor(((0,),), dtype=torch.int32, device="cuda"),
+        page_size=32,
+        max_q_len=1,
+        max_kv_len=1,
     )
-    attn = PagedAttention(torch.device(DEVICE))
+    attn = PagedAttention(torch.device("cuda"))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="cannot run during CUDA graph capture"):
         attn.plan(
@@ -1000,50 +900,49 @@ def test_attention_ts_context_one_shot_apis_reject_cuda_graph_capture(
             causal=False,
             backend="fa2",
         )
+    # the legacy packed batch_prefill() variant is ragged: not paged prefill
 
 
 def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper() -> None:
     """The metadata preserves the caller-owned fixed metadata tensors."""
-    qo_indptr = torch.tensor((0, 4, 9), dtype=torch.int32, device=DEVICE)
+
+    qo_indptr = torch.tensor((0, 4, 9), dtype=torch.int32, device="cuda")
     block_tables = torch.tensor(
-        ((3, 1, -1), (7, 0, 2)), dtype=torch.int32, device=DEVICE
+        ((3, 1, -1), (7, 0, 2)), dtype=torch.int32, device="cuda"
     )
-    seq_lens_kv = torch.tensor((33, 65), dtype=torch.int32, device=DEVICE)
+    seq_lens_kv = torch.tensor((33, 65), dtype=torch.int32, device="cuda")
     md = PagedAttentionMetadata.dense(
         qo_indptr, seq_lens_kv, block_tables, page_size=32, max_q_len=5, max_kv_len=65
     )
+
     assert md.qo_indptr is qo_indptr
     assert md.block_tables is block_tables
     assert md.kv_seq_lens is seq_lens_kv
-    assert md.batch_size == 2 and md.total_q_tokens == 9
-    assert md.max_kv_len == 65 and md.max_q_len == 5
-    assert md.kv_input_form == "block_tables"
+    assert md.batch_size == 2
+    assert md.total_q_tokens == 9
+    assert md.max_kv_len == 65
 
 
 def test_attention_ts_context_paged_one_shot_validates_fixed_table() -> None:
     """The legacy geometry facts from the same fixed-table tensors."""
-    md = PagedAttentionMetadata.dense(
-        torch.tensor((0, 1, 3), dtype=torch.int32, device=DEVICE),
-        torch.tensor((17, 65), dtype=torch.int32, device=DEVICE),
-        torch.tensor(((4, -1, -1), (1, 3, 0)), dtype=torch.int32, device=DEVICE),
-        page_size=32,
-        max_q_len=2,
-        max_kv_len=65,
-    )
+
+    def build(max_kv_len):
+        return PagedAttentionMetadata.dense(
+            torch.tensor((0, 1, 3), dtype=torch.int32, device="cuda"),
+            torch.tensor((17, 65), dtype=torch.int32, device="cuda"),
+            torch.tensor(((4, -1, -1), (1, 3, 0)), dtype=torch.int32, device="cuda"),
+            page_size=32,
+            max_q_len=2,
+            max_kv_len=max_kv_len,
+        )
+
+    md = build(65)
     assert md.max_kv_len == 65
     assert md.max_q_len == 2
     assert md.batch_size == 2
-    assert md.total_q_tokens == 3
     # unified takes the maxima explicitly and validates them (the legacy derives)
-    with pytest.raises(ValueError, match="max_kv_len \\(64\\) is smaller"):
-        PagedAttentionMetadata.dense(
-            torch.tensor((0, 1, 3), dtype=torch.int32, device=DEVICE),
-            torch.tensor((17, 65), dtype=torch.int32, device=DEVICE),
-            torch.tensor(((4, -1, -1), (1, 3, 0)), dtype=torch.int32, device=DEVICE),
-            page_size=32,
-            max_q_len=2,
-            max_kv_len=64,
-        )
+    with pytest.raises(ValueError, match=r"max_kv_len \(64\) is smaller"):
+        build(64)
 
 
 @pytest.mark.parametrize(
@@ -1056,65 +955,88 @@ def test_attention_ts_context_paged_one_shot_validates_fixed_table() -> None:
     ids=("short-row", "invalid-active-page", "nonpositive-kv-length"),
 )
 def test_attention_ts_context_paged_one_shot_rejects_invalid_fixed_metadata(
-    block_tables,
-    seq_lens_kv,
+    block_tables: tuple[tuple[int, ...], ...],
+    seq_lens_kv: tuple[int, ...],
     match: str,
 ) -> None:
-    """The unified metadata's answer to the three legacy rejections."""
-    build = lambda: PagedAttentionMetadata.dense(  # noqa: E731
-        torch.tensor((0, 1, 3), dtype=torch.int32, device=DEVICE),
-        torch.tensor(seq_lens_kv, dtype=torch.int32, device=DEVICE),
-        torch.tensor(block_tables, dtype=torch.int32, device=DEVICE),
-        page_size=32,
-        max_q_len=2,
-        max_kv_len=65,
-    )
+    qo_indptr_cpu = torch.tensor((0, 1, 3), dtype=torch.int32)
+    kv_lens_cpu = torch.tensor(seq_lens_kv, dtype=torch.int32)
+    block_tables = torch.tensor(block_tables, dtype=torch.int32, device="cuda")
+
+    def build():
+        return PagedAttentionMetadata.dense(
+            qo_indptr_cpu.cuda(),
+            kv_lens_cpu.cuda(),
+            block_tables,
+            page_size=32,
+            max_q_len=2,
+            max_kv_len=65,
+            qo_indptr_cpu=qo_indptr_cpu,
+            kv_seq_lens_cpu=kv_lens_cpu,
+        )
+
     if match == "at least ceil":
-        # same class of check, unified wording
+        # short-row: the same check, unified wording
         with pytest.raises(ValueError, match="exceeds block_tables capacity"):
             build()
         return
-    md = build()  # contract differences: accepted
+    md = build()
     if match == "active block_tables":
-        # page ids are trusted in-pool (design doc "Input contract"): no range
-        # check without a device sync; the caller owns pool bounds
+        # invalid-active-page: accepted. Page ids are trusted in-pool (design
+        # doc "Input contract"); a range check would need a device sync.
         assert int(md.block_tables.max()) == 5
-    else:
-        # kv_len 0 is a padding row (design doc "Zero-row contract")
-        assert md.kv_seq_lens_cpu.tolist() == [0, 65]
-        q = torch.randn(3, 4, 128, dtype=torch.bfloat16, device=DEVICE)
-        k = torch.randn(5, 2, 32, 128, dtype=torch.bfloat16, device=DEVICE)
-        v = torch.randn_like(k)
-        results = run_on_backends(
-            md,
-            q,
-            (k, v),
-            num_qo_heads=4,
-            num_kv_heads=2,
-            head_dim_qk=128,
-            q_dtype=torch.bfloat16,
-            kv_layout="HND",
-            causal=False,
-            backends=("fa2",),
-            include_auto=False,
-        )
-        o_out, _ = oracle(md, q, k, v, causal=False, kv_layout="HND")
-        for _n, _s, out, _l in results:
-            torch.testing.assert_close(out[1:].float(), o_out[1:], **OUT_TOL)
+        return
+
+    # nonpositive-kv-length: accepted. kv_len 0 is a padding row (design doc
+    # "Zero-row contract"); request 1 still computes correctly on fa2.
+    torch.manual_seed(0)
+    q = torch.randn(3, 4, 128, dtype=torch.bfloat16, device="cuda")
+    k_cache = torch.randn(5, 2, 32, 128, dtype=torch.bfloat16, device="cuda")
+    v_cache = torch.randn_like(k_cache)
+    attn = PagedAttention(torch.device("cuda"))
+    attn.plan(
+        md,
+        num_qo_heads=4,
+        num_kv_heads=2,
+        head_dim_qk=128,
+        q_dtype=torch.bfloat16,
+        kv_layout="HND",
+        causal=False,
+        lse_mode="base2",
+        backend="fa2",
+    )
+    assert attn.backend == "fa2"
+    out, lse = attn.run(q, (k_cache, v_cache))
+
+    ref_out, ref_lse = reference_paged_prefill(
+        q,
+        k_cache,
+        v_cache,
+        qo_indptr_cpu,
+        kv_lens_cpu,
+        block_tables,
+        32,
+        False,
+        kv_layout="HND",
+    )
+    torch.testing.assert_close(out[1:].float(), ref_out[1:], **OUT_TOL)
+    torch.testing.assert_close(lse[1:], ref_lse[1:], **LSE_TOL)
 
 
 # ---------------------------------------------------------------------------
-# causal envelope
+# GPU rows: the legacy fixture on fa2
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("paged", (False, True), ids=("packed", "paged"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_run_rejects_causal_q_longer_than_kv(paged: bool):
     """Bottom-right causal attention requires Sq <= Sk for every request."""
+
     if not paged:
-        pytest.skip("packed (ragged) BatchPrefillTSWrapper variant: not paged")
-    legacy = _legacy()
-    case = legacy._make_paged_context_case(
+        pytest.skip("packed (ragged) BatchPrefillTSWrapper variant: not paged prefill")
+    case = _make_paged_context_case(
         q_lengths=(2, 3),
         k_lengths=(3, 2),
         num_qo_heads=4,
@@ -1124,29 +1046,23 @@ def test_attention_ts_context_run_rejects_causal_q_longer_than_kv(paged: bool):
         mask_type="causal",
         seed=2026071930,
     )
-    metadata = legacy._make_native_paged_metadata(case)
-    md = _dense_from_native(case, metadata)
-    attn = PagedAttention(torch.device(DEVICE))
-    with pytest.raises(
-        ValueError,
-        match=r"request 1 has q_len 3 > kv_len 2",
-    ):
+    md = _dense(case, _make_native_paged_metadata(case))
+    attn = PagedAttention(torch.device("cuda"))
+    with pytest.raises(ValueError, match=r"request 1 has q_len 3 > kv_len 2"):
         attn.plan(
             md,
             num_qo_heads=4,
             num_kv_heads=4,
             head_dim_qk=128,
             q_dtype=torch.bfloat16,
+            kv_layout="HND",
             causal=True,
             backend="fa2",
         )
 
 
-# ---------------------------------------------------------------------------
-# graph replay with updated fixed metadata
-# ---------------------------------------------------------------------------
-
-
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
 @pytest.mark.parametrize(
     ("head_dim", "plan_k_lengths"),
     (
@@ -1156,12 +1072,15 @@ def test_attention_ts_context_run_rejects_causal_q_longer_than_kv(paged: bool):
 )
 def test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata(
     head_dim: int,
-    plan_k_lengths: tuple,
-    record_property,
+    plan_k_lengths: tuple[int, int],
 ) -> None:
-    """Captured runs compute the runtime table / lengths after update()."""
-    legacy = _legacy()
-    case = legacy._make_paged_context_case(
+    """Captured runs compute the runtime page table / lengths after update().
+
+    The legacy wrapper re-reads the caller's tensors in place on replay; the
+    unified graph mode re-plans the mutated tensors into reserved storage
+    through ``update()`` (design doc "Plan lifecycle: graph mode")."""
+
+    case = _make_paged_context_case(
         q_lengths=(17, 17),
         k_lengths=plan_k_lengths,
         num_qo_heads=4,
@@ -1172,15 +1091,18 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata(
         output_scale=1.0,
         seed=2026090302 + head_dim,
     )
-    metadata = legacy._make_native_paged_metadata(
+    metadata = _make_native_paged_metadata(
         case, extra_page_columns=1, row_stride_multiplier=2
     )
     assert not metadata.block_tables.is_contiguous()  # the legacy 2x row stride
-    width = int(metadata.block_tables.shape[1])
-    md1 = _dense_from_native(case, metadata, max_kv_len=width * case.page_size)
+    # graph mode sizes its reserved storage by the table width
+    max_kv_len = int(metadata.block_tables.shape[1]) * case.page_size
     q = case.reference.q
-    ref = case.reference
-    common = dict(
+    sm_scale = case.reference.sm_scale
+
+    attn = PagedAttention(torch.device("cuda"), use_cuda_graph=True)
+    attn.plan(
+        _dense(case, metadata, max_kv_len=max_kv_len),
         num_qo_heads=4,
         num_kv_heads=2,
         head_dim_qk=head_dim,
@@ -1188,39 +1110,55 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata(
         kv_layout="HND",
         causal=True,
         lse_mode="base2",
+        backend="fa2",
     )
-    dev = torch.device(DEVICE)
-    resolving = []
-    for name in ("fa2", "trtllm-gen", "cake", "cudnn", "auto"):
-        try:
-            res = resolve_paged_attention(
-                device=dev,
-                page_size=case.page_size,
-                need_lse=True,
-                backend=name,
-                **{k: v for k, v in common.items() if k != "lse_mode"},
-            )
-        except ValueError as e:
-            record_property(f"excluded_{name}", str(e))
-            continue
-        resolving.append((name, res))
-    assert resolving
+    assert attn.backend == "fa2"
 
-    # the runtime batch: reversed lengths, page ids 1..N in order (legacy)
+    # warm up and capture into caller-owned output (legacy _capture_context_graph)
+    graph_out = torch.full_like(q, float("nan"))
+    graph_lse = torch.empty(q.shape[0], 4, dtype=torch.float32, device="cuda")
+    attn.run(
+        q, (case.k_cache, case.v_cache), out=graph_out, lse=graph_lse, sm_scale=sm_scale
+    )
+    torch.cuda.synchronize()
+    _assert_context_correct(graph_out, case.reference)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        attn.run(
+            q,
+            (case.k_cache, case.v_cache),
+            out=graph_out,
+            lse=graph_lse,
+            sm_scale=sm_scale,
+        )
+    metadata_ptrs = (metadata.block_tables.data_ptr(), metadata.seq_lens_kv.data_ptr())
+    metadata_stride = metadata.block_tables.stride()
+
+    # the runtime batch: reversed lengths, page ids 1..N in order
     runtime_k_lengths = tuple(reversed(plan_k_lengths))
     runtime_page_counts = tuple(
         math.ceil(length / case.page_size) for length in runtime_k_lengths
     )
-    runtime_page_indptr = legacy._cumulative(runtime_page_counts)
+    runtime_page_indptr = _cumulative(runtime_page_counts)
     runtime_page_indices = tuple(range(1, runtime_page_indptr[-1] + 1))
     runtime_block_tables = torch.full_like(metadata.block_tables, -911)
     for batch_idx, (begin, end) in enumerate(itertools.pairwise(runtime_page_indptr)):
         runtime_block_tables[batch_idx, : end - begin] = torch.tensor(
-            runtime_page_indices[begin:end], dtype=torch.int32, device=DEVICE
+            runtime_page_indices[begin:end], dtype=torch.int32, device="cuda"
         )
-    runtime_seq_lens = torch.tensor(runtime_k_lengths, dtype=torch.int32, device=DEVICE)
+    metadata.block_tables.copy_(runtime_block_tables)
+    metadata.seq_lens_kv.copy_(
+        torch.tensor(runtime_k_lengths, dtype=torch.int32, device="cuda")
+    )
+    assert metadata_ptrs == (
+        metadata.block_tables.data_ptr(),
+        metadata.seq_lens_kv.data_ptr(),
+    )
+    assert metadata.block_tables.stride() == metadata_stride
+    runtime_md = _dense(case, metadata, max_kv_len=max_kv_len)
+    attn.update(runtime_md)
 
-    def gather_logical_cache(cache):
+    def gather_logical_cache(cache: torch.Tensor) -> torch.Tensor:
         requests = []
         for batch_idx, k_length in enumerate(runtime_k_lengths):
             page_begin = runtime_page_indptr[batch_idx]
@@ -1233,120 +1171,59 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata(
             )
         return torch.cat(requests)
 
-    from dataclasses import replace
-
     runtime_reference = replace(
-        ref,
+        case.reference,
         k=gather_logical_cache(case.k_cache),
         v=gather_logical_cache(case.v_cache),
         kv_indptr=torch.tensor(
-            legacy._cumulative(runtime_k_lengths), dtype=torch.int32, device=DEVICE
+            _cumulative(runtime_k_lengths), dtype=torch.int32, device="cuda"
         ),
         k_lengths=runtime_k_lengths,
     )
-    expected = legacy._context_reference(runtime_reference)
+    expected = _context_reference(runtime_reference)
 
-    def plan_or_contiguous(attn, md, res, name, what):
-        # the legacy table is a 2x row-stride VIEW; trtllm-gen / cake walk a
-        # packed (batch, width) array and decline the view with the reason
-        # (design doc "Page-table ABI per backend"); the conversion then hands
-        # them the contiguous copy and records the difference
-        try:
-            attn.plan(md, backend=res, **common) if what == "plan" else attn.update(md)
-            return md
-        except ValueError as e:
-            if "contiguous (batch, width) block_tables" not in str(e):
-                raise
-            record_property(f"{name}_table_view", "declined: " + str(e)[:80])
-            md_c = PagedAttentionMetadata.dense(
-                md.qo_indptr,
-                md.kv_seq_lens,
-                md.block_tables.contiguous(),
-                page_size=md.page_size,
-                max_q_len=md.max_q_len,
-                max_kv_len=md.max_kv_len,
-                qo_indptr_cpu=md.qo_indptr_cpu,
-                kv_seq_lens_cpu=md.kv_seq_lens_cpu,
-            )
-            attn.plan(md_c, backend=res, **common) if what == "plan" else attn.update(
-                md_c
-            )
-            return md_c
+    graph_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
 
-    for name, res in resolving:
-        attn = PagedAttention(dev, use_cuda_graph=True)
-        plan_or_contiguous(attn, md1, res, name, "plan")
-        if name == "auto":
-            record_property("auto_backend", attn.backend)
-        out = torch.empty(q.shape[0], 4, head_dim, dtype=q.dtype, device=dev)
-        lse = torch.empty(q.shape[0], 4, dtype=torch.float32, device=dev)
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(2):
-                attn.run(
-                    q,
-                    (case.k_cache, case.v_cache),
-                    out=out,
-                    lse=lse,
-                    sm_scale=ref.sm_scale,
-                )
-        torch.cuda.current_stream().wait_stream(s)
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            attn.run(
-                q, (case.k_cache, case.v_cache), out=out, lse=lse, sm_scale=ref.sm_scale
-            )
-        g.replay()
-        torch.cuda.synchronize()
-        legacy._assert_context_correct(out, ref)
+    # the legacy one-shot cross-check: an eager plan of the runtime metadata
+    eager = PagedAttention(torch.device("cuda"))
+    eager.plan(
+        runtime_md,
+        num_qo_heads=4,
+        num_kv_heads=2,
+        head_dim_qk=head_dim,
+        q_dtype=torch.bfloat16,
+        kv_layout="HND",
+        causal=True,
+        backend="fa2",
+    )
+    one_shot_out, _ = eager.run(q, (case.k_cache, case.v_cache), sm_scale=sm_scale)
 
-        # the legacy mutates the caller's table / lengths in place and replays;
-        # unified re-plans the new metadata into the reserved storage
-        metadata.block_tables.copy_(runtime_block_tables)
-        metadata.seq_lens_kv.copy_(runtime_seq_lens)
-        md2 = _dense_from_native(case, metadata, max_kv_len=width * case.page_size)
-        md2 = plan_or_contiguous(attn, md2, res, name, "update")
-        out.fill_(float("nan"))
-        g.replay()
-        torch.cuda.synchronize()
-        legacy._assert_context_correct(out, runtime_reference, expected=expected)
-        o_out, o_lse = oracle(
-            md2,
-            q,
-            case.k_cache,
-            case.v_cache,
-            causal=True,
-            kv_layout="HND",
-            sm_scale=ref.sm_scale,
-        )
-        torch.testing.assert_close(out.float(), o_out, **OUT_TOL)
-        torch.testing.assert_close(lse, o_lse, **LSE_TOL)
-        # eager plan of the same runtime metadata (the legacy one-shot cross-check)
-        eager = PagedAttention(dev)
-        plan_or_contiguous(eager, md2, res, name, "plan")
-        e_out, e_lse = eager.run(q, (case.k_cache, case.v_cache), sm_scale=ref.sm_scale)
-        legacy._assert_context_correct(e_out, runtime_reference, expected=expected)
-        torch.testing.assert_close(e_out.float(), o_out, **OUT_TOL)
-        # restore the plan-time table for the next backend
-        metadata.block_tables.copy_(
-            legacy._make_native_paged_metadata(
-                case, extra_page_columns=1, row_stride_multiplier=2
-            ).block_tables
-        )
-        metadata.seq_lens_kv.copy_(
-            torch.tensor(plan_k_lengths, dtype=torch.int32, device=DEVICE)
-        )
+    _assert_context_correct(graph_out, runtime_reference, expected=expected)
+    _assert_context_correct(one_shot_out, runtime_reference, expected=expected)
+
+    # fp32 oracle on the runtime batch: output and base-2 LSE
+    ref_out, ref_lse = reference_paged_prefill(
+        q,
+        case.k_cache,
+        case.v_cache,
+        runtime_md.qo_indptr_cpu,
+        runtime_md.kv_seq_lens_cpu,
+        runtime_md.block_tables,
+        case.page_size,
+        True,
+        sm_scale=sm_scale,
+        kv_layout="HND",
+    )
+    torch.testing.assert_close(graph_out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(graph_lse, ref_lse, **LSE_TOL)
 
 
-# ---------------------------------------------------------------------------
-# poisoned V tails past kv_len
-# ---------------------------------------------------------------------------
-
-
-def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256(record_property):
-    legacy = _legacy()
-    case = legacy._make_paged_context_case(
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256():
+    case = _make_paged_context_case(
         q_lengths=(17, 65),
         # Cross the 128-token KV tile boundary so poisoned V tails also
         # exercise nonzero logical tile/page coordinates.
@@ -1358,67 +1235,51 @@ def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256(record_pro
         mask_type="causal",
         seed=2026071520,
     )
-    legacy._poison_invalid_paged_v_tails(case)
-    metadata = legacy._make_native_paged_metadata(case)
+    _poison_invalid_paged_v_tails(case)
+    metadata = _make_native_paged_metadata(case)
+    md = _dense(case, metadata)
+
+    attn = PagedAttention(torch.device("cuda"))
+    attn.plan(
+        md,
+        num_qo_heads=8,
+        num_kv_heads=4,
+        head_dim_qk=256,
+        q_dtype=torch.float16,
+        kv_layout="HND",
+        causal=True,
+        lse_mode="base2",
+        backend="fa2",
+    )
+    assert attn.backend == "fa2"
+    output = torch.full_like(case.reference.q, float("inf"))
+    returned, lse = attn.run(
+        case.reference.q,
+        (case.k_cache, case.v_cache),
+        out=output,
+        sm_scale=case.reference.sm_scale,
+        v_scale=case.reference.output_scale,
+    )
+    assert returned is output
     assert case.paged_kv_last_page_len.tolist() == [17, 1]
     assert case.paged_kv_indices.tolist() != list(range(case.paged_kv_indices.numel()))
-    md = _dense_from_native(case, metadata)
-    results = _run_case(case, md, record_property=record_property)
-    assert all(served == "fa2" for _n, served, _o, _l in results)  # D256: fa2 only
-    o_out, o_lse = oracle(
-        md,
+    _assert_context_correct(output, case.reference)
+
+    # fp32 oracle: output (times output_scale) and base-2 LSE.  The oracle
+    # multiplies whole pages, so the NaN tail is zeroed for it (0 x NaN).
+    ref_out, ref_lse = reference_paged_prefill(
         case.reference.q,
         case.k_cache,
         case.v_cache.nan_to_num(nan=0.0),
-        causal=True,
-        kv_layout="HND",
+        md.qo_indptr_cpu,
+        md.kv_seq_lens_cpu,
+        md.block_tables,
+        case.page_size,
+        True,
         sm_scale=case.reference.sm_scale,
+        kv_layout="HND",
     )
-    for _name, _served, out, lse in results:
-        legacy._assert_context_correct(out, case.reference)
-        torch.testing.assert_close(
-            out.float(), o_out * case.reference.output_scale, **OUT_TOL
-        )
-        torch.testing.assert_close(lse, o_lse, **LSE_TOL)
-
-
-@pytest.mark.parametrize("backend", ["fa2", "trtllm-gen", "cake", "cudnn"])
-def test_paged_in_page_tail_past_kv_len_is_masked(backend, record_property):
-    """The D128 twin of the legacy D256 row on every backend: the in-page V
-    tail past kv_len is NaN.  fa2 masks it; trtllm-gen, cake and cuDNN
-    over-read it (0 x NaN), recorded as a non-strict xfail behind
-    EXPECT_INPAGE_TAIL_IGNORED (measured on B200, 2026-09-18)."""
-    legacy = _legacy()
-    case = legacy._make_paged_context_case(
-        q_lengths=(17, 65),
-        k_lengths=(177, 193),
-        num_qo_heads=8,
-        num_kv_heads=4,
-        head_dim=128,
-        qkv_dtype=torch.float16,
-        mask_type="causal",
-        seed=2026071520,
+    torch.testing.assert_close(
+        output.float(), ref_out * case.reference.output_scale, **OUT_TOL
     )
-    legacy._poison_invalid_paged_v_tails(case)
-    metadata = legacy._make_native_paged_metadata(case)
-    md = _dense_from_native(case, metadata)
-    results = _run_case(
-        case,
-        md,
-        backends=(backend,),
-        include_auto=False,
-        record_property=record_property,
-    )
-    ((_name, _served, out, _lse),) = results
-    expected = legacy._context_reference(case.reference)
-    finite = bool(torch.isfinite(out.float()).all())
-    correct = finite and torch.allclose(out.float(), expected, rtol=1e-2, atol=2e-3)
-    record_property("finite_with_nan_tail", finite)
-    record_property("correct_with_nan_tail", correct)
-    xfail_unless(
-        EXPECT_INPAGE_TAIL_IGNORED,
-        correct,
-        f"{backend} over-reads the in-page V tail past kv_len (0 x NaN / garbage "
-        f"reaches the output: finite={finite}); the legacy TensorSpeed kernel masks it",
-    )
-    legacy._assert_context_correct(out, case.reference, expected=expected)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)

@@ -1,214 +1,144 @@
 """Legacy -> unified: tests/attention/test_sm120_prims_prefill_backend.py
 
-Every test function below carries the name of the legacy test it converts and
-runs the legacy fixture through flashinfer.prefill.PagedAttention.
+The legacy subject is the ``cute-dsl-prims`` backend of the paged / ragged
+prefill wrappers (SM120 only, nvidia-cutlass-dsl >= 4.7.0).  Every paged
+legacy case is an fp8 e4m3 q / K / V problem at head_dim 32 with an output
+dtype of its own: the unified API has no fp8 q (nor head_dim 32, nor an output
+dtype), so the converted cases assert the plan() rejection of the legacy
+configuration and stop.  The legacy gate is mirrored, so the rows skip where
+the legacy skips.
 
-CI: the legacy file is in no A10G fixed shard; the H100 lane collects it at
-1/5 sampling and every row skips on the SM120 + nvidia-cutlass-dsl>=4.7.0
-gate, so the ``cute-dsl-prims`` backend never executed in PR CI (reports/
-unified-prefill-round4-20260918/ci-status.md).  On B200 the legacy file skips
-entirely (12 skipped).
-
-The ``cute-dsl-prims`` backend of the legacy paged wrapper (SM120 only) is
-not a unified backend, and every paged legacy row is an fp8 e4m3 q / K / V
-problem at head_dim 32 with a bf16 / fp16 output -- three axes the unified
-API does not express (fp8 q: EXPECT_FP8_Q; head_dim 32: EXPECT_HEAD_DIM_32;
-an output dtype independent of q: EXPECT_OUTPUT_DTYPE), so no numeric
-workload of this file can run through ``PagedAttention`` today: each paged
-row asserts the clear rejections for its exact shape, and the lifecycle /
-compile-cache / PDL contracts are ``native-only``.
-
-Cannot-cover / partial notes (kept next to the LEGACY_MAP rows):
-- test_paged_public_wrapper: fp8 q, D32, bf16 output, ``workspace_size()``
-  == (0, 0) (a backend-private fact; the unified analog is
-  ``PagedAttention.workspace_requirements``) and ``enable_pdl`` (no unified
-  knob) -- rejections asserted, nothing runs.
-- test_cuda_graph_reads_updated_caller_block_table: the legacy graph re-reads
-  a caller-owned table mutated in place; the unified graph mode re-plans via
-  ``update(metadata)`` (converted on a runnable shape in
-  test_legacy_unified_attention_ts_context.py); this row's fp8 / D32 fixture
-  asserts the rejections.
-- test_cuda_graph_rejects_uncompiled_specialization: a "compile before
-  capture" contract of the cute-dsl backend; unified refuses plan() under
-  capture altogether (native-only here, converted in the TensorSpeed file).
-- test_prims_fail_fast_for_unsupported_options: ``max_sequence_kv`` and the
-  sinks rejection are backend-private options; the unified analog of "a
-  feature the backend lacks" is the resolve-time capability exclusion
-  (asserted for sinks on cuDNN).
-- test_prims_accepts_combined_hnd_cache_and_pdl: compile-cache hit accounting
-  and PDL are backend-private (native-only).
-- test_ragged_public_wrapper: ragged, out-of-scope.
+The ragged test is out of scope; the CUDA-graph compile-before-capture, the
+backend-private option rejections (``max_sequence_kv``, sinks) and the
+compile-cache / PDL accounting are contracts of the cute-dsl-prims backend
+(native-only).
 """
 
-import inspect
+from importlib.metadata import PackageNotFoundError, version
 
 import pytest
 import torch
+from packaging.version import Version
 
-from flashinfer.experimental.paged_attention import CAPABILITIES
-from flashinfer.prefill import PagedAttention, resolve_paged_attention
+from flashinfer.prefill import PagedAttention, PagedAttentionMetadata
 
-from .legacy_unified_helpers import (
-    DEVICE,
-    EXPECT_HEAD_DIM_32,
-    EXPECT_OUTPUT_DTYPE,
-    check_legacy_map,
-    check_legacy_map_complete,
-    fp8_q_rejected,
-    gated,
-    output_dtype_knob_present,
-)
-
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-
+# Read by the legacy <-> unified parity report:
+# (legacy nodeid, [unified test functions], status, note)
 LEGACY_SOURCE = "tests/attention/test_sm120_prims_prefill_backend.py"
-
 LEGACY_MAP = [
-    # (legacy nodeid, [unified test function names in this file], status, note)
     (
         "tests/attention/test_sm120_prims_prefill_backend.py::test_ragged_public_wrapper",
         [],
         "out-of-scope",
-        "BatchPrefillWithRaggedKVCacheWrapper(backend='cute-dsl-prims'): ragged",
+        "BatchPrefillWithRaggedKVCacheWrapper: ragged KV",
     ),
     (
         "tests/attention/test_sm120_prims_prefill_backend.py::test_paged_public_wrapper",
         ["test_paged_public_wrapper"],
         "unsupported-by-design",
-        "fp8 q / K / V at D32 with a bf16 output (H4:2, page 16/32/64/128, causal): "
-        "fp8 q (EXPECT_FP8_Q), head_dim 32 (EXPECT_HEAD_DIM_32) and the output dtype "
-        "(EXPECT_OUTPUT_DTYPE) each assert their rejection per page size; the "
-        "workspace_size() == (0, 0) fact and enable_pdl are backend-private",
+        "fp8 q / K / V at head_dim 32 with a bf16 output: asserts the fp8 q rejection; "
+        "legacy SM120 gate mirrored",
     ),
     (
         "tests/attention/test_sm120_prims_prefill_backend.py::test_cuda_graph_reads_updated_caller_block_table",
         ["test_cuda_graph_reads_updated_caller_block_table"],
         "unsupported-by-design",
-        "same fp8 / D32 fixture: rejections asserted; the graph-replay semantics "
-        "differ by design (legacy re-reads the caller's table in place, unified "
-        "re-plans through update(metadata), converted on a runnable shape in "
-        "test_legacy_unified_attention_ts_context.py)",
+        "fp8 q / K / V at head_dim 32 with an fp16 output: asserts the fp8 q rejection; "
+        "legacy SM120 gate mirrored",
     ),
     (
         "tests/attention/test_sm120_prims_prefill_backend.py::test_cuda_graph_rejects_uncompiled_specialization",
-        ["test_sm120_prims_is_not_a_unified_backend"],
+        [],
         "native-only",
-        "'compiled before CUDA Graph capture' is a cute-dsl-prims artifact contract; "
-        "unified plan() refuses to run under capture at all (converted in the "
-        "TensorSpeed file)",
+        "'compiled before CUDA Graph capture' artifact contract of cute-dsl-prims",
     ),
     (
         "tests/attention/test_sm120_prims_prefill_backend.py::test_prims_fail_fast_for_unsupported_options",
-        ["test_prims_fail_fast_for_unsupported_options"],
+        [],
         "native-only",
-        "max_sequence_kv and the sinks NotImplementedError are backend-private "
-        "options of cute-dsl-prims; the unified analog -- a capability exclusion "
-        "named at resolve time -- is asserted for sinks on cuDNN",
+        "max_sequence_kv and the sinks NotImplementedError are cute-dsl-prims options",
     ),
     (
         "tests/attention/test_sm120_prims_prefill_backend.py::test_prims_accepts_combined_hnd_cache_and_pdl",
-        ["test_sm120_prims_is_not_a_unified_backend"],
+        [],
         "native-only",
-        "compile-cache hit accounting across enable_pdl values is a cute-dsl-prims "
-        "contract; unified has no PDL knob (a backend launch detail)",
+        "compile-cache hit accounting across enable_pdl values of cute-dsl-prims",
     ),
 ]
 
 
-def test_legacy_map_is_well_formed():
-    check_legacy_map(LEGACY_MAP, globals())
-    check_legacy_map_complete(LEGACY_SOURCE, LEGACY_MAP)
+def _has_required_cutlass_dsl() -> bool:
+    try:
+        installed_version = version("nvidia-cutlass-dsl")
+    except PackageNotFoundError:
+        return False
+    return Version(installed_version) >= Version("4.7.0")
 
 
-def test_sm120_prims_is_not_a_unified_backend():
-    """The anchor of the native-only rows: no cute-dsl-prims backend, no
-    compile-cache / PDL surface on PagedAttention."""
-    assert "cute-dsl-prims" not in CAPABILITIES
-    params = set(inspect.signature(PagedAttention.plan).parameters) | set(
-        inspect.signature(PagedAttention.run).parameters
-    )
-    assert not any("pdl" in p or "cache_info" in p for p in params)
-    assert not any(
-        hasattr(PagedAttention, attr) for attr in ("cache_info", "cache_clear")
-    )
-
-
-def _assert_legacy_regime_rejected(*, page_size: int) -> None:
-    """The whole legacy regime -- fp8 q / K / V, head_dim 32, an output dtype
-    of its own -- for the legacy shape (H4:2 / H2:1, HND, causal)."""
-    assert output_dtype_knob_present() == EXPECT_OUTPUT_DTYPE
-    res = fp8_q_rejected(
-        backend="fa2",
-        num_qo_heads=4,
-        num_kv_heads=2,
-        head_dim=128,  # fp8 q is rejected before the head dim is looked at
-        page_size=page_size,
-        kv_layout="HND",
-        causal=True,
-    )
-    if res is not None:
-        pytest.fail("EXPECT_FP8_Q flipped: run the legacy fp8 fixture here")
-    res = gated(
-        EXPECT_HEAD_DIM_32,
-        lambda: resolve_paged_attention(
-            device=torch.device(DEVICE),
-            num_qo_heads=4,
-            num_kv_heads=2,
-            head_dim_qk=32,
-            q_dtype=torch.bfloat16,
-            page_size=page_size,
-            kv_layout="HND",
-            causal=True,
-            need_lse=True,
-        ),
-        match="unsupported head dims \\(32, 32\\)",
-    )
-    if res is not None:
-        pytest.fail("EXPECT_HEAD_DIM_32 flipped: run the D32 bf16 twin here")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (12, 0)
+    or not _has_required_cutlass_dsl(),
+    reason="requires SM120 and nvidia-cutlass-dsl>=4.7.0",
+)
 
 
 @pytest.mark.parametrize("page_size", [16, 32, 64, 128])
 def test_paged_public_wrapper(page_size):
-    _assert_legacy_regime_rejected(page_size=page_size)
-    # the unified workspace contract that replaces workspace_size() == (0, 0)
-    assert callable(getattr(PagedAttention, "workspace_requirements", None))
+    """The legacy batch (q lens 3 / 2, kv lens 5 / 4, H4:2, D32, HND, causal)
+    in fp8 e4m3: plan() rejects the fp8 q on every backend."""
+    device = torch.device("cuda:0")
+    qo = torch.tensor([0, 3, 5], dtype=torch.int32)
+    kv_lens = torch.tensor([5, 4], dtype=torch.int32)
+    page_indices = torch.tensor([3, 1, 4], dtype=torch.int32)
+    md = PagedAttentionMetadata.csr(
+        qo.to(device),
+        kv_lens.to(device),
+        page_indices.to(device),
+        page_size=page_size,
+        max_q_len=3,
+        max_kv_len=5,
+        qo_indptr_cpu=qo,
+        kv_seq_lens_cpu=kv_lens,
+    )
+    with pytest.raises(ValueError, match="unsupported q dtype torch.float8_e4m3fn"):
+        PagedAttention(device).plan(
+            md,
+            num_qo_heads=4,
+            num_kv_heads=2,
+            head_dim_qk=32,
+            q_dtype=torch.float8_e4m3fn,
+            kv_dtype=torch.float8_e4m3fn,
+            kv_layout="HND",
+            causal=True,
+            lse_mode="base2",
+        )
 
 
 def test_cuda_graph_reads_updated_caller_block_table():
-    _assert_legacy_regime_rejected(page_size=16)
-    # the unified graph-mode re-plan entry point (design doc "Plan lifecycle")
-    assert callable(getattr(PagedAttention, "update", None))
-    assert "use_cuda_graph" in inspect.signature(PagedAttention.__init__).parameters
-
-
-def test_prims_fail_fast_for_unsupported_options():
-    """A feature the backend lacks is a resolve-time exclusion with the
-    reason, never a NotImplementedError at run: sinks on cuDNN."""
-    _assert_legacy_regime_rejected(page_size=16)
-    plan_params = inspect.signature(PagedAttention.plan).parameters
-    assert "max_sequence_kv" not in plan_params
-    with pytest.raises(ValueError, match="attention sinks not supported"):
-        resolve_paged_attention(
-            device=torch.device(DEVICE),
-            num_qo_heads=4,
-            num_kv_heads=2,
-            head_dim_qk=128,
-            q_dtype=torch.bfloat16,
-            page_size=16,
-            kv_layout="HND",
-            causal=True,
-            sinks=True,
-            backend="cudnn",
-        )
-    res = resolve_paged_attention(
-        device=torch.device(DEVICE),
-        num_qo_heads=4,
-        num_kv_heads=2,
-        head_dim_qk=128,
-        q_dtype=torch.bfloat16,
+    """The legacy graph batch (one q token over one full page 16, H2:1, D32,
+    HND) in fp8 e4m3: plan() rejects the fp8 q on every backend."""
+    device = torch.device("cuda:0")
+    indptr = torch.tensor([0, 1], dtype=torch.int32)
+    kv_lens = torch.tensor([16], dtype=torch.int32)
+    md = PagedAttentionMetadata.dense(
+        indptr.to(device),
+        kv_lens.to(device),
+        torch.tensor([[0]], dtype=torch.int32, device=device),
         page_size=16,
-        kv_layout="HND",
-        causal=True,
-        sinks=True,
+        max_q_len=1,
+        max_kv_len=16,
+        qo_indptr_cpu=indptr,
+        kv_seq_lens_cpu=kv_lens,
     )
-    assert "cudnn" in res.excluded and "cudnn" not in res.backends
+    with pytest.raises(ValueError, match="unsupported q dtype torch.float8_e4m3fn"):
+        PagedAttention(device, use_cuda_graph=True).plan(
+            md,
+            num_qo_heads=2,
+            num_kv_heads=1,
+            head_dim_qk=32,
+            q_dtype=torch.float8_e4m3fn,
+            kv_dtype=torch.float8_e4m3fn,
+            kv_layout="HND",
+            causal=False,
+        )

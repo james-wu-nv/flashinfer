@@ -302,7 +302,11 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         name="trtllm-gen",
         cc_majors=frozenset({10}),
         q_dtypes=_F16,
-        head_dims=frozenset({(128, 128)}),
+        # (64, 64): the legacy sink context suite
+        # (tests/attention/test_attention_sink_blackwell.py) passes every D64
+        # point on B200, and the unified conversion runs the same fixtures on
+        # trtllm-gen against the legacy reference and the oracle.
+        head_dims=frozenset({(64, 64), (128, 128)}),
         # Every page size the paged context kernel ships for.  128 .. 1024
         # measured on B200 (2026-09-17) through the unified API against the
         # oracle: GQA 32/8 and 8/2, bf16, q [257, 1, 100, 40] over kv
