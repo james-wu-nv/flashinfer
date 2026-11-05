@@ -10,28 +10,37 @@ Layout (mirrors ``flashinfer/mla/_batch_mla/``):
     _contracts.py    PlanMetadata, Resolution, loud-error helpers
     _planning.py     structural/value validation, canonical -> derived forms
     _selection.py    tensor-free resolve_paged_attention() (level-1 selection)
-    _controller.py   plan()/run() lifecycle, transactional publication
+    _controller.py   plan()/update()/run() lifecycle, transactional publication
+    _graph.py        GraphCapacity, reserved storage and staging for CUDA graphs
     _backends/       one module per backend + declarative capabilities
 
 Reject-or-correct is the property the whole package is built around: any
 call either raises a clean, actionable error or returns results matching an
-independent reference. ``tests/experimental/test_paged_attention_fuzzer.py``
+independent reference.
+``tests/experimental/paged_attention/test_paged_attention_fuzzer.py``
 enforces it with randomized valid and corrupted inputs.
 """
 
-from ._backends import CAPABILITIES, MIN_DENSE_PAGE_SIZE, PagedAttentionCapabilities
+from ._backends import (
+    CAPABILITIES,
+    MIN_DENSE_PAGE_SIZE,
+    PagedAttentionCapabilities,
+    derived_needs,
+)
 from ._contracts import PagedAttentionMetadata, PlanMetadata, Resolution
-from ._controller import PagedAttentionController
+from ._controller import PagedAttentionController, workspace_requirements
 from ._graph import GraphBuffers, GraphCapacity
-from ._planning import Derived, derive
-from ._selection import HEURISTIC_ORDER, resolve_paged_attention
+from ._planning import DERIVED_FORMS, Derived, HostArrays, derive
+from ._selection import HEURISTIC_ORDER, heuristic_order, resolve_paged_attention
 
 __all__ = [
     "CAPABILITIES",
+    "DERIVED_FORMS",
     "Derived",
     "GraphBuffers",
     "GraphCapacity",
     "HEURISTIC_ORDER",
+    "HostArrays",
     "MIN_DENSE_PAGE_SIZE",
     "PagedAttentionCapabilities",
     "PagedAttentionController",
@@ -39,5 +48,8 @@ __all__ = [
     "PlanMetadata",
     "Resolution",
     "derive",
+    "derived_needs",
+    "heuristic_order",
     "resolve_paged_attention",
+    "workspace_requirements",
 ]

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 import torch
 
@@ -42,6 +42,52 @@ def _expect_window_left(window_left: int) -> None:
     )
 
 
+def _normalize_logits_soft_cap(logits_soft_cap: Optional[float]) -> Optional[float]:
+    """``None`` / ``0`` mean "no soft cap" (the legacy convention); anything
+    else must be a positive finite host float and is returned as ``float``."""
+    if logits_soft_cap is None:
+        return None
+    _expect(
+        isinstance(logits_soft_cap, (int, float))
+        and not isinstance(logits_soft_cap, bool)
+        and math.isfinite(logits_soft_cap)
+        and logits_soft_cap >= 0,
+        "logits_soft_cap must be None (off) or a non-negative finite host float "
+        f"(cap * tanh(score / cap)), got {logits_soft_cap!r}",
+    )
+    return float(logits_soft_cap) if logits_soft_cap > 0 else None
+
+
+def _expect_custom_mask(
+    custom_mask: torch.Tensor, device: torch.device, numel: int
+) -> None:
+    """The flattened per-request boolean mask contract (legacy mask layout)."""
+    _expect(
+        isinstance(custom_mask, torch.Tensor),
+        f"custom_mask must be a torch.Tensor, got {type(custom_mask).__name__}",
+    )
+    _expect(
+        custom_mask.dtype == torch.bool,
+        f"custom_mask must be a bool tensor (True = may attend), got {custom_mask.dtype}",
+    )
+    _expect(
+        custom_mask.device == device,
+        f"custom_mask lives on {custom_mask.device} but this instance is bound to {device}",
+    )
+    _expect(
+        custom_mask.dim() == 1 and custom_mask.is_contiguous(),
+        "custom_mask must be a contiguous 1-D tensor: the per-request "
+        "(q_len_i, kv_len_i) masks flattened row-major and concatenated in "
+        f"request order, got shape {tuple(custom_mask.shape)}",
+    )
+    _expect(
+        custom_mask.numel() == numel,
+        f"custom_mask has {custom_mask.numel()} elements but the batch needs "
+        f"sum(q_len_i * kv_len_i) = {numel} (flattened per-request masks in "
+        "request order)",
+    )
+
+
 def _expect_page_size(page_size: int, kv_input_form: str) -> None:
     _expect(
         isinstance(page_size, int) and page_size >= 1,
@@ -70,8 +116,35 @@ def resolve_config_key(
     need_lse,
     window_left,
     kv_input_form,
+    logits_soft_cap,
+    custom_mask,
+    sinks,
+    max_q_len,
+    cc_major,
+    cc_minor,
+    device_index,
 ) -> Tuple:
-    """The observational config a Resolution is pinned to (drift detection)."""
+    """The observational config a Resolution is pinned to (drift detection).
+
+    ``logits_soft_cap`` (normalized value or None), ``custom_mask`` and
+    ``sinks`` (booleans) are the feature axes: pinning covers them, so a
+    plan() that requests a feature the Resolution was not resolved for is a
+    drift error rather than a silent capability change.
+
+    ``max_q_len`` is the caller's shape hint (``None`` = none): the upper
+    bound on query tokens per request the resolution's candidate order was
+    chosen for.  It is part of the key so two Resolutions of one model
+    configuration with different hints (decode vs. prefill order) are
+    distinct, and plan() checks each batch against it.
+
+    The last element is the device binding ``(cc_major, cc_minor,
+    device_index)``: a Resolution resolved on one device must not be handed
+    to a controller bound to another device or compute capability, because
+    the probes (fa3's SM90a check, cubin availability) answered for the
+    device they were given.  ``cc_minor``/``device_index`` are ``None`` when
+    the caller resolved from an explicit ``cc_major`` without a device; such a
+    Resolution is pinned to the compute-capability major only.
+    """
     return (
         num_qo_heads,
         num_kv_heads,
@@ -85,6 +158,35 @@ def resolve_config_key(
         need_lse,
         window_left,
         kv_input_form,
+        logits_soft_cap,
+        bool(custom_mask),
+        bool(sinks),
+        max_q_len,
+        (cc_major, cc_minor, device_index),
+    )
+
+
+def _expect_pinned_device(resolved: Tuple, want: Tuple) -> None:
+    """Reject a Resolution whose device binding does not cover ``want``.
+
+    ``resolved`` / ``want`` are the trailing device triples of two config
+    keys.  A ``None`` in the resolved triple means "not pinned on this axis"
+    (explicit-``cc_major`` resolution) and matches anything.
+    """
+    r_major, r_minor, r_index = resolved
+    w_major, w_minor, w_index = want
+    _expect(
+        r_major == w_major and (r_minor is None or r_minor == w_minor),
+        "the pinned Resolution was resolved for compute capability "
+        f"sm_{r_major}{'x' if r_minor is None else r_minor} but this instance runs on "
+        f"sm_{w_major}{w_minor} — the probes answered for another GPU; re-run "
+        "resolve_paged_attention(device=...) on the target device",
+    )
+    _expect(
+        r_index is None or r_index == w_index,
+        f"the pinned Resolution was resolved on cuda:{r_index} but this instance "
+        f"is bound to cuda:{w_index} — resolve once per device (or resolve from "
+        "an explicit cc_major to pin the compute capability only)",
     )
 
 
@@ -92,27 +194,65 @@ def resolve_config_key(
 class Resolution:
     """Init-time resolution result (proposal §5.3, level 1).
 
-    ``backends`` is the pinned, ordered candidate set: every member is
-    runnable for the declared configuration and observationally identical at
-    the contract level (same dtypes, same LSE availability), so a later
-    plan-time choice within this set cannot surprise the engine.  Pass the
-    whole Resolution to ``plan(backend=...)`` to enforce the pinning:
-    plan() verifies its arguments match ``config`` and chooses only within
-    ``backends``.
+    ``backends`` is the pinned, ordered candidate set: every member passed
+    the static capability check and the environment probes for the declared
+    configuration on the resolved device, and is observationally identical
+    at the contract level (same dtypes, same LSE availability), so a later
+    plan-time choice within this set cannot surprise the engine.  Membership
+    is support *evidence*, not a guarantee: a candidate may still decline a
+    specific batch at plan time with a typed unsupported signal, in which case
+    plan() continues to the next member (see ``PagedAttentionController``).
+    Pass the whole Resolution to ``plan(backend=...)`` to enforce the
+    pinning: plan() verifies its arguments and its device match ``config``
+    and chooses only within ``backends``.
     """
 
     backends: Tuple[str, ...]
     excluded: Dict[str, str] = field(default_factory=dict)
     kv_layout: str = "HND"
-    # the resolve-time observational config, used by plan() to detect drift
+    # the resolve-time observational config, used by plan() to detect drift;
+    # its last element is the device binding (cc_major, cc_minor, device_index)
     config: Tuple = ()
 
     @property
     def chosen(self) -> str:
         return self.backends[0]
 
+    @property
+    def device_binding(self) -> Tuple:
+        """``(cc_major, cc_minor, device_index)`` this Resolution answers for."""
+        return self.config[-1] if self.config else (None, None, None)
+
+    @property
+    def max_q_len(self) -> Optional[int]:
+        """The ``max_q_len`` hint this Resolution was resolved with, or ``None``.
+
+        With a hint the candidate order is the one for batches whose requests
+        have at most that many query tokens, and plan() rejects a batch (in
+        CUDA-graph mode: a capacity) whose ``max_q_len`` exceeds it.
+        """
+        return self.config[-2] if len(self.config) >= 2 else None
+
     def explain(self) -> str:
-        lines = [f"candidates (preference order): {list(self.backends)}"]
+        cc_major, cc_minor, index = self.device_binding
+        if cc_major is not None:
+            where = (
+                f"sm_{cc_major}{cc_minor}, cuda:{index}"
+                if cc_minor is not None
+                else f"sm_{cc_major}x (compute-capability major only; not "
+                "pinned to a device)"
+            )
+            lines = [f"resolved for: {where}"]
+        else:
+            lines = []
+        if self.max_q_len is not None:
+            lines.append(
+                f"max_q_len hint: {self.max_q_len} (order for batches with at most "
+                f"{self.max_q_len} query tokens per request)"
+            )
+        else:
+            lines.append("max_q_len hint: none (default order)")
+        lines.append(f"candidates (preference order): {list(self.backends)}")
         for name, reason in self.excluded.items():
             lines.append(f"excluded {name}: {reason}")
         return "\n".join(lines)
@@ -127,11 +267,38 @@ class PagedAttentionMetadata:
     make "exactly one paging form" structural.  Construction validates shapes
     and values against the host mirrors — pass the mirrors the engine already
     owns and construction is zero-sync; otherwise it performs ONE documented
-    D2H here, and every later ``plan()`` on this object is sync-free.
+    D2H here, and every later ``plan()`` on this object is sync-free.  The
+    derived forms are computed from the mirrors on the host and reach the
+    device through one pinned upload (see ``_planning.derive``).
 
     The object also owns the backend-neutral derived forms (CSR page indptr,
-    cumulative KV lengths, dense table) lazily, so several plans over the same
-    batch (windowed / full layers, causal / non-causal) derive once.
+    cumulative KV lengths, dense table) lazily and per need set, so several
+    plans over the same batch (windowed / full layers, causal / non-causal)
+    derive once and only the forms the chosen backend reads are computed.
+
+    Padding rows: ``kv_seq_lens[i] == 0`` is legal and marks a padding row
+    (vLLM's CUDA-graph padding fills ``seq_lens`` with 0 and the table row
+    with its null block; sglang's fill value 1 is an ordinary live row).  The
+    library guarantees no page of that row is read and unchanged results for
+    every other row; the row's output and LSE are unspecified and may be left
+    unwritten — never read a padding row.  Measured on B200: cuDNN
+    (``actual_seq_lens_kv=0``) and the FA kernels (a CSR row with zero pages)
+    write a zero output row and LSE -inf, trtllm-gen (``seq_lens=0``) leaves
+    the rows untouched; cake declines the batch, see the backend.  A request may also have
+    ``q_len == 0`` (``qo_indptr[i] == qo_indptr[i + 1]``, vLLM's padded
+    ``query_start_loc`` tail): it owns no query token and no output row, and
+    every backend leaves the other rows correct (ledger M17, measured with
+    the native calls); ``qo_indptr`` must be non-decreasing and the batch
+    must hold at least one query token.
+
+    In-page tail: the slots of a request's last page past ``kv_seq_lens[i]``
+    are never attended, but they must hold finite values.  The FA kernels
+    zero the tail before the PV product; trtllm-gen, cake and cuDNN load the
+    whole page and multiply the masked (zero) probabilities with V, so a NaN
+    or Inf there reaches the output as ``0 * NaN`` (ledger M23, measured on
+    B200).  Any finite content — stale tokens of an earlier request, zeros —
+    gives the exact result; a pool that is never written past ``kv_len`` is
+    only safe if its storage was initialised.
 
     Identity semantics: two objects compare by identity, not by tensor
     contents (they are meant to be built once per step and reused).
@@ -146,7 +313,13 @@ class PagedAttentionMetadata:
     kv_page_indices: Optional[torch.Tensor] = None  # flat CSR page ids
     qo_indptr_cpu: Optional[torch.Tensor] = None
     kv_seq_lens_cpu: Optional[torch.Tensor] = None
-    _derived: Dict[bool, Any] = field(default_factory=dict, repr=False)
+    # the validated host arrays (``_planning.HostArrays``): one pinned staging
+    # tensor computed at construction, uploaded once on the first plan that
+    # needs a device form; lifetime = this object
+    _host: Any = field(default=None, repr=False)
+    _derived: Dict[Tuple[FrozenSet[str], int], Any] = field(
+        default_factory=dict, repr=False
+    )
 
     # ---- constructors ----
     @classmethod
@@ -229,12 +402,20 @@ class PagedAttentionMetadata:
         )
         # Value-level validation is unconditional — it is what makes the
         # reject-or-correct property hold.  Zero-sync iff the caller hands us
-        # the host mirrors it already owns; otherwise ONE documented D2H here.
-        if self.qo_indptr_cpu is None:
+        # the host mirrors it already owns; otherwise ONE documented D2H here
+        # (both arrays packed into one transfer when both are missing).
+        if self.qo_indptr_cpu is None and self.kv_seq_lens_cpu is None:
+            b = self.kv_seq_lens.shape[0]
+            packed = torch.cat([self.qo_indptr, self.kv_seq_lens]).cpu()
+            object.__setattr__(self, "qo_indptr_cpu", packed[: b + 1])
+            object.__setattr__(self, "kv_seq_lens_cpu", packed[b + 1 :])
+        elif self.qo_indptr_cpu is None:
             object.__setattr__(self, "qo_indptr_cpu", self.qo_indptr.cpu())
-        if self.kv_seq_lens_cpu is None:
+        elif self.kv_seq_lens_cpu is None:
             object.__setattr__(self, "kv_seq_lens_cpu", self.kv_seq_lens.cpu())
-        validate_values(
+        # the causal envelope depends on plan(causal=...): see
+        # validate_causal_envelope()
+        host = validate_values(
             self.qo_indptr,
             self.kv_seq_lens,
             self.block_tables,
@@ -244,8 +425,8 @@ class PagedAttentionMetadata:
             self.max_kv_len,
             self.qo_indptr_cpu,
             self.kv_seq_lens_cpu,
-            causal=False,  # the causal envelope depends on plan(causal=...)
         )
+        object.__setattr__(self, "_host", host)
 
     # ---- derived facts ----
     @property
@@ -262,24 +443,43 @@ class PagedAttentionMetadata:
 
     @property
     def total_q_tokens(self) -> int:
-        assert self.qo_indptr_cpu is not None
-        return int(self.qo_indptr_cpu[-1])
+        return int(self._host.numpy("qo_indptr")[-1])
 
-    def derived(self, *, needs_dense: bool):
-        """Backend-neutral derived forms, computed once per (object, needs_dense)."""
-        from ._planning import derive
+    def validate_causal_envelope(self) -> None:
+        """``q_len_i <= kv_len_i`` for every request (host arrays, zero sync)."""
+        from ._planning import validate_causal_envelope
 
-        key = bool(needs_dense) or self.block_tables is not None
+        validate_causal_envelope(self._host)
+
+    def derived(self, *, needs, max_kv_len: Optional[int] = None):
+        """The derived forms in ``needs`` (``_planning.DERIVED_FORMS`` names),
+        computed once per (object, need set, width) and cached: several plans
+        over the same batch that pick the same backend derive once, and a
+        backend never pays for a form it does not read.
+
+        ``max_kv_len`` widens a dense table derived from flat page ids to
+        ``ceil(max_kv_len / page_size)`` columns (CUDA-graph mode derives at
+        the capacity so the table fits its reserved storage); ``None`` uses
+        the batch's own max, and a value below it is rejected.
+        """
+        from ._planning import derive, normalize_needs
+
+        width_max = self.max_kv_len if max_kv_len is None else max_kv_len
+        _expect(
+            width_max >= self.max_kv_len,
+            f"derived(max_kv_len={max_kv_len}) is narrower than the batch's "
+            f"max_kv_len {self.max_kv_len}",
+        )
+        key = (normalize_needs(needs), width_max)
         d = self._derived.get(key)
         if d is None:
             d = derive(
-                self.qo_indptr,
-                self.kv_seq_lens,
                 self.block_tables,
                 self.kv_page_indices,
-                self.page_size,
-                self.max_kv_len,
-                needs_dense=key,
+                width_max,
+                needs=key[0],
+                host=self._host,
+                device=self.device,
             )
             self._derived[key] = d
         return d
@@ -291,9 +491,11 @@ class PlanMetadata:
 
     Built by the controller after validation; backends receive it together
     with the derived forms (``_planning.Derived``) and must not reach past it
-    into caller state. ``block_tables`` is the dense table — given by the
-    caller or derived — and is ``None`` only when the chosen backend does not
-    need it.
+    into caller state. ``block_tables`` is the dense table — the caller's own
+    (or its copy in reserved graph storage) in the dense input form, derived
+    in the flat form — and is ``None`` only in the flat form when the chosen
+    backend does not read a dense table. In CUDA-graph mode ``max_q_len`` /
+    ``max_kv_len`` are the capacity's values, not the batch's own.
     """
 
     qo_indptr: torch.Tensor
@@ -316,6 +518,17 @@ class PlanMetadata:
     batch_size: int
     qo_indptr_cpu: torch.Tensor
     kv_seq_lens_cpu: torch.Tensor
+    # ---- feature axes (declared at plan time; capability-checked) ----
+    # softmax logits soft cap: cap * tanh(score / cap) on the scaled scores
+    # (None = off; normalized by the controller)
+    logits_soft_cap: Optional[float] = None
+    # per-request flattened boolean mask, concatenated in request order
+    # (sum(q_len_i * kv_len_i),), True = may attend; ANDed into the
+    # causal/window envelope
+    custom_mask: Optional[torch.Tensor] = None
+    # attention sinks will be passed to run(): the backend must plan the
+    # sink-aware kernel variant
+    use_sinks: bool = False
 
     @property
     def total_q_tokens(self) -> int:
@@ -325,6 +538,12 @@ class PlanMetadata:
     def need_lse(self) -> bool:
         return self.lse_mode != "none"
 
+    @property
+    def mask_numel(self) -> int:
+        """Length of the flattened custom mask this batch requires (host)."""
+        q_lens = self.qo_indptr_cpu.diff().to(torch.int64)
+        return int((q_lens * self.kv_seq_lens_cpu.to(torch.int64)).sum())
+
 
 __all__ = [
     "LN2",
@@ -332,5 +551,8 @@ __all__ = [
     "PagedAttentionMetadata",
     "PlanMetadata",
     "Resolution",
+    "_expect_custom_mask",
+    "_expect_pinned_device",
+    "_normalize_logits_soft_cap",
     "resolve_config_key",
 ]
