@@ -32,6 +32,7 @@ from typing import (
     overload,
 )
 
+import numpy as np
 import torch
 
 from .api_logging import flashinfer_api, flashinfer_experimental_api
@@ -73,6 +74,7 @@ from .mla import (
 )
 from .page import get_seq_lens
 from .quantization import packbits, segment_packbits
+from .quantization.packbits import get_quantization_module
 from .trace.templates.attention import (
     gqa_paged_prefill_trace,
     gqa_ragged_prefill_trace,
@@ -1749,6 +1751,39 @@ def _compute_page_mask_indptr(
         0,
     )
     return mask_indptr
+
+
+def _pack_custom_mask(
+    custom_mask: torch.Tensor, mask_indptr: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""``segment_packbits(custom_mask, mask_indptr, bitorder="little")`` for
+    the wrappers' plan(), without a device synchronization when the indptr
+    lives on the host.
+
+    :func:`segment_packbits` derives the packed indptr on the indptr's device
+    and reads its last entry back (``.item()``): one sync per plan, plus the
+    blocking pageable upload of the indptr itself.  With a host ``mask_indptr``
+    (the common case: callers keep qo_indptr on the CPU while the mask is on
+    the GPU) the packed layout is known on the host, so both indptrs are
+    computed there, uploaded from one pinned staging tensor with an
+    asynchronous copy, and the packbits kernel writes into an output sized
+    from the host.  A device ``mask_indptr`` takes the original path.
+    """
+    x = custom_mask.contiguous().view(-1)
+    if mask_indptr.device.type != "cpu":
+        return segment_packbits(x, mask_indptr.to(x.device), bitorder="little")
+    n = mask_indptr.shape[0]
+    staging = torch.empty(2 * n, dtype=torch.int32, pin_memory=True)
+    st = staging.numpy()
+    st[:n] = mask_indptr.numpy()
+    st[n] = 0
+    # (seglen + 7) // 8 packed bytes per segment, byte-aligned segments
+    np.cumsum((st[1:n] - st[: n - 1] + 7) // 8, out=st[n + 1 :])
+    packed_numel = int(st[2 * n - 1])
+    indptrs = staging.to(x.device, non_blocking=True)
+    y = torch.empty(packed_numel, dtype=torch.uint8, device=x.device)
+    get_quantization_module().segment_packbits(x, indptrs[:n], indptrs[n:], "little", y)
+    return y, indptrs[n:]
 
 
 # Architectures on which the NVFP4 split-KV corruption was actually observed. Keep this as narrow
@@ -3831,11 +3866,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # The segment_packbits kernel requires the indptr on the mask's
             # device (CHECK_DEVICE in quantization.cu), but mask_indptr
             # inherits qo_indptr's device, which callers (e.g. vLLM) routinely
-            # keep on CPU while the mask is on GPU.
-            packed_custom_mask, mask_indptr = segment_packbits(
-                custom_mask.contiguous().view(-1),
-                mask_indptr.to(custom_mask.device),
-                bitorder="little",
+            # keep on CPU while the mask is on GPU; _pack_custom_mask uploads
+            # it asynchronously and never reads the device back.
+            packed_custom_mask, mask_indptr = _pack_custom_mask(
+                custom_mask, mask_indptr
             )
 
         if prefix_len_ptr is not None and self._variant_owns_mask:
@@ -5974,12 +6008,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             # create packed custom mask from custom mask
             # segment_packbits requires mask_indptr on the same device as
             # custom_mask, but mask_indptr inherits qo_indptr's device (often
-            # CPU) while custom_mask is on GPU. Mirror the paged path's
-            # .to(device) so the ragged custom-mask flow doesn't crash.
-            packed_custom_mask, mask_indptr = segment_packbits(
-                custom_mask.contiguous().view(-1),
-                mask_indptr.to(custom_mask.device),
-                bitorder="little",
+            # CPU) while custom_mask is on GPU; same sync-free packing as the
+            # paged path.
+            packed_custom_mask, mask_indptr = _pack_custom_mask(
+                custom_mask, mask_indptr
             )
 
         if (
@@ -10174,7 +10206,12 @@ from ._paged_attention import (  # noqa: E402
 )
 
 _PAGED_ATTENTION_LAZY = frozenset(
-    {"PagedAttentionMetadata", "Resolution", "PagedAttentionCapabilities"}
+    {
+        "PagedAttentionMetadata",
+        "GraphCapacity",
+        "Resolution",
+        "PagedAttentionCapabilities",
+    }
 )
 
 
