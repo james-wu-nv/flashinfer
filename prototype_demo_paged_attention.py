@@ -133,5 +133,6 @@ try:  # under-claimed max: real KV goes to 256 — rejected at metadata construc
 except ValueError as e:
     print(f"ValueError: {e}")
 print(
-    "\n(reject-or-correct is machine-checked: tests/experimental/test_paged_attention_fuzzer.py)"
+    "\n(reject-or-correct is machine-checked: "
+    "tests/experimental/paged_attention/test_paged_attention_fuzzer.py)"
 )
