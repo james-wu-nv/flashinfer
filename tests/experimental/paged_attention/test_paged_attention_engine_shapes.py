@@ -22,8 +22,9 @@ the full audited list lives in integrations/README.md):
   slices work as-is.  Carried friction: no host copy of paged_kernel_lens
   exists at the plan site today (the diff adds a copy-forward of a
   scheduler-owned host array).  The radix-extend cascade (causal=False
-  over prefix lens, zero-length rows for no-prefix requests) is outside
-  the v1 envelope entirely.
+  over prefix lens, zero-length rows for no-prefix requests) stays outside
+  the v1 envelope: zero-length rows are accepted as padding rows, but their
+  LSE is unspecified and the cascade merge would have to consume it.
 """
 
 import pytest

@@ -4,7 +4,8 @@ Pure-torch fp32 implementation of paged batch prefill with bottom-right
 causal masking, returning both the output and the contract-form LSE
 (base-2, packed ``(total_q_tokens, num_qo_heads)``).  Deliberately written
 request-by-request from first principles — slow and obvious beats fast and
-kernel-shaped for an oracle.
+kernel-shaped for an oracle.  Padding rows (kv_len 0) get a zero output and
+LSE -inf; the library contract leaves them unspecified, so compare live rows.
 """
 
 import math
@@ -27,7 +28,18 @@ def reference_paged_prefill(
     kv_layout: str = "HND",
     kv_page_indices: Optional[torch.Tensor] = None,  # flat CSR page ids
     lse_base: str = "2",  # "2" (FlashInfer contract) or "e"
+    logits_soft_cap: Optional[float] = None,  # cap * tanh(score / cap), post-scale
+    custom_mask: Optional[torch.Tensor] = None,  # flattened per-request bool masks
+    sinks: Optional[torch.Tensor] = None,  # (num_qo_heads,) extra softmax logits
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Bottom-right causal / sliding-window paged attention with the optional
+    feature axes: a logits soft cap applied to the SCALED scores before
+    masking, a custom mask (the legacy flattened layout: request-ordered
+    concatenation of row-major ``(q_len_i, kv_len_i)`` boolean masks) ANDed
+    into the allowed set, and per-head attention sinks -- one extra logit
+    ``sinks[h]`` in head ``h``'s softmax denominator with no value
+    contribution, so ``lse' = logaddexp(lse, sinks[h])`` and
+    ``out' = out * exp(lse - lse')``; the returned LSE includes the sink."""
     if kv_layout == "NHD":
         k_cache = k_cache.permute(0, 2, 1, 3)
         v_cache = v_cache.permute(0, 2, 1, 3)
@@ -44,10 +56,18 @@ def reference_paged_prefill(
     )
     lse = torch.empty(total_q, num_qo_heads, device=q.device, dtype=torch.float32)
 
+    mask_off = 0
     for i in range(b):
         s, e = int(qo_indptr_cpu[i]), int(qo_indptr_cpu[i + 1])
         lq, lkv = e - s, int(kv_seq_lens_cpu[i])
         if lq == 0:
+            continue
+        if lkv == 0:
+            # padding row: the contract leaves its values unspecified (finite
+            # output); the oracle's convention is the empty softmax, so tests
+            # exclude these rows from the comparison rather than rely on it
+            out[s:e] = 0.0
+            lse[s:e] = float("-inf")
             continue
         q_i = q[s:e].float()  # (lq, Hq, Dqk)
         n_pages = (lkv + page_size - 1) // page_size
@@ -74,6 +94,8 @@ def reference_paged_prefill(
         v_i = v_i.repeat_interleave(group, dim=0)
         # scores: (Hq, lq, lkv)
         scores = torch.einsum("qhd,hkd->hqk", q_i, k_i) * sm_scale
+        if logits_soft_cap is not None and logits_soft_cap > 0:
+            scores = logits_soft_cap * torch.tanh(scores / logits_soft_cap)
         qpos = torch.arange(lq, device=q.device).unsqueeze(1)
         kpos = torch.arange(lkv, device=q.device).unsqueeze(0)
         allowed = torch.ones(lq, lkv, dtype=torch.bool, device=q.device)
@@ -85,13 +107,20 @@ def reference_paged_prefill(
             # sliding window: kv index j visible iff p - j <= window_left
             # where p = (lkv - lq) + qpos is the query's absolute kv position
             allowed &= kpos >= (lkv - lq) + qpos - window_left
-        if causal or window_left >= 0:
+        if custom_mask is not None:
+            allowed &= custom_mask[mask_off : mask_off + lq * lkv].view(lq, lkv).bool()
+            mask_off += lq * lkv
+        if causal or window_left >= 0 or custom_mask is not None:
             scores = scores.masked_fill(~allowed.unsqueeze(0), float("-inf"))
         lse_i = torch.logsumexp(scores, dim=-1)  # (Hq, lq), natural log
-        if lse_base == "2":
-            lse_i = lse_i / math.log(2)
         p = torch.softmax(scores, dim=-1)
         o_i = torch.einsum("hqk,hkd->qhd", p, v_i)  # (lq, Hq, Dvo)
+        if sinks is not None:
+            lse_sink = torch.logaddexp(lse_i, sinks.float().unsqueeze(1))  # (Hq, lq)
+            o_i = o_i * torch.exp(lse_i - lse_sink).transpose(0, 1).unsqueeze(-1)
+            lse_i = lse_sink
+        if lse_base == "2":
+            lse_i = lse_i / math.log(2)
         out[s:e] = o_i
         lse[s:e] = lse_i.transpose(0, 1)
     return out, lse

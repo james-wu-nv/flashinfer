@@ -1,0 +1,1520 @@
+"""fi_trace for the experimental ``PagedAttention.run`` (unified paged attention).
+
+The stable trace lane (``tests/trace/``) filters experimental registrations,
+so this file exercises the template directly and through the bound entry:
+
+- ``flashinfer.fi_trace(attn.run, ...)`` on planned instances over the
+  dense/CSR x HND/NHD x none/base2/basee x causal/window matrix, on fa2 and
+  on cuDNN / trtllm-gen where they resolve — the definition must not change
+  with the backend;
+- the exported ``reference`` / ``init`` sources execute in a fresh namespace,
+  the reference matches ``paged_attention_reference.py`` and the rebuilt
+  instance re-traces to the same definition;
+- auto-dump through the bound ``self`` writes a complete JSON (no unknown
+  dtypes, no missing Const values, public fi_api tag);
+- identity encodes the plan (form, q / kv dtype, layout, causal, window, LSE
+  mode, logits soft cap, sinks, custom mask) as Const axes the exported init
+  and reference take, so a CSR, fp8-KV, fp16 or feature definition rebuilds
+  from its JSON alone;
+- tracing before plan / without an instance raises; a failed re-plan still
+  traces the last successful plan; in graph mode the traced metadata is the
+  reserved storage; tracing is sync-free and read-only.
+"""
+
+from __future__ import annotations
+
+import ast
+import inspect
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+from unittest import mock
+
+import pytest
+import torch
+
+import flashinfer.trace.template as trace_template_mod
+from flashinfer.fi_trace import fi_trace
+from flashinfer.prefill import PagedAttention, resolve_paged_attention
+from flashinfer.trace.template import (
+    Const,
+    Scalar,
+    Tensor,
+    _render_init_source,
+    _render_reference_source,
+)
+from flashinfer.trace.templates.paged_attention import (
+    _paged_attention_init,
+    _paged_attention_reference,
+    _paged_attention_template,
+    paged_attention_trace_dispatch,
+)
+
+from .paged_attention_reference import reference_paged_prefill
+from .test_paged_attention_coverage import build_problem
+from .test_paged_attention_prototype import (
+    LSE_TOL,
+    OUT_TOL,
+    make_metadata,
+    make_problem,
+)
+
+cuda_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+FI_API_TAG = "fi_api:flashinfer.prefill.PagedAttention.run"
+LSE_MODES = ("none", "base2", "basee")
+LAYOUTS = ("HND", "NHD")
+FORMS = {"dense": "block_tables", "csr": "page_indices"}
+MASKS = {"causal": (True, -1), "window": (True, 32)}
+# the plan-fixed Const axes the reference takes as keyword-only int scalars
+VARIANT_AXES = (
+    "csr",
+    "fp8_kv",
+    "q_dtype",
+    "kv_layout",
+    "causal",
+    "window_left",
+    "lse_mode",
+    "logits_soft_cap",
+    "use_sinks",
+    "use_custom_mask",
+)
+_SHAPE = dict(
+    batch_size=4,
+    max_q=16,
+    max_kv=160,
+    num_qo_heads=8,
+    num_kv_heads=2,
+    head_dim_qk=128,
+    page_size=16,
+    dtype=torch.bfloat16,
+)
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+
+def _problem(seed, *, form="dense", layout="HND", **overrides):
+    return make_problem(
+        seed, **dict(_SHAPE, **overrides), input_form=FORMS[form], kv_layout=layout
+    )
+
+
+def _runnable(p, backend, *, causal, window_left, lse_mode):
+    try:
+        resolve_paged_attention(
+            device=torch.device(p["device"]),
+            num_qo_heads=p["num_qo_heads"],
+            num_kv_heads=p["num_kv_heads"],
+            head_dim_qk=p["head_dim_qk"],
+            head_dim_vo=p["head_dim_vo"],
+            q_dtype=p["dtype"],
+            kv_dtype=p.get("kv_dtype"),
+            page_size=p["page_size"],
+            kv_layout=p["kv_layout"],
+            causal=causal,
+            need_lse=lse_mode != "none",
+            window_left=window_left,
+            kv_input_form=p["input_form"],
+            backend=backend,
+        )
+    except ValueError:
+        return False
+    return True
+
+
+def _plan(
+    p,
+    backend,
+    *,
+    causal=True,
+    window_left=-1,
+    lse_mode="base2",
+    graph=False,
+    **plan_extra,
+):
+    attn = PagedAttention(torch.device(p["device"]), use_cuda_graph=graph)
+    attn.plan(
+        make_metadata(p),
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim_qk"],
+        head_dim_vo=p["head_dim_vo"],
+        q_dtype=p["dtype"],
+        kv_dtype=p.get("kv_dtype"),
+        kv_layout=p["kv_layout"],
+        causal=causal,
+        window_left=window_left,
+        lse_mode=lse_mode,
+        backend=backend,
+        **plan_extra,
+    )
+    return attn
+
+
+def _trace(attn, p, **extra):
+    """Bound trace under the sync-debug guard: tracing must never sync."""
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        return fi_trace(
+            attn.run, q=p["q"], kv_cache=(p["k_cache"], p["v_cache"]), **extra
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+def _assert_complete(defn):
+    json.dumps(defn)
+    missing = [
+        k for k, a in defn["axes"].items() if a["type"] == "const" and "value" not in a
+    ]
+    assert not missing, f"Const axes without values: {missing}"
+    unknown = [
+        k
+        for section in ("inputs", "outputs")
+        for k, v in defn[section].items()
+        if v.get("dtype") == "unknown"
+    ]
+    assert not unknown, f"unknown dtypes: {unknown}"
+    assert defn["op_type"] == "gqa_paged"
+    assert defn["tags"][0] == FI_API_TAG
+    assert defn["outputs"]["output"]["param"] == "out"
+    assert "reference" in defn and "init" in defn
+
+
+def _exec(source):
+    namespace = {}
+    exec(source, namespace)  # noqa: S102
+    return namespace
+
+
+def _oracle(p, *, causal, window_left, lse_mode):
+    out, lse = reference_paged_prefill(
+        p["q"],
+        p["k_ref"],
+        p["v_ref"],
+        p["qo_indptr_cpu"],
+        p["kv_seq_lens_cpu"],
+        p["block_tables"] if p["input_form"] == "block_tables" else None,
+        p["page_size"],
+        causal,
+        window_left=window_left,
+        kv_layout=p["kv_layout"],
+        kv_page_indices=p["kv_page_indices"],
+        lse_base="e" if lse_mode == "basee" else "2",
+    )
+    return out, (None if lse_mode == "none" else lse)
+
+
+# ── bound traces over the matrix; identity independent of the backend ────────
+
+
+@cuda_only
+@pytest.mark.parametrize("mask", list(MASKS))
+@pytest.mark.parametrize("lse_mode", LSE_MODES)
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("form", list(FORMS))
+def test_bound_trace_matrix(form, layout, lse_mode, mask):
+    causal, window_left = MASKS[mask]
+    p = _problem(11, form=form, layout=layout)
+    definitions = {}
+    for backend in ("fa2", "cudnn", "trtllm-gen"):
+        if not _runnable(
+            p, backend, causal=causal, window_left=window_left, lse_mode=lse_mode
+        ):
+            continue
+        attn = _plan(
+            p, backend, causal=causal, window_left=window_left, lse_mode=lse_mode
+        )
+        definitions[backend] = _trace(attn, p)
+    assert "fa2" in definitions, "fa2 must be runnable for the matrix"
+    defn = definitions["fa2"]
+    _assert_complete(defn)
+
+    prefix = f"paged_attention_{form}_"
+    assert defn["name"].startswith(prefix)
+    axes = {k: v.get("value") for k, v in defn["axes"].items()}
+    assert axes["num_qo_heads"] == 8 and axes["num_kv_heads"] == 2
+    assert axes["head_dim_qk"] == 128 and axes["head_dim_vo"] == 128
+    assert axes["page_size"] == 16
+    assert axes["kv_layout"] == LAYOUTS.index(layout)
+    assert axes["causal"] == int(causal)
+    assert axes["window_left"] == window_left
+    assert axes["lse_mode"] == LSE_MODES.index(lse_mode)
+    assert axes["csr"] == int(form == "csr")
+    assert axes["fp8_kv"] == 0 and axes["q_dtype"] == 0
+    assert axes["logits_soft_cap"] == 0
+    assert axes["use_sinks"] == 0 and axes["use_custom_mask"] == 0
+    assert not any(t.startswith("feature:") for t in defn["tags"])
+    assert "_qdtype0_" in defn["name"] and "q:bf16" in defn["tags"]
+    assert defn["name"].endswith(
+        f"_layout{LAYOUTS.index(layout)}_causal{int(causal)}_wl{window_left}"
+        f"_lse{LSE_MODES.index(lse_mode)}"
+    )
+
+    inputs = defn["inputs"]
+    cache_shape = (
+        ["num_pages", "num_kv_heads", "page_size"]
+        if layout == "HND"
+        else ["num_pages", "page_size", "num_kv_heads"]
+    )
+    assert inputs["k_cache"]["shape"] == cache_shape + ["head_dim_qk"]
+    assert inputs["v_cache"]["shape"] == cache_shape + ["head_dim_vo"]
+    assert inputs["k_cache"]["dtype"] == "bfloat16"
+    assert inputs["qo_indptr"]["dtype"] == "int32" and inputs["qo_indptr"]["optional"]
+    assert inputs["kv_seq_lens"]["dtype"] == "int32"
+    if form == "dense":
+        assert inputs["block_tables"]["shape"] == ["batch_size", "max_pages"]
+        assert "kv_page_indices" not in inputs and "max_pages" in defn["axes"]
+    else:
+        assert inputs["kv_page_indices"]["shape"] == ["num_kv_indices"]
+        assert "block_tables" not in inputs and "num_kv_indices" in defn["axes"]
+    for name in ("sm_scale", "k_scale", "v_scale"):
+        assert inputs[name] == {
+            "shape": None,
+            "dtype": "float32",
+            "optional": True,
+            "description": inputs[name]["description"],
+        }
+    assert defn["outputs"]["output"]["dtype"] == "bfloat16"
+    assert defn["outputs"]["output"]["shape"] == [
+        "total_q",
+        "num_qo_heads",
+        "head_dim_vo",
+    ]
+    if lse_mode == "none":
+        assert "lse" not in defn["outputs"]
+    else:
+        assert defn["outputs"]["lse"] == {
+            "shape": ["total_q", "num_qo_heads"],
+            "dtype": "float32",
+            "param": "lse",
+            "description": defn["outputs"]["lse"]["description"],
+        }
+    assert f"form:{form}" in defn["tags"] and f"layout:{layout}" in defn["tags"]
+    assert f"lse:{lse_mode}" in defn["tags"]
+    assert not any(t.startswith("backend:") for t in defn["tags"])
+
+    # the mathematical identity does not depend on the resolved backend
+    for backend, other in definitions.items():
+        assert other == defn, f"definition differs on {backend}"
+
+
+@cuda_only
+def test_fp8_kv_cache_is_a_separate_schema():
+    p = _problem(13, kv_dtype=torch.float8_e4m3fn)
+    if not _runnable(p, "fa2", causal=True, window_left=-1, lse_mode="base2"):
+        pytest.skip("fa2 fp8 KV not runnable here")
+    attn = _plan(p, "fa2")
+    defn = _trace(attn, p, k_scale=p["k_scale"], v_scale=p["v_scale"])
+    _assert_complete(defn)
+    assert defn["name"].startswith("paged_attention_dense_fp8kv_")
+    assert defn["inputs"]["k_cache"]["dtype"] == "float8_e4m3fn"
+    assert defn["inputs"]["q"]["dtype"] == "bfloat16"
+    assert defn["outputs"]["output"]["dtype"] == "bfloat16"
+    assert "kv:fp8" in defn["tags"]
+    bf16 = _trace(_plan(_problem(13), "fa2"), _problem(13))
+    assert bf16["name"] != defn["name"]
+    # the JSON's axes alone rebuild the fp8 variant: fp8 K/V, kv_dtype in the
+    # plan, scales in the run bundle, and the rebuilt plan re-traces to the
+    # same definition (on 0f0123c5 the init produced a bf16 KV plan)
+    assert defn["axes"]["fp8_kv"]["value"] == 1 and bf16["axes"]["fp8_kv"]["value"] == 0
+    init_fn = _exec(defn["init"])["_paged_attention_init"]
+    ref_fn = _exec(defn["reference"])["_paged_attention_reference"]
+    inputs, rebuilt = _rebuild_and_check(
+        defn, init_fn, ref_fn, _init_axes("small", "dense"), device=p["device"]
+    )
+    k_cache, v_cache = inputs["run"]["kv_cache"]
+    assert k_cache.dtype == v_cache.dtype == torch.float8_e4m3fn
+    assert inputs["run"]["q"].dtype == torch.bfloat16
+    assert inputs["plan"]["kv_dtype"] == torch.float8_e4m3fn
+    assert inputs["run"]["k_scale"] > 0 and inputs["run"]["v_scale"] > 0
+    again = fi_trace(rebuilt.run, **inputs["run"])
+    assert again["name"] == defn["name"] and again["inputs"] == defn["inputs"]
+
+
+@cuda_only
+def test_fp16_query_is_a_separate_definition():
+    """An fp16 plan exports fp16 inputs and output, q_dtype=1 and its own
+    name; its init rebuilds fp16 tensors and an fp16 plan (the fp16 detail
+    of C05: on 0f0123c5 the init hard-coded bf16 and the two dtypes shared
+    one name)."""
+    p16 = _problem(14, dtype=torch.float16)
+    defn = _trace(_plan(p16, "fa2"), p16)
+    _assert_complete(defn)
+    assert "_qdtype1_" in defn["name"] and "q:fp16" in defn["tags"]
+    assert defn["axes"]["q_dtype"]["value"] == 1
+    assert defn["inputs"]["q"]["dtype"] == "float16"
+    assert defn["inputs"]["k_cache"]["dtype"] == "float16"
+    assert defn["outputs"]["output"]["dtype"] == "float16"
+    bf16 = _trace(_plan(_problem(14), "fa2"), _problem(14))
+    assert bf16["name"] != defn["name"] and "_qdtype0_" in bf16["name"]
+    init_fn = _exec(defn["init"])["_paged_attention_init"]
+    ref_fn = _exec(defn["reference"])["_paged_attention_reference"]
+    inputs, rebuilt = _rebuild_and_check(
+        defn, init_fn, ref_fn, _init_axes("small", "dense"), device=p16["device"]
+    )
+    q, (k_cache, _) = inputs["run"]["q"], inputs["run"]["kv_cache"]
+    assert q.dtype == k_cache.dtype == torch.float16
+    assert inputs["plan"]["q_dtype"] == inputs["plan"]["kv_dtype"] == torch.float16
+    again = fi_trace(rebuilt.run, **inputs["run"])
+    assert again["name"] == defn["name"] and again["inputs"] == defn["inputs"]
+
+
+@cuda_only
+def test_csr_page_size_1_rebuilds_from_the_json_alone():
+    """CR04: a legal page_size=1 CSR trace carries csr=1 in its axes, so the
+    exported init — given only the JSON's Const and Var axes — rebuilds CSR
+    metadata with num_kv_indices live page ids (on 0f0123c5 it built a dense
+    table and failed on the dense page-size floor)."""
+    p = _problem(15, form="csr", page_size=1, max_kv=48)
+    defn = _trace(_plan(p, "fa2"), p)
+    assert defn["axes"]["csr"]["value"] == 1 and defn["axes"]["page_size"]["value"] == 1
+    assert defn["name"].startswith("paged_attention_csr_") and "_ps1_" in defn["name"]
+    init_fn = _exec(defn["init"])["_paged_attention_init"]
+    ref_fn = _exec(defn["reference"])["_paged_attention_reference"]
+    axes = dict(total_q=12, batch_size=3, num_kv_indices=40, num_pages=48)
+    inputs, rebuilt = _rebuild_and_check(
+        defn, init_fn, ref_fn, axes, device=p["device"]
+    )
+    metadata = inputs["plan"]["metadata"]
+    assert metadata.kv_input_form == "page_indices" and metadata.block_tables is None
+    assert metadata.kv_page_indices.shape == (40,)
+    assert fi_trace(rebuilt.run, **inputs["run"]) == defn
+
+
+# ── reference == oracle, also from the exported source ───────────────────────
+
+
+def _cpu_case(seed, *, head_dim_qk=128, head_dim_vo=128, page_size=8):
+    g = torch.Generator().manual_seed(seed)
+    q_lens = torch.tensor([5, 1, 7], dtype=torch.int32)
+    kv_lens = torch.tensor([21, 9, 7], dtype=torch.int32)  # partial last pages
+    qo_indptr = torch.cat([torch.zeros(1, dtype=torch.int32), q_lens.cumsum(0).int()])
+    pages = (kv_lens + page_size - 1) // page_size
+    width, pool = int(pages.max()), int(pages.sum()) + 3
+    perm = torch.randperm(pool, generator=g).int()
+    block_tables = torch.zeros(len(kv_lens), width, dtype=torch.int32)
+    off = 0
+    for i, n in enumerate(pages.tolist()):
+        block_tables[i, :n] = perm[off : off + n]
+        off += n
+    flat = torch.cat([block_tables[i, :n] for i, n in enumerate(pages.tolist())])
+    q = torch.randn(int(qo_indptr[-1]), 8, head_dim_qk, generator=g)
+    k = torch.randn(pool, 2, page_size, head_dim_qk, generator=g)
+    v = torch.randn(pool, 2, page_size, head_dim_vo, generator=g)
+    return dict(
+        q=q,
+        k_hnd=k,
+        v_hnd=v,
+        qo_indptr=qo_indptr,
+        kv_seq_lens=kv_lens,
+        block_tables=block_tables,
+        kv_page_indices=flat,
+        page_size=page_size,
+    )
+
+
+@pytest.mark.parametrize("dims", [(128, 128), (192, 128)], ids=["d128", "d192_128"])
+@pytest.mark.parametrize(
+    "causal,window_left",
+    [(1, -1), (0, -1), (1, 4), (0, 4)],
+    ids=["causal", "full", "causal_w4", "full_w4"],
+)
+@pytest.mark.parametrize("lse_mode", [0, 1, 2])
+@pytest.mark.parametrize("kv_layout", [0, 1])
+@pytest.mark.parametrize("csr", [0, 1])
+def test_reference_matches_oracle_cpu(
+    csr, kv_layout, lse_mode, causal, window_left, dims
+):
+    """The template reference and its exported source agree with the oracle
+    (bottom-right causal, window, GQA, Dqk != Dvo, partial pages, LSE base)."""
+    c = _cpu_case(17, head_dim_qk=dims[0], head_dim_vo=dims[1])
+    if kv_layout:
+        k = c["k_hnd"].permute(0, 2, 1, 3).contiguous()
+        v = c["v_hnd"].permute(0, 2, 1, 3).contiguous()
+    else:
+        k, v = c["k_hnd"], c["v_hnd"]
+    kwargs = dict(
+        q=c["q"],
+        k_cache=k,
+        v_cache=v,
+        qo_indptr=c["qo_indptr"],
+        kv_seq_lens=c["kv_seq_lens"],
+        block_tables=None if csr else c["block_tables"],
+        kv_page_indices=c["kv_page_indices"] if csr else None,
+        sm_scale=0.1,
+        kv_layout=kv_layout,
+        causal=causal,
+        window_left=window_left,
+        lse_mode=lse_mode,
+        csr=csr,
+    )
+    ref_out, ref_lse = reference_paged_prefill(
+        c["q"],
+        k,
+        v,
+        c["qo_indptr"],
+        c["kv_seq_lens"],
+        None if csr else c["block_tables"],
+        c["page_size"],
+        bool(causal),
+        sm_scale=0.1,
+        window_left=window_left,
+        kv_layout=LAYOUTS[kv_layout],
+        kv_page_indices=c["kv_page_indices"] if csr else None,
+        lse_base="2" if lse_mode == 1 else "e",
+    )
+    exported = _exec(_render_reference_source(_paged_attention_reference))
+    for fn in (_paged_attention_reference, exported["_paged_attention_reference"]):
+        out, lse = fn(**kwargs)
+        assert out.dtype == c["q"].dtype
+        torch.testing.assert_close(out, ref_out, atol=1e-5, rtol=1e-5)
+        if lse_mode == 0:
+            assert lse is None
+        else:
+            assert lse.dtype == torch.float32
+            torch.testing.assert_close(lse, ref_lse, atol=1e-5, rtol=1e-5)
+
+
+def test_reference_refuses_another_variants_inputs():
+    """The variant scalars (csr / fp8_kv / q_dtype) select the paging table
+    and are checked against the tensors, so a definition is never evaluated
+    on another variant's inputs."""
+    c = _cpu_case(18)
+    kw = dict(
+        q=c["q"].to(torch.bfloat16),
+        k_cache=c["k_hnd"].to(torch.bfloat16),
+        v_cache=c["v_hnd"].to(torch.bfloat16),
+        qo_indptr=c["qo_indptr"],
+        kv_seq_lens=c["kv_seq_lens"],
+        block_tables=c["block_tables"],
+        kv_page_indices=c["kv_page_indices"],
+        kv_layout=0,
+        causal=1,
+        window_left=-1,
+        lse_mode=0,
+    )
+    dense, _ = _paged_attention_reference(**kw, csr=0, fp8_kv=0, q_dtype=0)
+    flat, _ = _paged_attention_reference(**kw, csr=1, fp8_kv=0, q_dtype=0)
+    torch.testing.assert_close(dense, flat)
+    with pytest.raises(ValueError, match="exactly one of"):
+        _paged_attention_reference(**kw)  # both tables, no csr to choose
+    with pytest.raises(ValueError, match="fp8_kv=1"):
+        _paged_attention_reference(**kw, csr=0, fp8_kv=1)
+    with pytest.raises(ValueError, match="q_dtype=1"):
+        _paged_attention_reference(**kw, csr=0, q_dtype=1)
+
+
+def _diagonal_safe_mask(q_lens, kv_lens, generator):
+    """Random flattened per-request masks whose bottom-right diagonal is
+    allowed, so no query row is fully masked (init uses the same rule)."""
+    blocks = []
+    for lq, lkv in zip(q_lens.tolist(), kv_lens.tolist(), strict=True):
+        block = torch.rand(lq, lkv, generator=generator) < 0.5
+        rows = torch.arange(lq)
+        block[rows, lkv - lq + rows] = True
+        blocks.append(block.flatten())
+    return torch.cat(blocks)
+
+
+@pytest.mark.parametrize("feature", ["softcap", "sinks", "custom_mask", "all"])
+def test_reference_features_match_oracle_cpu(feature):
+    """Soft cap (cap * tanh before masking), sinks (extra per-head logit in
+    the denominator, LSE includes it) and a custom mask (ANDed with the
+    envelope) in the template reference and its exported source agree with
+    the oracle; a feature axis without its input is refused."""
+    c = _cpu_case(21)
+    g = torch.Generator().manual_seed(21)
+    cap = 30 if feature in ("softcap", "all") else 0
+    sinks = torch.randn(8, generator=g) if feature in ("sinks", "all") else None
+    mask = (
+        _diagonal_safe_mask(c["qo_indptr"].diff(), c["kv_seq_lens"], g)
+        if feature in ("custom_mask", "all")
+        else None
+    )
+    kwargs = dict(
+        q=c["q"],
+        k_cache=c["k_hnd"],
+        v_cache=c["v_hnd"],
+        qo_indptr=c["qo_indptr"],
+        kv_seq_lens=c["kv_seq_lens"],
+        block_tables=c["block_tables"],
+        sinks=sinks,
+        custom_mask=mask,
+        kv_layout=0,
+        causal=1,
+        window_left=-1,
+        lse_mode=2,
+        csr=0,
+        logits_soft_cap=cap,
+        use_sinks=int(sinks is not None),
+        use_custom_mask=int(mask is not None),
+    )
+    ref_out, ref_lse = reference_paged_prefill(
+        c["q"],
+        c["k_hnd"],
+        c["v_hnd"],
+        c["qo_indptr"],
+        c["kv_seq_lens"],
+        c["block_tables"],
+        c["page_size"],
+        True,
+        logits_soft_cap=cap or None,
+        custom_mask=mask,
+        sinks=sinks,
+        lse_base="e",
+    )
+    exported = _exec(_render_reference_source(_paged_attention_reference))
+    for fn in (_paged_attention_reference, exported["_paged_attention_reference"]):
+        out, lse = fn(**kwargs)
+        torch.testing.assert_close(out, ref_out, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(lse, ref_lse, atol=1e-5, rtol=1e-5)
+    if sinks is not None:
+        with pytest.raises(ValueError, match="sinks"):
+            _paged_attention_reference(**dict(kwargs, sinks=None))
+    if mask is not None:
+        with pytest.raises(ValueError, match="custom_mask"):
+            _paged_attention_reference(**dict(kwargs, custom_mask=None))
+
+
+# ── exported init / reference round trip on the GPU ──────────────────────────
+
+
+# Var-axis values handed to the exported init: the small default bundle and
+# the committed fixture's own workload (total_q 512 over 4 requests, a pool
+# of 128 pages, a 32-page-wide table / 128 live flat page ids).
+INIT_AXES = {
+    "small": dict(total_q=40, batch_size=3),
+    "sized": dict(total_q=512, batch_size=4, len_indptr=5, num_pages=128),
+}
+
+
+def _init_axes(kind, form):
+    axes = dict(INIT_AXES[kind])
+    if kind == "sized":
+        axes["max_pages" if form == "dense" else "num_kv_indices"] = (
+            32 if form == "dense" else 128
+        )
+    return axes
+
+
+def _rebuild_and_check(defn, init_fn, ref_fn, axes, *, device, backend="fa2"):
+    """init(JSON const axes + ``axes``) -> plan/run on ``backend`` -> reference.
+
+    Only what the JSON exports reaches init: the paging form and dtypes come
+    from its Const axes, never from a hand-filled kwarg.  Returns
+    ``(inputs, rebuilt)``.
+    """
+    const = {k: v["value"] for k, v in defn["axes"].items() if v["type"] == "const"}
+    inputs = init_fn(backend=backend, device=device, **const, **axes)
+    assert set(inputs) == {"plan", "run"}
+    rebuilt = PagedAttention(torch.device(device))
+    rebuilt.plan(**inputs["plan"])
+    out, lse = rebuilt.run(**inputs["run"])
+    ctx = rebuilt._trace_context()
+    ref_out, ref_lse = ref_fn(
+        inputs["run"]["q"],
+        *inputs["run"]["kv_cache"],
+        ctx["qo_indptr"],
+        ctx["kv_seq_lens"],
+        block_tables=ctx["block_tables"],
+        kv_page_indices=ctx["kv_page_indices"],
+        k_scale=inputs["run"].get("k_scale"),
+        v_scale=inputs["run"].get("v_scale"),
+        sinks=inputs["run"].get("sinks"),
+        custom_mask=inputs["plan"].get("custom_mask"),
+        **{k: const[k] for k in VARIANT_AXES},
+    )
+    torch.testing.assert_close(out.float(), ref_out.float(), **OUT_TOL)
+    if const["lse_mode"]:
+        torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+    else:
+        assert lse is None
+    # the Var axes of the definition are honoured by the bundle
+    q, (k_cache, v_cache) = inputs["run"]["q"], inputs["run"]["kv_cache"]
+    batch = axes.get("batch_size") or axes["len_indptr"] - 1
+    assert q.shape[0] == axes["total_q"] == int(ctx["qo_indptr_cpu"][-1])
+    assert ctx["qo_indptr"].shape[0] == batch + 1 == ctx["kv_seq_lens"].shape[0] + 1
+    if "num_pages" in axes:
+        assert k_cache.shape[0] == v_cache.shape[0] == axes["num_pages"]
+    if "max_pages" in axes:
+        assert ctx["block_tables"].shape == (batch, axes["max_pages"])
+    if "num_kv_indices" in axes:
+        assert ctx["kv_page_indices"].shape == (axes["num_kv_indices"],)
+    _assert_constraints_hold(defn, _kwargs_from_context(ctx, q, k_cache, v_cache))
+    # partial last pages really are in the bundle (token-granular pages have none)
+    if ctx["page_size"] > 1:
+        assert int((ctx["kv_seq_lens_cpu"] % ctx["page_size"] != 0).sum()) >= 1
+    return inputs, rebuilt
+
+
+def _kwargs_from_context(ctx, q, k_cache, v_cache):
+    return dict(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        qo_indptr=ctx["qo_indptr"],
+        kv_seq_lens=ctx["kv_seq_lens"],
+        block_tables=ctx["block_tables"],
+        kv_page_indices=ctx["kv_page_indices"],
+        custom_mask=ctx.get("custom_mask"),
+        page_size=ctx["page_size"],
+    )
+
+
+def _assert_constraints_hold(defn, kw):
+    """Evaluate every constraint string of ``defn`` on concrete trace kwargs."""
+    const = {k: v["value"] for k, v in defn["axes"].items() if v["type"] == "const"}
+    qo_indptr = kw["qo_indptr"].cpu()
+    kv_seq_lens = kw["kv_seq_lens"].cpu()
+    names = dict(
+        const,
+        total_q=int(kw["q"].shape[0]),
+        batch_size=int(kv_seq_lens.shape[0]),
+        len_indptr=int(qo_indptr.shape[0]),
+        num_pages=int(kw["k_cache"].shape[0]),
+        qo_indptr=qo_indptr,
+        kv_seq_lens=kv_seq_lens,
+        min=min,
+        max=max,
+    )
+    if kw.get("block_tables") is not None:
+        names["max_pages"] = int(kw["block_tables"].shape[1])
+    if kw.get("kv_page_indices") is not None:
+        names["num_kv_indices"] = int(kw["kv_page_indices"].shape[0])
+    if kw.get("custom_mask") is not None:
+        names["mask_len"] = int(kw["custom_mask"].numel())
+    for constraint in defn["constraints"]:
+        assert bool(eval(constraint, {"__builtins__": {}}, names)), constraint  # noqa: S307
+
+
+@cuda_only
+@pytest.mark.parametrize("axes", list(INIT_AXES))
+@pytest.mark.parametrize("lse_mode", ["none", "basee"])
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("form", list(FORMS))
+def test_exported_init_and_reference_rebuild_the_traced_plan(
+    form, layout, lse_mode, axes
+):
+    """init from the JSON builds a valid planned instance of the traced
+    variant for the requested Var axes (including a workload larger than
+    the old fixed 4-page table); its run() matches the JSON's reference and
+    re-tracing it yields the same definition."""
+    p = _problem(19, form=form, layout=layout)
+    attn = _plan(p, "fa2", lse_mode=lse_mode)
+    defn = _trace(attn, p)
+    init_fn = _exec(defn["init"])["_paged_attention_init"]
+    ref_fn = _exec(defn["reference"])["_paged_attention_reference"]
+    inputs, rebuilt = _rebuild_and_check(
+        defn, init_fn, ref_fn, _init_axes(axes, form), device=p["device"]
+    )
+    assert inputs["plan"]["metadata"].kv_input_form == FORMS[form]
+    assert inputs["plan"]["kv_layout"] == layout
+    assert inputs["plan"]["lse_mode"] == lse_mode
+
+    again = fi_trace(rebuilt.run, **inputs["run"])
+    assert again["name"] == defn["name"]
+    assert again["axes"] == defn["axes"]
+    assert again["inputs"] == defn["inputs"] and again["outputs"] == defn["outputs"]
+
+
+def test_init_rejects_axes_it_cannot_honour():
+    with pytest.raises(ValueError, match="len_indptr"):
+        _paged_attention_init(total_q=8, batch_size=2, len_indptr=4)
+    with pytest.raises(ValueError, match="max_pages"):
+        _paged_attention_init(total_q=65, batch_size=1, max_pages=4)
+    with pytest.raises(ValueError, match="num_kv_indices"):
+        _paged_attention_init(total_q=65, batch_size=1, csr=1, num_kv_indices=4)
+    with pytest.raises(ValueError, match="num_pages"):
+        _paged_attention_init(total_q=65, batch_size=1, max_pages=5, num_pages=3)
+    with pytest.raises(ValueError, match="num_pages"):
+        _paged_attention_init(total_q=65, batch_size=2, csr=1, num_pages=2)
+    with pytest.raises(ValueError, match="total_q"):
+        _paged_attention_init(total_q=0, batch_size=1)
+
+
+def _dense_init_live_pages(**axes):
+    """(live pages per request, table width, pool pages) of a dense init bundle."""
+    bundle = _paged_attention_init(device="cuda", **axes)
+    md = bundle["plan"]["metadata"]
+    live = ((md.kv_seq_lens_cpu + md.page_size - 1) // md.page_size).tolist()
+    return live, md.block_tables.shape[1], bundle["run"]["kv_cache"][0].shape[0]
+
+
+@cuda_only
+def test_dense_init_sizes_live_pages_from_the_pool_not_the_table_width():
+    """R06: max_pages is table capacity.  A pool of one page with a five-column
+    table (batch 1, one query token, page_size 16) is a legal traced workload:
+    one live page, four idle columns.  On 0f0123c5 every column counted as a
+    live page and the init rejected it (num_pages 1 < 5)."""
+    live, width, pool = _dense_init_live_pages(
+        total_q=1, batch_size=1, len_indptr=2, num_pages=1, max_pages=5
+    )
+    assert live == [1] and width == 5 and pool == 1
+    # spare pool pages spread over the requests, the table width caps them
+    live, width, pool = _dense_init_live_pages(
+        total_q=8, batch_size=3, num_pages=10, max_pages=4
+    )
+    assert width == 4 and pool == 10 and sum(live) <= 10 and max(live) <= 4
+    assert live == [4, 3, 3]
+    # a pool larger than the table can hold leaves pool pages unreferenced
+    live, width, pool = _dense_init_live_pages(
+        total_q=4, batch_size=2, num_pages=100, max_pages=3
+    )
+    assert live == [3, 3] and width == 3 and pool == 100
+    # a pool smaller than the query tokens' pages makes requests share pages
+    live, width, pool = _dense_init_live_pages(
+        total_q=64, batch_size=2, num_pages=2, max_pages=4
+    )
+    assert live == [2, 2] and pool == 2
+    # without num_pages every column is live (the old default workload)
+    live, width, pool = _dense_init_live_pages(total_q=8, batch_size=2, max_pages=4)
+    assert live == [4, 4] and pool == 8
+
+
+@cuda_only
+def test_wide_table_small_pool_trace_rebuilds_from_the_json_alone():
+    """R06 end to end: trace the one-live-page / five-column workload, then
+    rebuild it with the JSON's axes (num_pages 1, max_pages 5) and check the
+    rebuilt plan against the reference and the definition's constraints."""
+    p = _problem(16, batch_size=1, max_q=1, max_kv=2)
+    assert p["block_tables"].shape == (1, 1) and int(p["kv_seq_lens_cpu"][0]) == 1
+    # a pool of exactly the one page the request reads (id 0) and a table
+    # five columns wide whose idle columns hold that same valid pool page
+    page = int(p["block_tables"][0, 0])
+    k = p["k_cache"][page : page + 1].contiguous()
+    v = p["v_cache"][page : page + 1].contiguous()
+    wide = torch.zeros(1, 5, dtype=torch.int32, device=p["device"])
+    p1 = dict(p, block_tables=wide, k_cache=k, v_cache=v)
+    attn = _plan(p1, "fa2")
+    attn.run(p1["q"], (k, v))
+    defn = _trace(attn, p1)
+    init_fn = _exec(defn["init"])["_paged_attention_init"]
+    ref_fn = _exec(defn["reference"])["_paged_attention_reference"]
+    axes = dict(total_q=1, batch_size=1, len_indptr=2, num_pages=1, max_pages=5)
+    inputs, rebuilt = _rebuild_and_check(
+        defn, init_fn, ref_fn, axes, device=p["device"]
+    )
+    md = inputs["plan"]["metadata"]
+    assert md.block_tables.shape == (1, 5) and int(md.kv_seq_lens_cpu[0]) <= 16
+    assert fi_trace(rebuilt.run, **inputs["run"]) == defn
+
+
+@cuda_only
+def test_direct_template_accepts_init_bundle_without_instance():
+    """A template's own fi_trace works on init's flattened bundle (metadata=)."""
+    tpl = _paged_attention_template(csr=1, kv_layout=1, lse_mode=1)
+    inputs = _paged_attention_init(
+        total_q=8, batch_size=2, csr=1, kv_layout=1, lse_mode=1, device="cuda"
+    )
+    defn = tpl.build_fi_trace_fn(FI_API_TAG[len("fi_api:") :])(
+        **inputs["plan"], **inputs["run"]
+    )
+    _assert_complete(defn)
+    assert defn["name"].startswith("paged_attention_csr_")
+    assert defn["inputs"]["kv_page_indices"]["dtype"] == "int32"
+
+
+# ── auto-dump ────────────────────────────────────────────────────────────────
+
+
+@cuda_only
+def test_auto_dump_writes_complete_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("FLASHINFER_TRACE_DUMP", "1")
+    monkeypatch.setenv("FLASHINFER_TRACE_DUMP_DIR", str(tmp_path))
+    monkeypatch.setattr(trace_template_mod, "_DUMPED_NAMES", set())
+    p = _problem(23, form="csr", layout="NHD")
+    attn = _plan(p, "fa2", lse_mode="basee")
+    attn.run(p["q"], (p["k_cache"], p["v_cache"]))
+    expected = fi_trace(attn.run, q=p["q"], kv_cache=(p["k_cache"], p["v_cache"]))
+    path = tmp_path / f"{expected['name']}.json"
+    assert path.exists(), sorted(f.name for f in tmp_path.iterdir())
+    doc = json.loads(path.read_text())
+    _assert_complete(doc)
+    assert doc == expected
+    assert expected["name"] in trace_template_mod._DUMPED_NAMES
+    # dedup: a second run does not rewrite the file
+    stamp = path.stat().st_mtime_ns
+    attn.run(p["q"], (p["k_cache"], p["v_cache"]))
+    assert path.stat().st_mtime_ns == stamp
+
+
+# ── identity ─────────────────────────────────────────────────────────────────
+
+
+@cuda_only
+def test_definition_name_encodes_plan_semantics():
+    """Same tensor shapes, different plan semantics -> different definitions;
+    the same semantics on another backend -> the same definition name."""
+    names = {}
+    for form in FORMS:
+        for layout in LAYOUTS:
+            p = _problem(29, form=form, layout=layout)
+            for lse_mode in LSE_MODES:
+                for causal, window_left in ((True, -1), (False, -1), (True, 32)):
+                    attn = _plan(
+                        p,
+                        "fa2",
+                        causal=causal,
+                        window_left=window_left,
+                        lse_mode=lse_mode,
+                    )
+                    key = (form, layout, lse_mode, causal, window_left)
+                    names[key] = _trace(attn, p)["name"]
+    assert len(set(names.values())) == len(names)
+    p = _problem(29)
+    for backend in ("cudnn", "trtllm-gen"):
+        if _runnable(p, backend, causal=True, window_left=-1, lse_mode="base2"):
+            attn = _plan(p, backend)
+            assert _trace(attn, p)["name"] == names[("dense", "HND", "base2", True, -1)]
+
+
+@cuda_only
+def test_dispatch_is_cached_and_publishes_representatives():
+    p = _problem(31)
+    attn = _plan(p, "fa2")
+    tpl = paged_attention_trace_dispatch(self=attn, q=p["q"])
+    assert tpl is paged_attention_trace_dispatch(self=attn)
+    assert tpl is _paged_attention_template(lse_mode=1)
+    assert tpl.identity == dict(
+        csr=0,
+        fp8_kv=0,
+        q_dtype=0,
+        kv_layout=0,
+        causal=1,
+        window_left=-1,
+        lse_mode=1,
+        logits_soft_cap=0,
+        use_sinks=0,
+        use_custom_mask=0,
+    )
+    labels = [t.name_prefix for t in paged_attention_trace_dispatch.templates]
+    assert labels == ["paged_attention_dense", "paged_attention_csr"]
+    assert all(
+        t.init is _paged_attention_init
+        for t in paged_attention_trace_dispatch.templates
+    )
+    assert hasattr(PagedAttention.run, "fi_trace") and hasattr(
+        PagedAttention.run, "fi_init"
+    )
+
+
+# ── diagnostics ──────────────────────────────────────────────────────────────
+
+
+@cuda_only
+def test_trace_before_plan_raises():
+    p = _problem(37)
+    attn = PagedAttention(torch.device(p["device"]))
+    with pytest.raises(ValueError, match="before plan"):
+        fi_trace(attn.run, q=p["q"], kv_cache=(p["k_cache"], p["v_cache"]))
+    with pytest.raises(ValueError, match="before plan"):
+        attn._trace_context()
+
+
+@cuda_only
+@pytest.mark.parametrize("backend", ["cudnn", "trtllm-gen"])
+def test_csr_trace_with_a_dense_table_backend(backend):
+    """A flat-form plan whose backend reads a derived dense table still traces
+    the caller's flat page ids, and to the same definition fa2 gives."""
+    p = _problem(53, form="csr")
+    if not _runnable(p, backend, causal=True, window_left=-1, lse_mode="base2"):
+        pytest.skip(f"{backend} does not resolve here")
+    attn = _plan(p, backend)
+    assert attn.backend == backend
+    ctx = attn._trace_context()
+    live = int(((p["kv_seq_lens_cpu"] + 15) // 16).sum())
+    assert ctx["block_tables"] is None
+    assert torch.equal(ctx["kv_page_indices"], p["kv_page_indices"][:live])
+    assert _trace(attn, p) == _trace(_plan(p, "fa2"), p)
+
+
+FEATURES = {
+    # feature -> (name marker, Const axis, value, feature input tensor)
+    "softcap": ("_cap30", "logits_soft_cap", 30, None),
+    "sinks": ("_sinks1", "use_sinks", 1, "sinks"),
+    "custom_mask": ("_mask1", "use_custom_mask", 1, "custom_mask"),
+}
+
+
+def _feature_plan(p, feature, seed):
+    """(plan kwargs, run kwargs, oracle kwargs) switching one feature on."""
+    if feature == "softcap":
+        return dict(logits_soft_cap=30.0), {}, dict(logits_soft_cap=30.0)
+    g = torch.Generator().manual_seed(seed)
+    if feature == "sinks":
+        sinks = torch.randn(p["num_qo_heads"], generator=g).to(p["device"])
+        return dict(use_sinks=True), dict(sinks=sinks), dict(sinks=sinks)
+    mask = _diagonal_safe_mask(p["qo_indptr_cpu"].diff(), p["kv_seq_lens_cpu"], g)
+    mask = mask.to(p["device"])
+    return dict(custom_mask=mask), {}, dict(custom_mask=mask)
+
+
+@cuda_only
+@pytest.mark.parametrize("feature", list(FEATURES))
+@pytest.mark.parametrize("form", list(FORMS))
+def test_feature_plans_trace_and_rebuild(form, feature):
+    """A plan with a logits soft cap, attention sinks or a custom mask exports
+    a definition that names the feature, whose exported reference reproduces
+    the kernel on the traced tensors and whose exported init rebuilds the
+    feature variant from the JSON alone (on 0f0123c5 these plans refused to
+    trace)."""
+    p = _problem(65, form=form)
+    plan_kw, run_kw, oracle_kw = _feature_plan(p, feature, seed=65)
+    attn = _plan(p, "fa2", **plan_kw)
+    out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]), **run_kw)
+    ref_out, ref_lse = reference_paged_prefill(
+        p["q"],
+        p["k_ref"],
+        p["v_ref"],
+        p["qo_indptr_cpu"],
+        p["kv_seq_lens_cpu"],
+        p["block_tables"] if form == "dense" else None,
+        p["page_size"],
+        True,
+        kv_layout=p["kv_layout"],
+        kv_page_indices=p["kv_page_indices"],
+        lse_base="2",
+        **oracle_kw,
+    )
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+    defn = _trace(attn, p, **run_kw)
+    _assert_complete(defn)
+    marker, axis, value, tensor = FEATURES[feature]
+    assert marker in defn["name"] and defn["axes"][axis]["value"] == value
+    assert defn["name"] != _trace(_plan(p, "fa2"), p)["name"]
+    if tensor is not None:
+        assert defn["inputs"][tensor]["dtype"] == (
+            "float32" if tensor == "sinks" else "bool"
+        )
+    if feature == "custom_mask":
+        assert defn["axes"]["mask_len"]["type"] == "var"
+        assert defn["inputs"]["custom_mask"]["optional"]  # owned by plan()
+    ctx = attn._trace_context()
+    _assert_constraints_hold(
+        defn, _kwargs_from_context(ctx, p["q"], p["k_cache"], p["v_cache"])
+    )
+    # the exported reference reproduces the kernel on the traced tensors
+    ref_fn = _exec(defn["reference"])["_paged_attention_reference"]
+    const = {k: v["value"] for k, v in defn["axes"].items() if v["type"] == "const"}
+    r_out, r_lse = ref_fn(
+        p["q"],
+        p["k_cache"],
+        p["v_cache"],
+        ctx["qo_indptr"],
+        ctx["kv_seq_lens"],
+        block_tables=ctx["block_tables"],
+        kv_page_indices=ctx["kv_page_indices"],
+        sinks=run_kw.get("sinks"),
+        custom_mask=ctx["custom_mask"],
+        **{k: const[k] for k in VARIANT_AXES},
+    )
+    torch.testing.assert_close(out.float(), r_out.float(), **OUT_TOL)
+    torch.testing.assert_close(lse, r_lse, **LSE_TOL)
+    # the exported init rebuilds the feature variant from the JSON alone
+    init_fn = _exec(defn["init"])["_paged_attention_init"]
+    inputs, rebuilt = _rebuild_and_check(
+        defn, init_fn, ref_fn, _init_axes("small", form), device=p["device"]
+    )
+    if feature == "softcap":
+        assert inputs["plan"]["logits_soft_cap"] == 30.0
+    elif feature == "sinks":
+        assert inputs["plan"]["use_sinks"] is True
+        assert inputs["run"]["sinks"].shape == (p["num_qo_heads"],)
+    else:
+        mask = inputs["plan"]["custom_mask"]
+        md = inputs["plan"]["metadata"]
+        assert mask.dtype == torch.bool
+        assert mask.numel() == int((md.qo_indptr_cpu.diff() * md.kv_seq_lens_cpu).sum())
+    assert fi_trace(rebuilt.run, **inputs["run"]) == defn
+
+
+@cuda_only
+def test_non_integer_soft_cap_refuses_to_trace():
+    """Const axes are integers: a cap the definition cannot spell is refused
+    before export instead of being rounded."""
+    p = _problem(54)
+    attn = _plan(p, "fa2", logits_soft_cap=30.5)
+    assert attn._trace_context()["logits_soft_cap"] == 30.5
+    with pytest.raises(ValueError, match="not an integer"):
+        fi_trace(attn.run, q=p["q"], kv_cache=(p["k_cache"], p["v_cache"]))
+    assert _trace(_plan(p, "fa2", logits_soft_cap=30), p)["axes"][
+        "logits_soft_cap"
+    ] == {"type": "const", "value": 30, "description": mock.ANY}
+
+
+@cuda_only
+def test_sinks_trace_requires_the_sinks_tensor():
+    p = _problem(56)
+    attn = _plan(p, "fa2", use_sinks=True)
+    with pytest.raises(ValueError, match="sinks="):
+        fi_trace(attn.run, q=p["q"], kv_cache=(p["k_cache"], p["v_cache"]))
+    with pytest.raises(ValueError, match="sinks="):
+        fi_trace(
+            attn.run,
+            q=p["q"],
+            kv_cache=(p["k_cache"], p["v_cache"]),
+            sinks=torch.zeros(p["num_qo_heads"], dtype=torch.bfloat16, device="cuda"),
+        )
+
+
+@cuda_only
+def test_padding_rows_refuse_to_trace():
+    """kv_len == 0 rows are legal padding for plan(), but the definition's
+    constraints require kv_seq_lens >= 1: refuse rather than emit a trace
+    that violates its own constraints."""
+    p = _problem(55)
+    kv0 = p["kv_seq_lens_cpu"].clone()
+    kv0[1] = 0
+    p0 = dict(p, kv_seq_lens_cpu=kv0, kv_seq_lens=kv0.to(p["kv_seq_lens"].device))
+    attn = _plan(p0, "fa2")
+    assert int(attn._trace_context()["kv_seq_lens_cpu"].min()) == 0
+    with pytest.raises(ValueError, match="padding rows"):
+        fi_trace(attn.run, q=p["q"], kv_cache=(p["k_cache"], p["v_cache"]))
+
+
+def _zero_query_problem(seed, form, q_lens):
+    return build_problem(
+        q_lens,
+        [16, 16],
+        num_qo_heads=_SHAPE["num_qo_heads"],
+        num_kv_heads=_SHAPE["num_kv_heads"],
+        head_dim_qk=_SHAPE["head_dim_qk"],
+        page_size=_SHAPE["page_size"],
+        dtype=_SHAPE["dtype"],
+        seed=seed,
+        input_form=FORMS[form],
+    )
+
+
+@cuda_only
+@pytest.mark.parametrize("q_lens", [[1, 0], [0, 1]], ids=["qo_0_1_1", "qo_0_0_1"])
+@pytest.mark.parametrize("form", list(FORMS))
+def test_zero_query_rows_trace_and_rebuild(form, q_lens):
+    """R8 / R07 / CR05 / C06: a request without query rows (qo_indptr [0,1,1]
+    or [0,0,1], kv_seq_lens [16,16]) is a legal plan; its trace must satisfy
+    its own constraints and its init must rebuild total_q=1 over batch_size=2.
+    On 0f0123c5 the definition required min(q_len) >= 1 and the init refused
+    total_q < batch_size."""
+    p = _zero_query_problem(61, form, q_lens)
+    attn = _plan(p, "fa2")
+    out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]))
+    ref_out, ref_lse = _oracle(p, causal=True, window_left=-1, lse_mode="base2")
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+    defn = _trace(attn, p)
+    _assert_complete(defn)
+    assert "min(qo_indptr[1:] - qo_indptr[:-1]) >= 0" in defn["constraints"]
+    assert not any(">= 1" in c and "qo_indptr" in c for c in defn["constraints"])
+    ctx = attn._trace_context()
+    assert int(ctx["qo_indptr_cpu"].diff().min()) == 0
+    _assert_constraints_hold(
+        defn, _kwargs_from_context(ctx, p["q"], p["k_cache"], p["v_cache"])
+    )
+
+    init_fn = _exec(defn["init"])["_paged_attention_init"]
+    ref_fn = _exec(defn["reference"])["_paged_attention_reference"]
+    axes = dict(total_q=1, batch_size=2, len_indptr=3, num_pages=4)
+    axes["max_pages" if form == "dense" else "num_kv_indices"] = 2
+    inputs, rebuilt = _rebuild_and_check(
+        defn, init_fn, ref_fn, axes, device=p["device"]
+    )
+    md = inputs["plan"]["metadata"]
+    assert md.qo_indptr_cpu.tolist() == [0, 1, 1]
+    assert int(md.kv_seq_lens_cpu.min()) >= 1
+    assert fi_trace(rebuilt.run, **inputs["run"]) == defn
+
+
+@cuda_only
+def test_row_boundaries():
+    """The three row boundaries stay distinct: ordinary rows trace, kv_len == 0
+    padding rows are refused before export, q_len == 0 rows trace and hold
+    the definition's constraints."""
+    normal = _problem(62)
+    assert _trace(_plan(normal, "fa2"), normal)["name"].startswith("paged_attention_")
+    kv0 = normal["kv_seq_lens_cpu"].clone()
+    kv0[0] = 0
+    padded = dict(
+        normal, kv_seq_lens_cpu=kv0, kv_seq_lens=kv0.to(normal["kv_seq_lens"].device)
+    )
+    with pytest.raises(ValueError, match="padding rows"):
+        _trace(_plan(padded, "fa2"), padded)
+    zero_q = _zero_query_problem(63, "dense", [1, 0])
+    attn = _plan(zero_q, "fa2")
+    defn = _trace(attn, zero_q)
+    _assert_constraints_hold(
+        defn,
+        _kwargs_from_context(
+            attn._trace_context(), zero_q["q"], zero_q["k_cache"], zero_q["v_cache"]
+        ),
+    )
+
+
+@cuda_only
+def test_unbound_trace_raises_instead_of_guessing():
+    p = _problem(37)
+    with pytest.raises(ValueError, match=r"flashinfer\.fi_trace\(attn\.run"):
+        PagedAttention.run.fi_trace(q=p["q"], kv_cache=(p["k_cache"], p["v_cache"]))
+    attn = _plan(p, "fa2")
+    with pytest.raises(ValueError, match="requires the run\\(\\) tensor"):
+        fi_trace(attn.run, q=p["q"])
+    # tensors of another dtype than the plan's would contradict the identity
+    with pytest.raises(ValueError, match="differ from the plan's"):
+        fi_trace(
+            attn.run,
+            q=p["q"].to(torch.float16),
+            kv_cache=(p["k_cache"], p["v_cache"]),
+        )
+    # a template of another identity refuses the bound plan
+    other = _paged_attention_template(csr=1, lse_mode=1)
+    with pytest.raises(ValueError, match="does not match this template"):
+        other.build_fi_trace_fn("x")(
+            self=attn, q=p["q"], kv_cache=(p["k_cache"], p["v_cache"])
+        )
+
+
+def test_template_factory_rejects_bad_identity():
+    with pytest.raises(ValueError, match="lse_mode"):
+        _paged_attention_template(lse_mode=3)
+    with pytest.raises(ValueError, match="window_left"):
+        _paged_attention_template(window_left=-2)
+    with pytest.raises(ValueError, match="kv_layout"):
+        _paged_attention_template(kv_layout=True)
+    with pytest.raises(ValueError, match="q_dtype"):
+        _paged_attention_template(q_dtype=2)
+    with pytest.raises(ValueError, match="logits_soft_cap"):
+        _paged_attention_template(logits_soft_cap=-1)
+    with pytest.raises(ValueError, match="use_sinks"):
+        _paged_attention_template(use_sinks=2)
+
+
+# ── failed re-plan, graph storage, read-only ─────────────────────────────────
+
+
+def _permuted_pages(p, seed):
+    """Same batch (lengths, shapes) with the pool pages renamed: a re-plan
+    that fits the graph capacity and changes the page mapping only."""
+    g = torch.Generator().manual_seed(seed)
+    pool = p["k_cache"].shape[0]
+    rename = torch.randperm(pool, generator=g).to(torch.int32)
+    bt = rename[p["block_tables"].cpu().long()]
+    flat = rename[p["kv_page_indices"].cpu().long()]
+    dev = torch.device(p["device"])
+    return dict(p, block_tables=bt.to(dev), kv_page_indices=flat.to(dev))
+
+
+@cuda_only
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "graph"])
+def test_failed_replan_still_traces_last_successful_plan(graph):
+    p1 = _problem(41)
+    attn = _plan(p1, "fa2", graph=graph)
+    before = _trace(attn, p1)
+    ctx1 = attn._trace_context()
+    kv_before = ctx1["kv_seq_lens"].clone()
+
+    bad = dict(p1)
+    kv_bad = p1["kv_seq_lens_cpu"].clone()
+    i = int(p1["qo_indptr_cpu"].diff().argmax())
+    kv_bad[i] = max(1, int(p1["qo_indptr_cpu"].diff()[i]) - 1)  # q_len > kv_len
+    bad["kv_seq_lens_cpu"] = kv_bad
+    bad["kv_seq_lens"] = kv_bad.to(p1["device"])
+    with pytest.raises(ValueError, match="causal masking requires"):
+        _plan_into(attn, bad)
+    if graph:
+        smaller = make_problem(42, **dict(_SHAPE, batch_size=3))
+        with pytest.raises(ValueError, match="CUDA graph re-plan: batch_size"):
+            _plan_into(attn, smaller)
+
+    ctx = attn._trace_context()
+    assert ctx["kv_seq_lens"].data_ptr() == ctx1["kv_seq_lens"].data_ptr()
+    assert torch.equal(ctx["kv_seq_lens"], kv_before)
+    assert torch.equal(ctx["kv_seq_lens_cpu"], p1["kv_seq_lens_cpu"])
+    assert _trace(attn, p1) == before
+
+
+def _plan_into(attn, p, backend="fa2"):
+    attn.plan(
+        make_metadata(p),
+        num_qo_heads=p["num_qo_heads"],
+        num_kv_heads=p["num_kv_heads"],
+        head_dim_qk=p["head_dim_qk"],
+        head_dim_vo=p["head_dim_vo"],
+        q_dtype=p["dtype"],
+        kv_layout=p["kv_layout"],
+        causal=True,
+        lse_mode="base2",
+        backend=backend,
+    )
+
+
+@cuda_only
+@pytest.mark.parametrize("form", list(FORMS))
+def test_graph_mode_trace_reads_reserved_storage(form):
+    p1 = _problem(43, form=form)
+    attn = _plan(p1, "fa2", graph=True)
+    gb = attn._impl._graph
+    assert gb is not None
+    ctx = attn._trace_context()
+    assert ctx["graph_capacity"] is gb.capacity
+    assert ctx["qo_indptr"].data_ptr() == gb.qo_indptr.data_ptr()
+    assert ctx["kv_seq_lens"].data_ptr() == gb.kv_seq_lens.data_ptr()
+    live = int(((p1["kv_seq_lens_cpu"] + 15) // 16).sum())
+    if form == "dense":
+        assert ctx["kv_page_indices"] is None
+        assert ctx["block_tables"].data_ptr() == gb.block_tables.data_ptr()
+        assert torch.equal(ctx["block_tables"], p1["block_tables"])
+    else:
+        assert ctx["block_tables"] is None
+        assert ctx["kv_page_indices"].data_ptr() == gb.kv_page_indices.data_ptr()
+        assert ctx["kv_page_indices"].numel() == live
+        assert torch.equal(ctx["kv_page_indices"], p1["kv_page_indices"][:live])
+    defn1 = _trace(attn, p1)
+
+    # re-plan into the same capacity: same storage, new contents, same identity
+    p2 = _permuted_pages(p1, seed=44)
+    _plan_into(attn, p2)
+    ctx2 = attn._trace_context()
+    table = "block_tables" if form == "dense" else "kv_page_indices"
+    assert ctx2[table].data_ptr() == ctx[table].data_ptr()
+    expected = p2[table] if form == "dense" else p2[table][:live]
+    assert torch.equal(ctx2[table], expected)
+    assert not torch.equal(
+        ctx2[table], p1[table] if form == "dense" else p1[table][:live]
+    )
+    assert _trace(attn, p2) == defn1
+
+
+@cuda_only
+@pytest.mark.parametrize("form", list(FORMS))
+def test_bound_trace_slices_capacity_buffers_to_live_rows(form):
+    """A trace of an instance bound to an explicit GraphCapacity with headroom
+    rows sees q / out / lse cut to the batch's live rows (views), so the
+    definition's ``total_q == qo_indptr[-1]`` constraint holds; a q shorter
+    than the plan is refused."""
+    from flashinfer.prefill import GraphCapacity
+
+    p = _problem(57, form=form)
+    live = int(p["qo_indptr_cpu"][-1])
+    extra = 24
+    width = p["block_tables"].shape[1]
+    capacity = dict(
+        batch_size=int(p["kv_seq_lens_cpu"].shape[0]),
+        total_q_tokens=live + extra,
+        max_q_len=p["max_q_len"],
+        max_kv_len=width * p["page_size"],
+        page_size=p["page_size"],
+    )
+    if form == "dense":
+        cap = GraphCapacity(**capacity, table_width=width)
+    else:
+        cap = GraphCapacity(
+            **capacity,
+            kv_input_form="page_indices",
+            flat_capacity=p["kv_page_indices"].shape[0] + 8,
+        )
+    attn = PagedAttention(torch.device(p["device"]), graph_capacity=cap)
+    _plan_into(attn, p)
+    q_cap = torch.empty(
+        live + extra, *p["q"].shape[1:], dtype=p["q"].dtype, device="cuda"
+    )
+    q_cap[:live] = p["q"]
+    out_cap = torch.empty(
+        live + extra,
+        p["num_qo_heads"],
+        p["head_dim_vo"],
+        dtype=p["q"].dtype,
+        device="cuda",
+    )
+    lse_cap = torch.empty(
+        live + extra, p["num_qo_heads"], dtype=torch.float32, device="cuda"
+    )
+    attn.run(q_cap, (p["k_cache"], p["v_cache"]), out=out_cap, lse=lse_cap)
+
+    tpl = paged_attention_trace_dispatch(self=attn)
+    kwargs = dict(
+        self=attn,
+        q=q_cap,
+        kv_cache=(p["k_cache"], p["v_cache"]),
+        out=out_cap,
+        lse=lse_cap,
+    )
+    norm = tpl.normalize_kwargs(kwargs)
+    for key, buf in (("q", q_cap), ("out", out_cap), ("lse", lse_cap)):
+        assert norm[key].shape[0] == live and norm[key].data_ptr() == buf.data_ptr()
+    assert norm["q"].shape[1:] == q_cap.shape[1:]
+    _assert_constraints_hold(
+        _trace(attn, p),
+        _kwargs_from_context(attn._trace_context(), norm["q"], *norm["kv_cache"]),
+    )
+    # the definition equals the one traced with exactly-sized buffers
+    assert _trace(attn, dict(p, q=q_cap)) == _trace(attn, p)
+    with pytest.raises(ValueError, match="query tokens"):
+        tpl.normalize_kwargs(dict(kwargs, q=q_cap[: live - 1]))
+    # unbound (init bundle) traces are left untouched
+    unbound = tpl.normalize_kwargs(
+        dict(kwargs, self=None, metadata=None) | {"q": q_cap}
+    )
+    assert unbound["q"].shape[0] == live + extra
+
+
+@cuda_only
+def test_trace_is_sync_free_and_read_only():
+    p = _problem(47, form="csr")
+    attn = _plan(p, "fa2")
+    impl = attn._impl
+    published = (impl._meta, impl._derived, impl._active, impl._backend_name)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        ctx = attn._trace_context()
+        defn = fi_trace(attn.run, q=p["q"], kv_cache=(p["k_cache"], p["v_cache"]))
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert (impl._meta, impl._derived, impl._active, impl._backend_name) == published
+    assert ctx["backend"] == "fa2" and defn["name"].startswith("paged_attention_csr_")
+    assert ctx["kv_page_indices"].numel() == int(
+        ((p["kv_seq_lens_cpu"] + 15) // 16).sum()
+    )
+
+
+# ── schema consistency (the stable lane filters experimental templates) ──────
+
+
+def _run_params():
+    return {n for n in inspect.signature(PagedAttention.run).parameters if n != "self"}
+
+
+@pytest.mark.parametrize(
+    "tpl",
+    [
+        _paged_attention_template(),
+        _paged_attention_template(csr=1),
+        _paged_attention_template(kv_layout=1, causal=0, lse_mode=2),
+        _paged_attention_template(csr=1, window_left=64, lse_mode=1, fp8_kv=1),
+        _paged_attention_template(q_dtype=1, fp8_kv=1),
+        _paged_attention_template(logits_soft_cap=30, use_sinks=1),
+        _paged_attention_template(csr=1, use_custom_mask=1, window_left=8),
+    ],
+    ids=[
+        "dense",
+        "csr",
+        "nhd_noncausal_basee",
+        "csr_window_fp8",
+        "fp16_fp8",
+        "softcap_sinks",
+        "csr_mask_window",
+    ],
+)
+def test_template_schema_is_consistent_with_run(tpl):
+    params = _run_params()
+    for key, d in tpl.inputs.items():
+        if getattr(d, "optional", False):
+            continue
+        assert (d.param or key) in params, f"{key} -> {d.param or key} not in run()"
+    tensor_dims = {
+        n for d in tpl.inputs.values() if isinstance(d, Tensor) for n in d.dim_names
+    }
+    scalar_keys = {k for k, d in tpl.inputs.items() if isinstance(d, Scalar)}
+    for name, marker in tpl.axes.items():
+        if isinstance(marker, Const) and marker.value is None:
+            assert name in tensor_dims, f"Const axis {name} has no tensor source"
+        if isinstance(marker, Const) and marker.value is not None:
+            assert name in scalar_keys, (
+                f"semantic axis {name} is not a reference scalar"
+            )
+    allowed = set(tpl.axes) | set(tpl.inputs) | {"max", "min"}
+    for constraint in tpl.constraints:
+        names = {
+            n.id
+            for n in ast.walk(ast.parse(constraint, mode="eval"))
+            if isinstance(n, ast.Name)
+        }
+        assert names <= allowed, f"{constraint!r} references {names - allowed}"
+    for out in tpl.outputs.values():
+        assert out.param in ("out", "lse")
+    assert tpl.op_type == "gqa_paged"
+    assert not tpl.name_prefix.startswith("gqa_paged")
+    # the reference signature carries the plan semantics as keyword-only ints
+    ref = inspect.signature(_paged_attention_reference)
+    for name in VARIANT_AXES:
+        assert ref.parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert tpl.axes[name].value is not None, f"{name} is not a fixed Const"
+    assert compile(_render_init_source(_paged_attention_init), "init", "exec")
+
+
+def test_import_flashinfer_does_not_load_the_experimental_package():
+    script = (
+        "import sys\n"
+        "import flashinfer, flashinfer.prefill\n"
+        "loaded = sorted(m for m in sys.modules if m.startswith('flashinfer.experimental'))\n"
+        "assert 'flashinfer.experimental.paged_attention' not in sys.modules, loaded\n"
+        "assert 'flashinfer.trace.templates.paged_attention' in sys.modules\n"
+        "assert hasattr(flashinfer.prefill.PagedAttention.run, 'fi_trace')\n"
+        "print('ok')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[3],
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith("ok")
+
+
+# ── committed example fixture ────────────────────────────────────────────────
+
+FIXTURE = (
+    Path(__file__).parents[2]
+    / "trace"
+    / "fi_trace_out"
+    / "paged_attention_dense_h32_kv8_dqk128_dvo128_ps16_qdtype0_layout1_causal1_wl-1_lse1.json"
+)
+
+
+def test_committed_fixture_matches_current_template():
+    """The JSON emitted by tests/trace/example.py (opt-in branch) must stay in
+    sync with the template: same schema, same rendered reference and init."""
+    doc = json.loads(FIXTURE.read_text())
+    n_req, total_q, np_pf, page_size = 4, 512, 32, 16
+    tpl = _paged_attention_template(kv_layout=1, causal=1, lse_mode=1)
+    fresh = tpl.build_fi_trace_fn(FI_API_TAG[len("fi_api:") :])(
+        q=torch.empty(total_q, 32, 128, dtype=torch.bfloat16),
+        kv_cache=(
+            torch.empty(n_req * np_pf, page_size, 8, 128, dtype=torch.bfloat16),
+            torch.empty(n_req * np_pf, page_size, 8, 128, dtype=torch.bfloat16),
+        ),
+        qo_indptr=torch.arange(n_req + 1, dtype=torch.int32) * 128,
+        kv_seq_lens=torch.full((n_req,), np_pf * page_size, dtype=torch.int32),
+        block_tables=torch.arange(n_req * np_pf, dtype=torch.int32).view(n_req, np_pf),
+    )
+    assert doc["name"] == FIXTURE.stem == fresh["name"]
+    assert doc == fresh
+    init_fn = _exec(doc["init"])["_paged_attention_init"]
+    assert inspect.signature(init_fn) == inspect.signature(_paged_attention_init)
+    ref_fn = _exec(doc["reference"])["_paged_attention_reference"]
+    assert inspect.signature(ref_fn) == inspect.signature(_paged_attention_reference)
+
+
+@cuda_only
+def test_committed_fixture_init_rebuilds_its_workload():
+    """The init embedded in the committed fixture rebuilds the fixture's own
+    workload (its Var axes: total_q 512, 4 requests, 128 pool pages, a 32-page
+    table) and runs it correctly on the GPU."""
+    doc = json.loads(FIXTURE.read_text())
+    init_fn = _exec(doc["init"])["_paged_attention_init"]
+    ref_fn = _exec(doc["reference"])["_paged_attention_reference"]
+    axes = dict(total_q=512, batch_size=0, len_indptr=5, num_pages=128, max_pages=32)
+    inputs, rebuilt = _rebuild_and_check(doc, init_fn, ref_fn, axes, device="cuda")
+    assert inputs["run"]["q"].shape == (512, 32, 128)
+    assert inputs["run"]["kv_cache"][0].shape == (128, 16, 8, 128)  # NHD
+    assert fi_trace(rebuilt.run, **inputs["run"])["name"] == doc["name"]
