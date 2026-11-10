@@ -40,8 +40,8 @@ from flashinfer.prefill import (
     resolve_paged_attention,
 )
 from flashinfer.utils import get_compute_capability
-from tests.test_helpers.paged_kv import make_padded_paged_kv_view
-from tests.test_helpers.test_helpers import ref_single_prefill
+from tests.attention.test_helpers.paged_kv import make_padded_paged_kv_view
+from tests.attention.test_helpers.test_helpers import ref_single_prefill
 
 from .paged_attention_reference import reference_paged_prefill
 

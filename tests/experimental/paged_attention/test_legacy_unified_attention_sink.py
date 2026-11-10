@@ -24,7 +24,7 @@ import random
 
 import pytest
 import torch
-from tests.test_helpers.sink_attention_reference import sink_attention_unified
+from tests.attention.test_helpers.sink_attention_reference import sink_attention_unified
 
 from flashinfer.prefill import (
     PagedAttention,

@@ -19,7 +19,7 @@ The legacy decode test (``trtllm_batch_decode_with_kv_cache``) is out of scope:
 import einops
 import pytest
 import torch
-from tests.test_helpers.sink_attention_reference import sink_attention_unified
+from tests.attention.test_helpers.sink_attention_reference import sink_attention_unified
 
 from flashinfer.prefill import (
     PagedAttention,
