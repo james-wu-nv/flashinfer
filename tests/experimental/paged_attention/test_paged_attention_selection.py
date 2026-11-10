@@ -203,13 +203,22 @@ def _plan_kw(p):
     )
 
 
+def _plan_time_order(p, res):
+    """The order plan() walks ``res``'s candidates in for this batch: the
+    auto policy ranks the pinned set per batch, so it need not be
+    ``res.backends``."""
+    attn = PagedAttention(torch.device(p["device"]))
+    attn.plan(make_metadata(p), backend=res, **_plan_kw(p))
+    return attn._impl.selection_order
+
+
 @needs_cuda
 def test_typed_unsupported_moves_to_the_next_candidate(monkeypatch):
     p = make_problem(seed=71, **_SHAPE)
     res = _resolve_or_skip(p, "auto")
     if len(res.backends) < 2:
         pytest.skip("needs two runnable candidates")
-    first, second = res.backends[0], res.backends[1]
+    first, second = _plan_time_order(p, res)[:2]
     _inject_preflight(
         monkeypatch,
         first,
@@ -231,12 +240,13 @@ def test_typed_unsupported_moves_to_the_next_candidate(monkeypatch):
 def test_other_exceptions_from_a_candidate_are_not_swallowed(monkeypatch):
     p = make_problem(seed=73, **_SHAPE)
     res = _resolve_or_skip(p, "auto")
-    _inject_preflight(monkeypatch, res.backends[0], ValueError("boom: not a fallback"))
+    first = _plan_time_order(p, res)[0]
+    _inject_preflight(monkeypatch, first, ValueError("boom: not a fallback"))
     attn = PagedAttention(torch.device(p["device"]))
     with pytest.raises(ValueError, match="boom: not a fallback"):
         attn.plan(make_metadata(p), backend=res, **_plan_kw(p))
     assert attn.backend is None
-    _inject_preflight(monkeypatch, res.backends[0], RuntimeError("plain runtime error"))
+    _inject_preflight(monkeypatch, first, RuntimeError("plain runtime error"))
     with pytest.raises(RuntimeError, match="plain runtime error"):
         attn.plan(make_metadata(p), backend=res, **_plan_kw(p))
 
@@ -301,7 +311,7 @@ def test_features_exclude_backends_with_reasons():
 
     res = resolve_paged_attention(cc_major=10, sinks=True, **_CFG)
     assert res.excluded["cudnn"] == "attention sinks not supported"
-    assert set(res.backends) == {"trtllm-gen", "cake", "fa2"}
+    assert set(res.backends) == {"trtllm-gen", "fa2"}
     assert res.config[-5:-2] == (None, False, True)
 
     # a configuration only cuDNN could run + a feature cuDNN lacks: loud
@@ -391,7 +401,7 @@ def test_max_q_len_hint_changes_the_order_on_this_device():
 
 
 @needs_cuda
-def test_no_hint_keeps_the_default_order_and_plan_honours_the_hint():
+def test_no_hint_keeps_the_default_order_and_plan_ranks_from_the_batch():
     p = make_problem(seed=89, uniform_q1=True, **dict(_SHAPE, max_q=1))
     res_plain = _resolve_or_skip(p, "auto")
     dev = torch.device(p["device"])
@@ -411,12 +421,13 @@ def test_no_hint_keeps_the_default_order_and_plan_honours_the_hint():
     )
     attn = PagedAttention(dev)
     attn.plan(make_metadata(p), backend=res_hint, **_plan_kw(p))
-    # plan() walks the hinted order: the first candidate that accepts the batch
-    assert attn.backend == res_hint.backends[0]
+    hinted = attn.backend
+    assert hinted == attn._impl.selection_order[0]
     assert "max_q_len hint: 1" in attn.explain()
-    # the same batch under the plain Resolution follows today's order
+    # the hint orders the Resolution, not the plan: the same batch under the
+    # plain Resolution is ranked from the batch and lands on the same backend
     attn.plan(make_metadata(p), backend=res_plain, **_plan_kw(p))
-    assert attn.backend == res_plain.backends[0]
+    assert attn.backend == hinted == attn._impl.selection_order[0]
     assert "max_q_len hint: none" in attn.explain()
     out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]))
     assert torch.isfinite(out.float()).all() and torch.isfinite(lse).all()

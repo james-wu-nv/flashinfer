@@ -50,10 +50,11 @@ Prototype simplifications (documented, not hidden):
   table declares it (fa2).  The same two scales multiply a fp16/bf16 KV
   cache on every backend (folded into the softmax scale / the output).
   fp8 Q and nvfp4 are undeclared axes.
-- Heuristic order is a static per-arch table bucketed by the optional
-  ``max_q_len`` hint of ``resolve_paged_attention`` (seeded from the B200
-  sweep in the WP-K report; proposal §5.2).  Autotune hook (§5.4) is not
-  wired: ``auto`` never times anything.
+- ``auto`` ranks the resolved candidates at every ``plan()`` from host
+  facts of the batch (``experimental/paged_attention/_auto_policy.py``: a
+  measured rule on sm_100, the previous static order elsewhere); cake is
+  never an auto candidate.  Autotune hook (§5.4) is not wired: ``auto``
+  never times anything.
 - ``logits_soft_cap`` / ``custom_mask`` / ``use_sinks`` are explicit
   capability axes (fa2: all three; fa3: soft cap + sinks; trtllm-gen and
   cake: sinks; cuDNN: none) — a backend lacking a requested feature is excluded, never
@@ -200,15 +201,15 @@ def resolve_paged_attention(
     - ``max_q_len``: optional shape hint — the batches planned with this
       Resolution have at most this many query tokens per request (1 for
       plain decode, the draft length for speculative decode; leave ``None``
-      for prefill or mixed batches).  It picks the ``auto`` candidate ORDER
-      from a small per-architecture table seeded from measurements, never
-      the candidate set: on sm_100 (B200) the paged context kernels behind
-      trtllm-gen / cake are 1.0-9.5x slower than fa2 at ``max_q_len <= 16``
-      (B=32, kv=4096, q=1: 513 vs 92 us; B=1, kv=16384, q=1: 209 vs 22 us)
-      and ahead from 64-256 query tokens per request depending on kv_len,
-      so hints ``<= 16`` put fa2 first and larger hints (or none) keep
-      today's order.  ``auto`` remains a static selection made
-      here, not autotuning: nothing is timed and ``plan()`` never reorders.
+      for prefill or mixed batches).  It is a promise about the batches,
+      not the thing that picks the backend: ``plan()`` ranks the candidates
+      from each batch's own shape (in CUDA-graph mode: the capacity, once),
+      so a hinted and an unhinted Resolution plan the same batch on the same
+      backend.  The hint only orders ``Resolution.backends`` / ``chosen`` /
+      ``explain()`` before a batch exists (a per-architecture table: on
+      sm_100 hints ``<= 16`` list fa2 first, where the paged context kernel
+      behind trtllm-gen is 1.0-9.5x slower on B200), and it never changes
+      the candidate set.  Nothing is timed.
       The hint is pinned in the Resolution (``explain()`` shows it, and two
       Resolutions of one model configuration with different hints have
       different ``config`` keys), and a ``plan()`` whose batch — in

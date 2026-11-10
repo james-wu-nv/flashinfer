@@ -4,6 +4,10 @@ Tensor-free: callable at engine init, before the KV pool exists and before
 any CUDA graph is captured. Evaluates every declared capability so the
 returned ``Resolution`` carries a reason for each excluded backend — the
 "explain" answer consumer-side tables cannot give.
+
+This level fixes the candidate SET.  Its order is only the estimate available
+without a batch; ``plan()`` reorders the set for each batch through
+``_auto_policy.py``.
 """
 
 from __future__ import annotations
@@ -12,6 +16,7 @@ from typing import Callable, Dict, Optional, Tuple
 
 import torch
 
+from ._auto_policy import _AUTO_BACKEND_CANDIDATES
 from ._backends._capabilities import CAPABILITIES
 from ._contracts import (
     Resolution,
@@ -111,13 +116,15 @@ def _bind_device(
     return dev, int(props.major), int(props.minor), int(dev.index)
 
 
-# Static preference order per compute-capability major, bucketed by the
+# Resolve-time preference order per compute-capability major, bucketed by the
 # caller's ``max_q_len`` hint (proposal §5.2: seeded from the benchmark suite;
 # it only has to beat consumer tables that rot).  Each entry is
 # ``(bound, order)``: the order applies to a hint ``<= bound``; entries are
 # ascending and the last one (``bound=None``) is the default, used with no hint
-# or a hint above every bound.  ``auto`` stays a static selection: the hint is
-# the only shape fact it reads, and plan() never reorders.
+# or a hint above every bound.  This is the order of ``Resolution.backends``
+# before any batch exists; plan() ranks the same set from the batch itself
+# (``_auto_policy.py``), so the hint no longer decides what a plan tries first.
+# ``cake`` is in no bucket: it is not an auto candidate.
 #
 # sm_100 numbers (B200, bf16, GQA 32/8, head_dim 128, page 16, causal, dense
 # table, CUDA-graph ``run`` medians in µs; full sweep in
@@ -141,11 +148,9 @@ def _bind_device(
 HEURISTIC_ORDER: Dict[int, Tuple[Tuple[Optional[int], Tuple[str, ...]], ...]] = {
     10: (
         # decode / speculative: fa2 first, then the context kernels
-        (16, ("fa2", "trtllm-gen", "cake", "cudnn")),
-        # default (chunked / full prefill, or no hint): cake right after
-        # trtllm-gen — same dialect and envelope, so it is the natural next
-        # candidate when trtllm-gen declines a batch
-        (None, ("trtllm-gen", "cake", "cudnn", "fa2")),
+        (16, ("fa2", "trtllm-gen", "cudnn")),
+        # default (chunked / full prefill, or no hint)
+        (None, ("trtllm-gen", "cudnn", "fa2")),
     ),
     9: ((None, ("fa3", "fa2", "cudnn")),),
     8: ((None, ("fa2", "cudnn")),),
@@ -210,9 +215,15 @@ def resolve_paged_attention(
     reason) rather than dropping it silently.
 
     ``max_q_len`` is an optional shape hint: the batches planned with this
-    Resolution have at most this many query tokens per request.  It selects
-    the candidate ORDER (``HEURISTIC_ORDER`` bucket) — never the candidate
-    set — and is pinned in ``config``, so plan() rejects a batch above it.
+    Resolution have at most this many query tokens per request.  It is pinned
+    in ``config``, so plan() rejects a batch above it, and it orders
+    ``backends`` (``HEURISTIC_ORDER`` bucket) — what ``chosen`` and
+    ``explain()`` report before a batch exists.  It never changes the
+    candidate set, and it does not decide what plan() tries first: with a
+    batch at hand the auto policy ranks the set from the batch's own facts.
+
+    ``backend="auto"`` considers the auto candidates only; ``cake`` runs when
+    named.
     """
     if head_dim_vo is None:
         head_dim_vo = head_dim_qk
@@ -271,6 +282,12 @@ def resolve_paged_attention(
             use_custom_mask=custom_mask,
             use_sinks=sinks,
         )
+        if (
+            reason is None
+            and backend == "auto"
+            and name not in _AUTO_BACKEND_CANDIDATES
+        ):
+            reason = f"not an auto candidate; pin it with backend={name!r}"
         if reason is None:
             reason = PROBES[name](dev)
         if reason is None:

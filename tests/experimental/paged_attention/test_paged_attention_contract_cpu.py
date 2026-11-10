@@ -418,7 +418,12 @@ def test_auto_orders_by_heuristic_and_explains_every_backend(no_probes, cc_major
     assert set(res.backends) | set(res.excluded) == set(CAPABILITIES)
     assert not (set(res.backends) & set(res.excluded))
     for name, why in res.excluded.items():
-        assert why == _reason(name, cc_major=cc_major)
+        # cake is never an auto candidate, even where its capabilities admit it
+        assert why == (
+            _reason(name, cc_major=cc_major)
+            or "not an auto candidate; pin it with backend='cake'"
+        )
+    assert "cake" in res.excluded
     assert res.kv_layout == "HND"
 
 
@@ -445,7 +450,7 @@ def test_probe_failure_becomes_an_exclusion_reason(monkeypatch):
     res = _resolve(10)
     assert "cudnn" not in res.backends
     assert res.excluded["cudnn"] == "cudnn-frontend python package not importable"
-    assert res.backends == ("trtllm-gen", "cake", "fa2")  # cudnn probed out
+    assert res.backends == ("trtllm-gen", "fa2")  # cudnn probed out
 
 
 def test_probes_run_only_for_capability_admitted_backends(monkeypatch):
@@ -504,9 +509,10 @@ def test_heuristic_order_covers_declared_cc_majors():
         )
         for bound, order in buckets:
             assert len(set(order)) == len(order), (cc, bound, order)
-            # every bucket ranks the SAME backends: the hint changes the
-            # order, never the candidate set
-            assert set(order) == declared_here, (
+            # every bucket ranks the SAME backends (the auto candidates: cake
+            # runs only when named): the hint changes the order, never the
+            # candidate set
+            assert set(order) == declared_here - {"cake"}, (
                 f"sm_{cc}x order {order} (max_q_len <= {bound}) != backends "
                 f"declaring sm_{cc}x {sorted(declared_here)}"
             )

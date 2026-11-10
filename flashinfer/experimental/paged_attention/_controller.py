@@ -2,11 +2,11 @@
 
 Owns the public lifecycle behind ``flashinfer.prefill``:
 validation, level-1 pinning against a ``Resolution``, level-2 choice within
-it (a preference-ordered walk in which only the typed
+it (a walk in the auto policy's order for the batch, in which only the typed
 ``_BackendPlanUnsupportedError`` from a candidate's ``preflight()`` moves on to
 the next candidate), derivation, and transactional publication of the planned
-backend. It does not own any backend dialect (``_backends/``) or selection
-policy (``_selection.py``).
+backend. It does not own any backend dialect (``_backends/``), the candidate
+set (``_selection.py``) or its ranking (``_auto_policy.py``).
 
 Publication is transactional at this layer: ``plan()`` only swaps the
 published metadata, derived forms, and active backend after the candidate
@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
+from ._auto_policy import _PlanFacts, plan_order
 from ._backends import (
     CAPABILITIES,
     _BackendPlanUnsupportedError,
@@ -293,8 +294,10 @@ class PagedAttentionController:
         self._planned = False
         self._backend_name: Optional[str] = None
         self._resolution: Optional[Resolution] = None
-        # plan-time selection trace: (backend, phase, reason) per candidate tried
+        # plan-time selection trace: (backend, phase, reason) per candidate tried,
+        # and the order the last plan walked the candidates in
         self._trace: List[Tuple[str, str, str]] = []
+        self._order: Tuple[str, ...] = ()
         self._meta: Optional[PlanMetadata] = None
         self._derived: Optional[Derived] = None
         # flat form only: the page ids the plan was made from (reserved storage
@@ -426,7 +429,9 @@ class PagedAttentionController:
                 backend=backend,
             )
         # Plan-time choice within the pinned set (level 2): walk the
-        # candidates in preference order.  A candidate may decline THIS batch
+        # candidates in the auto policy's order for this batch (eager: every
+        # plan; graph mode: the first plan, which freezes the backend).  The
+        # policy only ranks.  A candidate may decline THIS batch
         # from its cheap preflight() with the typed unsupported signal, in
         # which case the next member is tried; every other exception (invalid
         # input, OOM, JIT failure) propagates unchanged, and an explicit
@@ -462,21 +467,22 @@ class PagedAttentionController:
             # rather than this batch's own (validated <= in preflight); the
             # derived dense table is sized to the reserved one likewise.
             max_q_len, max_kv_len = gb.capacity.max_q_len, gb.capacity.max_kv_len
+            total_q_tokens = gb.capacity.total_q_tokens
         else:
             max_q_len, max_kv_len = metadata.max_q_len, metadata.max_kv_len
+            total_q_tokens = metadata.total_q_tokens
         if resolution.max_q_len is not None:
-            # The Resolution's candidate order was chosen for batches with at
-            # most ``max_q_len`` query tokens per request (the caller's hint);
-            # a batch — in graph mode the capacity the kernels are planned
-            # with — above it breaks that promise, so it is refused here,
-            # before any reserved-storage write, rather than run in the
-            # wrong order.
+            # The caller promised batches with at most ``max_q_len`` query
+            # tokens per request (the Resolution's hint); a batch — in graph
+            # mode the capacity the kernels are planned with — above it
+            # breaks that promise, so it is refused here, before any
+            # reserved-storage write.
             _expect(
                 max_q_len <= resolution.max_q_len,
                 f"max_q_len {max_q_len} of this "
                 f"{'graph capacity' if gb is not None else 'batch'} exceeds the "
-                f"pinned Resolution's hint max_q_len={resolution.max_q_len} (its "
-                "candidate order is for batches with at most that many query "
+                f"pinned Resolution's hint max_q_len={resolution.max_q_len} (it "
+                "was resolved for batches with at most that many query "
                 "tokens per request) — resolve_paged_attention() without the "
                 "hint, or with a larger one, for these batches",
             )
@@ -488,7 +494,37 @@ class PagedAttentionController:
             _check_frozen_contract(
                 {"backend": frozen_backend}, {"backend": resolution.backends[0]}
             )
-        for name in resolution.backends:
+        candidates = resolution.backends
+        if frozen_backend is None and len(candidates) > 1:
+            # Host values only: the bounds the kernels are planned with and
+            # the batch's host mirrors, never a device readback.
+            candidates = plan_order(
+                candidates,
+                self._device_binding()[:2],
+                _PlanFacts(
+                    batch_size=metadata.batch_size,
+                    total_q_tokens=total_q_tokens,
+                    max_q_len=max_q_len,
+                    max_kv_len=max_kv_len,
+                    num_qo_heads=num_qo_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
+                    page_size=metadata.page_size,
+                    kv_layout=kv_layout,
+                    q_dtype=q_dtype,
+                    kv_dtype=kv_dtype,
+                    causal=causal,
+                    window_left=window_left,
+                    logits_soft_cap=logits_soft_cap,
+                    custom_mask=custom_mask is not None,
+                    use_sinks=use_sinks,
+                    use_cuda_graph=gb is not None,
+                    qo_indptr=metadata.qo_indptr_cpu,
+                    kv_seq_lens=metadata.kv_seq_lens_cpu,
+                ),
+            )
+        for name in candidates:
             if frozen_backend is not None and name != frozen_backend:
                 # a captured graph launches the frozen backend's kernels; skip
                 # every other candidate before constructing or reserving
@@ -585,7 +621,7 @@ class PagedAttentionController:
             detail = "; ".join(f"{n}: {r}" for n, _, r in trace)
             raise ValueError(
                 "no pinned candidate can plan this batch "
-                f"(candidates {list(resolution.backends)}: {detail})"
+                f"(candidates {list(candidates)}: {detail})"
             )
         name, candidate, meta, derived, fresh = chosen
         key = (name, kv_layout)
@@ -636,6 +672,7 @@ class PagedAttentionController:
         self._backend_name = name
         self._resolution = resolution
         self._trace = trace
+        self._order = candidates
         self._meta = meta
         self._derived = derived
         if metadata.kv_page_indices is not None:
@@ -720,9 +757,7 @@ class PagedAttentionController:
             ("v_cache", v_cache, m.head_dim_vo),
         ):
             if t.dim() != 4:
-                raise ValueError(
-                    f"{name} must be 4-D paged {shape_word} [{layout}]"
-                )
+                raise ValueError(f"{name} must be 4-D paged {shape_word} [{layout}]")
             if not (
                 t.shape[h_pos] == m.num_kv_heads
                 and t.shape[ps_pos] == m.page_size
@@ -779,9 +814,7 @@ class PagedAttentionController:
                     f"batch's {total} tokens and at most its capacity of {rows}"
                 )
         elif q.shape[0] != total:
-            raise ValueError(
-                f"q has {q.shape[0]} tokens but qo_indptr sums to {total}"
-            )
+            raise ValueError(f"q has {q.shape[0]} tokens but qo_indptr sums to {total}")
         # Query ABI shared by every backend: the FA2/FA3 and trtllm-gen bindings
         # pass only the token and head strides (the kernels assume a dense
         # head_dim), so a non-unit inner stride is silently misread (native
@@ -900,10 +933,19 @@ class PagedAttentionController:
         """``(backend, phase, reason)`` for every candidate the last plan() tried."""
         return tuple(self._trace)
 
+    @property
+    def selection_order(self) -> Tuple[str, ...]:
+        """The candidates in the order the last successful plan() walked them."""
+        return self._order
+
     def explain(self) -> str:
         _expect(self._planned, "explain() called before plan() — call plan() first")
         assert self._resolution is not None
-        lines = [f"chosen: {self._backend_name}", "plan-time trace:"]
+        lines = [
+            f"chosen: {self._backend_name}",
+            f"plan-time order: {list(self._order)}",
+            "plan-time trace:",
+        ]
         for name, phase, reason in self._trace:
             lines.append(f"  {name} [{phase}]: {reason}")
         lines.append(self._resolution.explain())

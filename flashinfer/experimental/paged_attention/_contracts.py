@@ -228,9 +228,10 @@ class Resolution:
     def max_q_len(self) -> Optional[int]:
         """The ``max_q_len`` hint this Resolution was resolved with, or ``None``.
 
-        With a hint the candidate order is the one for batches whose requests
-        have at most that many query tokens, and plan() rejects a batch (in
-        CUDA-graph mode: a capacity) whose ``max_q_len`` exceeds it.
+        With a hint ``backends`` is in the resolve-time order for batches
+        whose requests have at most that many query tokens, and plan() rejects
+        a batch (in CUDA-graph mode: a capacity) whose ``max_q_len`` exceeds
+        it.  plan() itself ranks the candidates from the batch, not the hint.
         """
         return self.config[-2] if len(self.config) >= 2 else None
 
@@ -249,11 +250,15 @@ class Resolution:
         if self.max_q_len is not None:
             lines.append(
                 f"max_q_len hint: {self.max_q_len} (order for batches with at most "
-                f"{self.max_q_len} query tokens per request)"
+                f"{self.max_q_len} query tokens per request; longer batches are "
+                "rejected)"
             )
         else:
             lines.append("max_q_len hint: none (default order)")
-        lines.append(f"candidates (preference order): {list(self.backends)}")
+        lines.append(
+            f"candidates (resolve-time order; plan() ranks per batch): "
+            f"{list(self.backends)}"
+        )
         for name, reason in self.excluded.items():
             lines.append(f"excluded {name}: {reason}")
         return "\n".join(lines)

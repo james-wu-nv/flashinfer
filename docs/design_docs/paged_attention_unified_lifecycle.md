@@ -101,8 +101,8 @@ It does not define:
   protocol in `flashinfer/experimental/paged_attention/_backends/__init__.py`
   is private to this package.
 - A functional entry point. Planning is required before running.
-- Autotuning. `backend="auto"` is a static per-architecture preference order
-  seeded by hand (`HEURISTIC_ORDER` in `_selection.py`).
+- Autotuning. `backend="auto"` ranks the candidates with a fixed rule over
+  host facts of the batch (`_auto_policy.py`); nothing is timed.
 - KV-cache append, cascade or DCP orchestration.
 - Public exposure of the package modules or the concrete backend classes.
 
@@ -316,6 +316,7 @@ flashinfer/
     |-- _contracts.py              PagedAttentionMetadata, PlanMetadata, Resolution
     |-- _planning.py               validation, HostArrays, Derived, derive()
     |-- _selection.py              resolve_paged_attention(), probes, HEURISTIC_ORDER
+    |-- _auto_policy.py            plan-time ranking of the auto candidates
     |-- _controller.py             plan()/update()/run() lifecycle
     |-- _graph.py                  GraphCapacity, GraphBuffers, Transaction
     `-- _backends/
@@ -461,8 +462,10 @@ captured graph keeps the values it was captured with
 arguments, normalizes `logits_soft_cap`, and evaluates backends. With
 `backend="auto"` it evaluates every declared backend, ordered by
 `HEURISTIC_ORDER[cc_major]` first and the remaining names after, so
-`Resolution.explain()` carries a reason for each excluded backend. With an
-explicit name it evaluates only that backend. For each backend it asks the
+`Resolution.explain()` carries a reason for each excluded backend. `cake` is
+not an auto candidate on any architecture: under `auto` it is excluded with
+that reason and runs only when named. With an explicit name it evaluates only
+that backend. For each backend it asks the
 capability table (`rejection_reason`) and, if admitted, the environment probe
 (`PROBES[name](device)`):
 
@@ -481,12 +484,17 @@ three feature flags, and as its last element the device binding
 
 | cc major | preference order |
 | --- | --- |
-| 10 | trtllm-gen, cake, cudnn, fa2 |
+| 10 | trtllm-gen, cudnn, fa2 (fa2, trtllm-gen, cudnn with a `max_q_len` hint <= 16) |
 | 9 | fa3, fa2, cudnn |
 | 8 | fa2, cudnn |
 | 12 | fa2, cudnn |
 
-It is a static placeholder, to be seeded from the benchmark suite.
+This is only the order of `Resolution.backends` before a batch exists (what
+`chosen` and `Resolution.explain()` show). It fixes the candidate set;
+`plan()` ranks that set per batch (next section). The `max_q_len` hint picks
+the bucket here and stays a pinned promise — `plan()` rejects a batch, or a
+graph capacity, above it — but it no longer decides which backend a plan
+tries first.
 
 ### Capability axes
 
@@ -513,9 +521,59 @@ size, layout, non-causal, LSE, window, window with non-causal, soft cap,
 custom mask, sinks, and finally whether a dense-reading backend would have
 to derive its table from flat page ids below `MIN_DENSE_PAGE_SIZE`.
 
+### Level 2: the auto policy
+
+`_auto_policy.py` orders the resolved candidates for one `plan()`. It only
+ranks: the capability table and probes own the set, and each backend's
+`preflight()` owns eligibility for the batch. A single candidate (an explicit
+backend name) is not ranked.
+
+What it reads (`_PlanFacts`, host values only, built by the controller):
+
+| fact | eager | CUDA-graph mode |
+| --- | --- | --- |
+| `batch_size` | the batch | the batch (equal to the capacity's) |
+| `total_q_tokens`, `max_q_len`, `max_kv_len` | the metadata's values | the capacity's values |
+| per-request Q / KV lengths | the metadata's host mirrors | the first plan's host mirrors |
+| heads, head dims, page size, layout, dtypes, causal, window, soft cap, custom mask, sinks | `plan()` arguments | `plan()` arguments |
+
+The mirrors are read on every call and never fetched from the device; a
+device tensor in their place is treated as absent.
+
+Dispatch is by exact compute capability. SM100 `(10, 0)` has the measured
+rule (GB200, cuDNN 9.27, cudnn-frontend 1.32, 594 cases; the table of
+measurements is next to the rule in the module):
+
+1. cuDNN first inside the legacy wrapper's qualified cuDNN region (a copy of
+   `flashinfer.prefill._blackwell_paged_auto_cudnn` and the feature conditions
+   around its call: causal, no window, soft cap, custom mask or sinks; HND,
+   bf16, head dim 128, page 16, batch 1-4, 8-64 query heads; prefix
+   `64 <= max_q <= 1024`, `2048 <= max_kv <= 32768`, `max_kv >= 4 * max_q`, or
+   full prefill `1024 <= max_q == max_kv <= 8192` with every request's Q equal
+   to its KV; at least 8 Mi head x Q x KV work, exact when the lengths are on
+   the host).
+2. otherwise trtllm-gen first when `rows >= W` and `fill >= F`, with
+   `rows = num_qo_heads * total_q / 128`,
+   `ntg = batch * num_qo_heads * ceil(max_q / 128)` (the context kernel's CTA
+   grid), `fill = rows / ntg`; `W` is 64 at head dim >= 128 and 96 below; `F`
+   is 0.375 in graph mode and 0.75 eager.
+3. otherwise fa2 first.
+
+The other candidates follow in a fixed order: the loser of 2 / 3 next, cuDNN
+last outside its region. Other architectures keep their previous order, with
+the batch's `max_q_len` in place of the hint: SM90 fa3, fa2, cudnn (fa2
+first at `max_q_len <= 64`, as the legacy wrapper does); other SM10x
+trtllm-gen, cudnn, fa2 (fa2 first at `max_q_len <= 16`); SM80 and SM120 fa2,
+cudnn.
+
+Eager instances rank on every `plan()`, so the backend can change between
+batches. A graph-mode instance ranks once: the first successful plan freezes
+its backend, and later plans and `update()` keep it. To pin a backend, pass
+its name (`backend="fa2"`), or a `Resolution` resolved with that name.
+
 ### Level 2: the candidate walk
 
-In `plan()`, the controller walks `resolution.backends` in order. A candidate
+In `plan()`, the controller walks the candidates in the policy's order. A candidate
 may decline the specific batch from `preflight(meta)` with
 `_BackendPlanUnsupportedError` (a `RuntimeError` subclass defined in
 `_capabilities.py`, the twin of the MLA package's private type). Preflight is
@@ -547,11 +605,13 @@ Current preflight rules:
 ### `explain()`
 
 `PagedAttention.explain()` raises `ValueError` before the first successful
-plan. Afterwards it prints the chosen backend, the plan-time trace (one line
-per candidate tried: `name [preflight]: accepted` or the decline reason) and
-the `Resolution.explain()` text (the device the resolution answers for, the
-candidates in preference order, and each exclusion reason). The trace is also
-available as `PagedAttentionController.selection_trace`.
+plan. Afterwards it prints the chosen backend, the order the policy gave the
+candidates for that plan, the plan-time trace (one line per candidate tried:
+`name [preflight]: accepted` or the decline reason) and the
+`Resolution.explain()` text (the device the resolution answers for, the
+candidates in resolve-time order, and each exclusion reason). The trace and
+the order are also available as `PagedAttentionController.selection_trace`
+and `.selection_order`.
 
 ## Planning contract
 
