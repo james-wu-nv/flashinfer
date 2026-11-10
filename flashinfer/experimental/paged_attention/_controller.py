@@ -682,6 +682,9 @@ class PagedAttentionController:
         v_scale: Optional[float] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # Hot path: one call per attention layer.  Every check below builds its
+        # message only when it fails; formatting shapes and strides up front
+        # cost more host time than the checks themselves.
         _expect(self._planned, "run() called before plan() — call plan() first")
         m = self._meta
         assert m is not None and self._active is not None
@@ -700,11 +703,11 @@ class PagedAttentionController:
             ("out", out),
             ("lse", lse),
         ):
-            _expect(
-                t is None or t.device == self.device,
-                f"{name} lives on {getattr(t, 'device', None)} but this instance "
-                f"is bound to {self.device}",
-            )
+            if t is not None and t.device != self.device:
+                raise ValueError(
+                    f"{name} lives on {t.device} but this instance is bound to "
+                    f"{self.device}"
+                )
         layout = m.kv_layout
         h_pos, ps_pos = (1, 2) if layout == "HND" else (2, 1)
         shape_word = (
@@ -716,49 +719,53 @@ class PagedAttentionController:
             ("k_cache", k_cache, m.head_dim_qk),
             ("v_cache", v_cache, m.head_dim_vo),
         ):
-            _expect(t.dim() == 4, f"{name} must be 4-D paged {shape_word} [{layout}]")
-            swapped_hint = (
-                f" — dims 1/2 look transposed: the plan declared kv_layout="
-                f"{layout!r} {shape_word}; permute(0, 2, 1, 3).contiguous() or "
-                "re-plan with the other kv_layout"
-                if (
-                    t.shape[ps_pos] == m.num_kv_heads
-                    and t.shape[h_pos] == m.page_size
-                    and m.num_kv_heads != m.page_size
+            if t.dim() != 4:
+                raise ValueError(
+                    f"{name} must be 4-D paged {shape_word} [{layout}]"
                 )
-                else ""
-            )
-            _expect(
+            if not (
                 t.shape[h_pos] == m.num_kv_heads
                 and t.shape[ps_pos] == m.page_size
-                and t.shape[3] == dim_,
-                f"{name} shape {tuple(t.shape)} does not match plan "
-                f"(kv_layout={layout}, H={m.num_kv_heads}, "
-                f"page_size={m.page_size}, D={dim_})"
-                f"{swapped_hint}",
-            )
-            _expect(
-                t.dtype == m.kv_dtype,
-                f"{name} dtype {t.dtype} != planned {m.kv_dtype}",
-            )
+                and t.shape[3] == dim_
+            ):
+                swapped_hint = (
+                    f" — dims 1/2 look transposed: the plan declared kv_layout="
+                    f"{layout!r} {shape_word}; permute(0, 2, 1, 3).contiguous() or "
+                    "re-plan with the other kv_layout"
+                    if (
+                        t.shape[ps_pos] == m.num_kv_heads
+                        and t.shape[h_pos] == m.page_size
+                        and m.num_kv_heads != m.page_size
+                    )
+                    else ""
+                )
+                raise ValueError(
+                    f"{name} shape {tuple(t.shape)} does not match plan "
+                    f"(kv_layout={layout}, H={m.num_kv_heads}, "
+                    f"page_size={m.page_size}, D={dim_})"
+                    f"{swapped_hint}"
+                )
+            if t.dtype != m.kv_dtype:
+                raise ValueError(f"{name} dtype {t.dtype} != planned {m.kv_dtype}")
             # Same ABI as q below: the bindings pass page/head/token strides
             # only, so a non-unit head_dim stride would be silently misread.
-            _expect(
-                t.stride(-1) == 1,
-                f"{name} must be dense along head_dim (stride(-1) == 1), got "
-                f"strides {tuple(t.stride())} — the kernels address the KV pool "
-                "by page/head/token stride only; pass a view whose last dim is "
-                "unit-stride or a packed copy",
-            )
+            if t.stride(-1) != 1:
+                raise ValueError(
+                    f"{name} must be dense along head_dim (stride(-1) == 1), got "
+                    f"strides {tuple(t.stride())} — the kernels address the KV pool "
+                    "by page/head/token stride only; pass a view whose last dim is "
+                    "unit-stride or a packed copy"
+                )
         _expect(
             q.dim() == 3, "q must be packed (total_q_tokens, num_qo_heads, head_dim)"
         )
-        _expect(
-            q.shape[1] == m.num_qo_heads and q.shape[2] == m.head_dim_qk,
-            f"q shape {tuple(q.shape)} does not match plan "
-            f"(H={m.num_qo_heads}, D={m.head_dim_qk})",
-        )
-        _expect(q.dtype == m.q_dtype, f"q dtype {q.dtype} != planned {m.q_dtype}")
+        if not (q.shape[1] == m.num_qo_heads and q.shape[2] == m.head_dim_qk):
+            raise ValueError(
+                f"q shape {tuple(q.shape)} does not match plan "
+                f"(H={m.num_qo_heads}, D={m.head_dim_qk})"
+            )
+        if q.dtype != m.q_dtype:
+            raise ValueError(f"q dtype {q.dtype} != planned {m.q_dtype}")
         total = m.total_q_tokens
         if self._graph is not None:
             # graph mode: q/out/lse are the capture buffers, at most the
@@ -766,15 +773,14 @@ class PagedAttentionController:
             # batches (GraphBuffers.preflight), since a graph captured on
             # these buffers cannot reach past them
             rows = self._graph.capacity.total_q_tokens
-            _expect(
-                total <= q.shape[0] <= rows,
-                f"q has {q.shape[0]} tokens; a graph-mode instance needs this "
-                f"batch's {total} tokens and at most its capacity of {rows}",
-            )
-        else:
-            _expect(
-                q.shape[0] == total,
-                f"q has {q.shape[0]} tokens but qo_indptr sums to {total}",
+            if not (total <= q.shape[0] <= rows):
+                raise ValueError(
+                    f"q has {q.shape[0]} tokens; a graph-mode instance needs this "
+                    f"batch's {total} tokens and at most its capacity of {rows}"
+                )
+        elif q.shape[0] != total:
+            raise ValueError(
+                f"q has {q.shape[0]} tokens but qo_indptr sums to {total}"
             )
         # Query ABI shared by every backend: the FA2/FA3 and trtllm-gen bindings
         # pass only the token and head strides (the kernels assume a dense
@@ -782,13 +788,13 @@ class PagedAttentionController:
         # probe: max abs error 1.5 / 1.3 against 0.0025); cuDNN rejects it in
         # graph construction.  See
         # tests/experimental/paged_attention/test_paged_attention_strides.py.
-        _expect(
-            q.stride(-1) == 1,
-            f"q must be dense along head_dim (stride(-1) == 1), got strides "
-            f"{tuple(q.stride())} — every backend addresses q by token/head "
-            "stride only; pass a view whose last dim is unit-stride (a head "
-            "slice of a fused QKV buffer is fine) or a packed copy",
-        )
+        if q.stride(-1) != 1:
+            raise ValueError(
+                f"q must be dense along head_dim (stride(-1) == 1), got strides "
+                f"{tuple(q.stride())} — every backend addresses q by token/head "
+                "stride only; pass a view whose last dim is unit-stride (a head "
+                "slice of a fused QKV buffer is fine) or a packed copy"
+            )
         cap = CAPABILITIES[self._backend_name]
         if cap.requires_contiguous_q and not q.is_contiguous():
             strided = [
@@ -807,11 +813,11 @@ class PagedAttentionController:
                 and out.is_contiguous(),
                 "out must be contiguous (total_q_tokens, num_qo_heads, head_dim_vo)",
             )
-            _expect(
-                out.dtype == m.q_dtype,
-                f"out must match q dtype {m.q_dtype}, got {out.dtype} — "
-                "allocate with torch.empty(..., dtype=q.dtype, device=q.device)",
-            )
+            if out.dtype != m.q_dtype:
+                raise ValueError(
+                    f"out must match q dtype {m.q_dtype}, got {out.dtype} — "
+                    "allocate with torch.empty(..., dtype=q.dtype, device=q.device)"
+                )
         if lse is not None:
             _expect(
                 m.need_lse,
@@ -828,10 +834,12 @@ class PagedAttentionController:
             )
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(m.head_dim_qk)
-        _expect(
-            isinstance(sm_scale, float) and math.isfinite(sm_scale) and sm_scale > 0,
-            f"sm_scale must be a positive finite host float, got {sm_scale!r}",
-        )
+        if not (
+            isinstance(sm_scale, float) and math.isfinite(sm_scale) and sm_scale > 0
+        ):
+            raise ValueError(
+                f"sm_scale must be a positive finite host float, got {sm_scale!r}"
+            )
         # Per-tensor K / V scales for any planned kv_dtype: the dequantization
         # scales of an fp8 cache, or (legacy wrapper semantics) a plain
         # multiplier of a fp16 / bf16 cache.  Either way the backend folds

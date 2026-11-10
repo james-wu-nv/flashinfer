@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Any, Dict, FrozenSet, Optional, Tuple
 
 import torch
@@ -530,8 +531,9 @@ class PlanMetadata:
     # sink-aware kernel variant
     use_sinks: bool = False
 
-    @property
+    @cached_property
     def total_q_tokens(self) -> int:
+        # read once per planned batch: run() checks it on every call
         return int(self.qo_indptr_cpu[-1])
 
     @property
