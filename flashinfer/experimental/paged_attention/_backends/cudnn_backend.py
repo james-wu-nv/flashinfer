@@ -10,12 +10,22 @@ with one measured exception: at ``max_q_len == 1`` cuDNN (9.25 / frontend
 1.29, B200) writes no stats at all when a ragged stats offset is set, so that
 case uses the padded layout, which for max_q_len == 1 is byte-identical to
 the packed one (a view, still no gather).
+
+Execution: plan() stages a ``_CudnnPrefillPlan`` (the plan-owned metadata
+views, graph descriptor keys and static bindings the legacy wrapper also
+builds) and run() goes through a prepared ``CudnnPrefillGraph`` with
+``matches_plan`` / ``run_planned``, rebinding only Q / K / V / O / Stats per
+call.  The staged declaration is the one ``cudnn_batch_prefill_with_kv_cache``
+resolves from the same arguments, so both reach the same cached cuDNN graph.
+That functional entry remains the fallback where no plan can be staged (a
+cuDNN / frontend without the direct token-offset path) and the packed-LSE
+probe.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -142,6 +152,23 @@ class _CudnnBackend:
         self._batch_ids: Optional[torch.Tensor] = None
         self._pos: Optional[torch.Tensor] = None
         self._device = device
+        # Prepared path.  plan() stages the plan-owned cuDNN metadata, graph
+        # descriptor keys and static bindings (None: no plan can be staged on
+        # this cuDNN / frontend and run() takes the functional entry).  The
+        # cuDNN graph is also keyed on the q / K / V layouts and the scale
+        # float, which only run() sees, so run() fetches it once per
+        # signature and keeps it in the short most-recent-first history
+        # _reuse_cudnn_prefill_preparation maintains: four entries, of which
+        # _prepared (the last one used, checked first) is the head, not a
+        # fifth.  Alternating between up to four scales, layouts or
+        # declarations therefore does not go back to the process-wide graph
+        # cache; with more, each miss costs about one functional call.  The
+        # history outlives re-plans; the workspace its graphs were sized
+        # against is fixed for the life of this instance.
+        self._cudnn_plan: Optional[Any] = None
+        self._lse_base = "log2"
+        self._prepared: Optional[Any] = None
+        self._prepared_history: List[Any] = []
 
     def preflight(self, meta: PlanMetadata) -> None:
         """Batch-specific checks; typed unsupported only, no allocation."""
@@ -165,6 +192,68 @@ class _CudnnBackend:
     def lse_written_packed(self) -> bool:
         """True when cuDNN writes the packed LSE directly (no gather)."""
         return self._lse_path != "gather"
+
+    def _stage_cudnn_plan(
+        self,
+        meta: PlanMetadata,
+        derived: Derived,
+        block_tables: torch.Tensor,
+        path: str,
+    ) -> Optional[Any]:
+        """Plan-time half of the prepared path: the ``_CudnnPrefillPlan`` that
+        run() executes through, or None where only the functional entry can
+        serve the plan.
+
+        The metadata is the one ``cudnn_batch_prefill_with_kv_cache`` resolves
+        per call from the arguments run() hands it on the fallback path (the
+        same maxes, the same length / offset / table tensors, a stats offset
+        only on the direct LSE path), so both compute the same graph
+        descriptor key and share one cached cuDNN graph.  Nothing is written
+        to the backend here; plan() publishes the result with the rest.
+        """
+        from ....cudnn import prefill as cudnn_prefill
+
+        # The library's own gate (cuDNN 9.25 / frontend 1.27: per-request KV
+        # lengths next to token-unit Q offsets), read as a module attribute on
+        # every plan because tests steer it.  Below it the entry converts the
+        # offsets to element units on each call; a plan staged once would
+        # freeze that copy while the offsets keep changing in place (graph
+        # mode), so run() keeps calling the entry there.
+        if not cudnn_prefill._cudnn_supports_direct_seqlens(meta.q_dtype, mixed=True):
+            return None
+        b = meta.batch_size
+        metadata = cudnn_prefill._PrefillMetadata(
+            meta.max_q_len,
+            meta.max_kv_len,
+            meta.causal,
+            meta.need_lse,
+            o_data_type=meta.q_dtype,
+            actual_seq_lens_q=derived.require(FORM_Q_SEQ_LENS).view(b, 1, 1, 1),
+            actual_seq_lens_kv=meta.kv_seq_lens.view(b, 1, 1, 1),
+            block_tables=block_tables,  # width == ceil(max_kv / page)
+            batch_offsets_q=meta.qo_indptr,
+            batch_offsets_o=meta.qo_indptr,
+            batch_offsets_stats=meta.qo_indptr if path == "direct" else None,
+        ).resolve_from_plan(
+            meta.q_dtype,
+            meta.num_qo_heads,
+            meta.num_kv_heads,
+            meta.head_dim_qk,
+            meta.head_dim_vo,
+        )
+        if not metadata._token_offsets:
+            # resolved to the element-offset conversion after all
+            return None
+        # The device is the workspace's (indexed): the plan compares it with
+        # every tensor it binds.  With the previous plan at hand, prepare()
+        # returns that same object when nothing it binds moved -- graph mode,
+        # where every tensor above is reserved storage, so a captured execute
+        # keeps the pointers it baked in -- and otherwise reuses its
+        # descriptor keys when only the pointers changed (eager re-plans with
+        # fresh metadata tensors of one layout).
+        return cudnn_prefill._CudnnPrefillPlan.prepare(
+            metadata, meta.q_dtype, self._workspace.device, self._cudnn_plan
+        )
 
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
         # Page-table ABI: cuDNN requires the table's page dimension to equal
@@ -209,6 +298,11 @@ class _CudnnBackend:
                 # plan() is never inside a graph capture, so the one-time
                 # probe (a graph build + execute on a toy problem) belongs here
                 path = "direct"
+        # Stage before the gather indices below are refilled in place: staging
+        # can raise, and those indices are backend-owned storage a captured
+        # run keeps reading, outside the controller's rollback of the
+        # reserved buffers.
+        cudnn_plan = self._stage_cudnn_plan(meta, derived, block_tables, path)
         if meta.need_lse and path == "gather":
             # Gather fallback: the LSE-gather indices and the native padded
             # stats buffer are static per plan (qo_indptr and batch size are
@@ -226,22 +320,30 @@ class _CudnnBackend:
             new_pos = (token - meta.qo_indptr.to(torch.int64)[new_batch_ids]).clamp_(
                 0, meta.max_q_len - 1
             )
+            batch_ids, pos, native_lse = self._batch_ids, self._pos, self._native_lse
+            lse_shape = (meta.batch_size, meta.max_q_len, meta.num_qo_heads)
+            if native_lse is None or tuple(native_lse.shape) != lse_shape:
+                native_lse = torch.empty(*lse_shape, device=dev, dtype=torch.float32)
             # Keep the storage stable when the shapes repeat (CUDA-graph
             # re-plan): refill in place instead of rebinding new tensors.
-            batch_ids, pos, native_lse = self._batch_ids, self._pos, self._native_lse
+            # Last, after the allocation above: an eager re-plan with the
+            # same token count but another (batch, max_q) refills the
+            # previous plan's indices, which must not happen in a plan that
+            # then fails and leaves that previous plan published.
             if batch_ids is None or batch_ids.shape != new_batch_ids.shape:
                 batch_ids, pos = new_batch_ids, new_pos
             else:
                 batch_ids.copy_(new_batch_ids)
                 pos.copy_(new_pos)
-            lse_shape = (meta.batch_size, meta.max_q_len, meta.num_qo_heads)
-            if native_lse is None or tuple(native_lse.shape) != lse_shape:
-                native_lse = torch.empty(*lse_shape, device=dev, dtype=torch.float32)
         # publish only after every allocation above succeeded
         self._meta, self._derived = meta, derived
         self._block_tables = block_tables
         self._lse_path = path
         self._native_lse, self._batch_ids, self._pos = native_lse, batch_ids, pos
+        self._cudnn_plan = cudnn_plan
+        # native stats are natural-log: basee costs nothing, base2 one fold
+        # (none where cuDNN builds base-2 stats natively)
+        self._lse_base = "ln" if meta.lse_mode == "basee" else "log2"
 
     def run(
         self,
@@ -256,8 +358,6 @@ class _CudnnBackend:
         v_scale=None,
         sinks=None,
     ):
-        from ....cudnn import cudnn_batch_prefill_with_kv_cache
-
         meta, derived = self._meta, self._derived
         assert meta is not None and derived is not None
         assert self._block_tables is not None  # needs_dense contract
@@ -287,35 +387,86 @@ class _CudnnBackend:
             else:
                 lse_buf = lse_buf[:b].view(b, 1, meta.num_qo_heads)
         # K / V scales on the f16 / bf16 SDPA graph: the graph has no descale
-        # tensors (cudnn_batch_prefill_with_kv_cache binds k_scale / v_scale
-        # only into its fp8 graph; on the bf16 graph they are silently
-        # ignored -- measured on B200), so k_scale folds into attn_scale
-        # (which the library keys its graph cache on) and v_scale multiplies
-        # the output below, over the caller's whole buffer so a captured
-        # graph scales every row the capacity may hold.
+        # tensors, so k_scale folds into attn_scale -- a host float in the
+        # cuDNN graph key, hence part of a prepared graph's signature (one
+        # prepared graph per value; the staged plan carries no scale binding)
+        # -- and v_scale multiplies the output below, over the caller's whole
+        # buffer so a captured graph scales every row the capacity may hold.
         if k_scale is not None:
             sm_scale = sm_scale * k_scale
-        out_t, lse_t = cudnn_batch_prefill_with_kv_cache(
-            q,
-            k_cache,
-            v_cache,
-            sm_scale,
-            self._workspace,
-            max_token_per_sequence=meta.max_q_len,
-            max_sequence_kv=meta.max_kv_len,
-            actual_seq_lens_q=derived.require(FORM_Q_SEQ_LENS).view(b, 1, 1, 1),
-            actual_seq_lens_kv=meta.kv_seq_lens.view(b, 1, 1, 1),
-            block_tables=self._block_tables,  # width == ceil(max_kv / page)
-            causal=meta.causal,
-            return_lse=meta.need_lse,
-            # native stats are natural-log: basee costs nothing, base2 one fold
-            lse_base="ln" if meta.lse_mode == "basee" else "log2",
-            batch_offsets_q=meta.qo_indptr,
-            batch_offsets_stats=stats_offsets,
-            batch_offsets_units="tokens",
-            out=out,
-            lse=lse_buf,
-        )
+        plan = self._cudnn_plan
+        if plan is None:
+            # No staged plan (see _stage_cudnn_plan): the functional entry
+            # resolves its metadata, graph and bindings on every call.
+            from ....cudnn import cudnn_batch_prefill_with_kv_cache
+
+            out_t, lse_t = cudnn_batch_prefill_with_kv_cache(
+                q,
+                k_cache,
+                v_cache,
+                sm_scale,
+                self._workspace,
+                max_token_per_sequence=meta.max_q_len,
+                max_sequence_kv=meta.max_kv_len,
+                actual_seq_lens_q=derived.require(FORM_Q_SEQ_LENS).view(b, 1, 1, 1),
+                actual_seq_lens_kv=meta.kv_seq_lens.view(b, 1, 1, 1),
+                block_tables=self._block_tables,  # width == ceil(max_kv / page)
+                causal=meta.causal,
+                return_lse=meta.need_lse,
+                lse_base=self._lse_base,
+                batch_offsets_q=meta.qo_indptr,
+                batch_offsets_stats=stats_offsets,
+                batch_offsets_units="tokens",
+                out=out,
+                lse=lse_buf,
+            )
+        else:
+            # Hot path: compare this call's q / K / V layouts and scale float
+            # with the last prepared graph, then rebind Q, K, V, O and Stats
+            # next to the plan's static bindings and execute.  The functional
+            # entry instead re-resolves the metadata, computes the graph key
+            # twice and builds a new graph wrapper and binding dict on every
+            # call, for the same kernels.  A miss -- the first run of a
+            # signature, another scale or K/V stride layout, a re-plan with a
+            # new declaration -- goes through this instance's history and
+            # then the process-wide graph cache, which builds only a graph it
+            # has never seen (as the functional entry would).
+            if out is None:
+                out = torch.empty(
+                    q.shape[0],
+                    meta.num_qo_heads,
+                    meta.head_dim_vo,
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+            need_lse, lse_base = meta.need_lse, self._lse_base
+            prepared = self._prepared
+            if prepared is None or not prepared.matches_plan(
+                q, k_cache, v_cache, sm_scale, plan, need_lse, lse_base=lse_base
+            ):
+                from ....cudnn.prefill import _reuse_cudnn_prefill_preparation
+
+                prepared = self._prepared = _reuse_cudnn_prefill_preparation(
+                    self._prepared_history,
+                    q,
+                    k_cache,
+                    v_cache,
+                    sm_scale,
+                    self._workspace,
+                    plan=plan,
+                    return_lse=need_lse,
+                    lse_base=lse_base,
+                )
+            out_t, lse_t = prepared.run_planned(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                lse_buf,
+                self._workspace,
+                plan=plan,
+                lse_base=lse_base,
+            )
         if v_scale is not None and v_scale != 1.0:
             out_t.mul_(v_scale)
         if not meta.need_lse:
