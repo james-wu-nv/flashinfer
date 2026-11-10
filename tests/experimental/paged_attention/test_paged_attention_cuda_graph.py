@@ -1557,12 +1557,14 @@ def _cake_buffers(p):
 
 
 def test_cake_capture_requires_an_eager_run_on_the_captured_tensors():
-    """Cake under capture (ledger M18).  A run() on q/k/v never seen eagerly
-    raises inside the capture with the kernel's prewarm message and leaves
-    the instance, the stream and the device usable; after one eager run()
-    on those tensors the capture succeeds and replays correctly.  Two buffer
-    sets stand in for a benchmark's cold-L2 rotation: each needs its own
-    eager run before its capture."""
+    """Cake under capture (ledger M18).  A Cake program that is built on first
+    use refuses a run() on q/k/v never seen eagerly, inside the capture, with
+    the kernel's prewarm message, and leaves the instance, the stream and the
+    device usable; after one eager run() on those tensors the capture succeeds.
+    A program that ships prebuilt (the BF16 causal LSE form since the upstream
+    AOT context programs) captures directly.  Either way the replay is correct.
+    Two buffer sets stand in for a benchmark's cold-L2 rotation: each follows
+    the same rule."""
     p = make_problem(seed=41, **_SHAPE)
     _resolve_or_skip(p, "cake")
     dev = torch.device(p["device"])
@@ -1587,26 +1589,26 @@ def test_cake_capture_requires_an_eager_run_on_the_captured_tensors():
         torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
         torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
 
-    # never run eagerly: refused inside the capture, cleanly
-    with pytest.raises(RuntimeError, match="prewarm each Cake FMHA"):
-        capture(first)
-    assert not torch.cuda.is_current_stream_capturing()
-    torch.cuda.synchronize()
+    def capture_cold(bufs):
+        # never run eagerly: either the program is prebuilt and captures, or
+        # the capture is refused cleanly and one eager run() on the exact
+        # tensors is the prewarm
+        try:
+            return capture(bufs)
+        except RuntimeError as exc:
+            assert "prewarm each Cake FMHA" in str(exc)
+        assert not torch.cuda.is_current_stream_capturing()
+        torch.cuda.synchronize()
+        q, k, v, out, lse = bufs
+        attn.run(q, (k, v), out=out, lse=lse)
+        torch.cuda.synchronize()
+        return capture(bufs)
 
-    # one eager run() on the exact tensors is the prewarm
-    q, k, v, out, lse = first
-    attn.run(q, (k, v), out=out, lse=lse)
-    torch.cuda.synchronize()
-    g1 = capture(first)
+    g1 = capture_cold(first)
     check(first, g1)
 
     # the second buffer set is a new binding: same rule
-    with pytest.raises(RuntimeError, match="prewarm each Cake FMHA"):
-        capture(second)
-    q, k, v, out, lse = second
-    attn.run(q, (k, v), out=out, lse=lse)
-    torch.cuda.synchronize()
-    g2 = capture(second)
+    g2 = capture_cold(second)
     check(second, g2)
     check(first, g1)  # the first graph is unaffected
 
