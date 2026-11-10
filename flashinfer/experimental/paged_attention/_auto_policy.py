@@ -206,7 +206,8 @@ def _in_sm100_cudnn_region(facts: _PlanFacts) -> bool:
         return prefix
     q_lens, kv_lens = lengths
     # Maxima alone cannot distinguish full prefill from a mixed-prefix batch.
-    if full and not (
+    # (A graph bucket can satisfy both bound tests; the prefix one needs no proof.)
+    if not prefix and not (
         max(q_lens) >= 1024
         and all(q == kv and q > 0 for q, kv in zip(q_lens, kv_lens, strict=True))
     ):

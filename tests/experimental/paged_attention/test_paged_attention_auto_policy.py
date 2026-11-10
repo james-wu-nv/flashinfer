@@ -250,6 +250,15 @@ _SM100_TABLE = [
         dict(graph=True, max_kv_len=8192),
         "trtllm-gen",
     ),
+    # a prefix batch whose graph bounds also fit the widened full-prefill test
+    # (GB200 graph: B2 64/8 q1024 kv4096: cudnn 196, trtllm-gen 209)
+    (
+        "graph-prefix-inside-full-bounds [m]",
+        [1024] * 2,
+        [4096] * 2,
+        dict(hq=64, graph=True),
+        "cudnn",
+    ),
     ("eager-bounds-must-match", [4921], [4921], dict(max_kv_len=8192), "trtllm-gen"),
 ]
 
