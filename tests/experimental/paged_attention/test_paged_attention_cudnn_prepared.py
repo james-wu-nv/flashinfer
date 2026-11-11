@@ -112,12 +112,13 @@ def _problem(
     pool=None,
     dtype=torch.bfloat16,
     head_dim_qk=HEAD_DIM,
+    page=PAGE,
 ):
     """``build_problem`` at head dims (128, 128) / page 16 / bf16 unless
     overridden.  ``pool`` fixes the number of pages in the K/V pool, so
     batches with different lengths share the K/V shapes (part of the cuDNN
     graph signature, and the size of a capture's static K/V buffers)."""
-    pages = sum(-(-int(kv) // PAGE) for kv in kv_lens)
+    pages = sum(-(-int(kv) // page) for kv in kv_lens)
     return build_problem(
         q_lens,
         kv_lens,
@@ -125,7 +126,7 @@ def _problem(
         num_kv_heads=heads[1],
         head_dim_qk=head_dim_qk,
         head_dim_vo=HEAD_DIM,
-        page_size=PAGE,
+        page_size=page,
         dtype=dtype,
         seed=seed,
         kv_layout=kv_layout,
@@ -270,7 +271,7 @@ def _no_staged_plan(monkeypatch):
     monkeypatch.setattr(
         cudnn_backend._CudnnBackend,
         "_stage_cudnn_plan",
-        lambda self, meta, derived, block_tables, path: None,
+        lambda self, meta, derived, block_tables, path, declared: None,
     )
 
 
@@ -562,7 +563,7 @@ def test_both_paths_fetch_the_same_cudnn_graph(monkeypatch, variant, batch, lse_
         "stats_use_log2",
     ):
         assert getattr(functional, name) == getattr(prepared, name), name
-    assert prepared.override_cache is None  # the exact declaration, no class
+    assert prepared.override_cache is None  # the graph has the declared shape
 
 
 @pytest.mark.parametrize("lse_mode", ["none", "base2"])
@@ -692,11 +693,13 @@ def test_eager_replan_with_changed_lengths_and_page_ids(monkeypatch, input_form)
 
 def test_table_width_and_stride_transitions(monkeypatch):
     """One instance through the page-table layouts an engine hands over: an
-    exact-width table, a capacity-width one (the backend binds a narrow view
-    that keeps the wide row stride), the caller's own row-stride view, a
-    wider declaration, then the earlier layouts again.  The table's shape and
-    strides are part of the graph signature: every layout is correct, and on
-    the prepared path a layout seen before prepares nothing."""
+    exact-width table, a capacity-width one, the caller's own row-stride view
+    of it, a longer KV in the next class (through a table narrower than that
+    class), then the earlier layouts again.  The table's shape and strides
+    are part of the graph signature, and the table cuDNN binds is the
+    backend's own, in the layout of the KV class: every caller layout is
+    correct, the three of one class share one prepared graph, and on the
+    prepared path a class seen before prepares nothing."""
     capacity = 9
     wide = _problem([7, 16, 3], [64, 30, 90], seed=115, table_width=capacity, pool=30)
     width = -(-wide["max_kv_len"] // PAGE)
@@ -714,7 +717,7 @@ def test_table_width_and_stride_transitions(monkeypatch):
     preparations = _count_preparations(monkeypatch)
     if staged:
         _forbid_functional_entry(monkeypatch)
-    steps = ((exact, 1), (wide, 2), (view, 2), (longer, 3), (exact, 3), (view, 3))
+    steps = ((exact, 1), (wide, 1), (view, 1), (longer, 2), (exact, 2), (view, 2))
     for p, prepared_so_far in steps:
         _plan_cudnn(p, lse_mode="base2", attn=attn)
         out, lse = run(attn, p)
@@ -725,12 +728,11 @@ def test_table_width_and_stride_transitions(monkeypatch):
 
 def test_eager_replan_across_page_table_owners(monkeypatch):
     """One instance alternating between a dense table the controller derives
-    from flat page ids and caller-supplied tables: a wider one (a narrow view
-    with the wide row stride is bound) and one of the exact width.  Every
-    step changes the page ids and the per-request lengths, so a binding left
-    over from the previous owner's table would read the wrong pages.  The
-    derived table and the caller's exact-width one have one layout, hence one
-    prepared graph; the wide table's row stride is a second one."""
+    from flat page ids and caller-supplied tables: a wider one and one of the
+    exact width.  Every step changes the page ids and the per-request
+    lengths, so a binding left over from the previous plan's table would read
+    the wrong pages.  The backend binds a table of its own, built from each
+    of them in the one layout of the KV class, hence one prepared graph."""
     same = dict(pool=30)  # one batch size, max_q 16, max_kv 90: 6 table columns
     flat_a = _problem(
         [7, 16, 3], [64, 30, 90], seed=117, input_form="page_indices", **same
@@ -748,22 +750,13 @@ def test_eager_replan_across_page_table_owners(monkeypatch):
     preparations = _count_preparations(monkeypatch)
     if staged:
         _forbid_functional_entry(monkeypatch)
-    steps = (
-        (flat_a, 1),
-        (wide_b, 2),
-        (flat_c, 2),
-        (exact_d, 2),
-        (flat_a, 2),
-        (wide_b, 2),
-        (exact_d, 2),
-    )
-    for p, prepared_so_far in steps:
+    for p in (flat_a, wide_b, flat_c, exact_d, flat_a, wide_b, exact_d):
         _plan_cudnn(p, lse_mode="base2", attn=attn)
         for _ in range(2):
             out, lse = run(attn, p)
             assert_matches(out, lse, p, lse_mode="base2")
         if staged:
-            assert len(preparations) == prepared_so_far
+            assert len(preparations) == 1
 
 
 @pytest.mark.parametrize("first", [0, 2], ids=["from_none", "from_basee"])
@@ -1166,7 +1159,7 @@ def test_cuda_graph_staging_failure_keeps_the_captured_state(monkeypatch):
     kept_plan = backend._cudnn_plan
     batch_ids, pos = backend._batch_ids.clone(), backend._pos.clone()
 
-    def failing(meta, derived, block_tables, path):
+    def failing(meta, derived, block_tables, path, declared):
         raise RuntimeError("injected staging failure")
 
     with monkeypatch.context() as m:
