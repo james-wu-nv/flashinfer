@@ -96,8 +96,9 @@ def cudnn_qualified(monkeypatch):
 
 # (id, q_lens, kv_lens, facts overrides, first preference).  Heads are 32/8
 # unless overridden.  Shapes marked [m] are measured cases of the GB200 fit
-# (reports/prefill-auto-design-20261109, results/gb200-*-f2*); the others
-# step one unit across a threshold from one.
+# (reports/prefill-auto-design-20261109, results/gb200-*-f2* and, for the
+# short-KV rows, results/gb200-auto5-f4*); the others step one unit across a
+# threshold from one.
 _SM100_TABLE = [
     # ---- rows >= 64 at head_dim 128 (fill 1.0; KV outside the cuDNN region)
     ("rows64-graph [m]", [256], [131072], dict(graph=True), "trtllm-gen"),
@@ -143,6 +144,54 @@ _SM100_TABLE = [
     ("ragged-fill0.74", [128, 63], [1024, 1024], dict(hq=64), "fa2"),
     # decode / speculative lengths never fill a tile
     ("decode [m]", [2] * 256, [2048] * 256, dict(hq=64, graph=True), "fa2"),
+    # ---- eager, fewer than 1024 keys per query row: fa2 between 148 rows and
+    # rows * keys = 2^19 (results/gb200-auto5-f4*; graph mode has no such rule)
+    ("short-kv-rows256 [m]", [256] * 4, [256] * 4, {}, "fa2"),
+    (
+        "short-kv-rows256-graph [m]",
+        [256] * 4,
+        [256] * 4,
+        dict(graph=True),
+        "trtllm-gen",
+    ),
+    # the lengths decide, not a bound declared above them; the bound stands
+    # in only when the lengths are not on the host
+    ("short-kv-loose-bound", [128] * 8, [256] * 8, dict(max_kv_len=8192), "fa2"),
+    (
+        "short-kv-loose-bound-device-lengths",
+        [128] * 8,
+        [256] * 8,
+        dict(max_kv_len=8192, host=False),
+        "trtllm-gen",
+    ),
+    ("short-kv-device-lengths", [128] * 8, [256] * 8, dict(host=False), "fa2"),
+    ("short-kv-1023", [128] * 8, [1023] * 8, {}, "fa2"),
+    ("short-kv-1024", [128] * 8, [1024] * 8, {}, "trtllm-gen"),
+    # a sliding window bounds the keys of a row whatever the KV length
+    ("short-kv-window127 [m]", [128] * 8, [8192] * 8, dict(window_left=127), "fa2"),
+    (
+        "short-kv-window127-graph [m]",
+        [128] * 8,
+        [8192] * 8,
+        dict(window_left=127, graph=True),
+        "trtllm-gen",
+    ),
+    ("short-kv-window1022", [128] * 8, [8192] * 8, dict(window_left=1022), "fa2"),
+    # up to 148 rows fa2 splits the KV range and trtllm-gen keeps the batch
+    ("short-kv-rows148 [m]", [592], [8192], dict(window_left=127), "trtllm-gen"),
+    ("short-kv-rows149", [596], [8192], dict(window_left=127), "fa2"),
+    ("short-kv-rows160 [m]", [128] * 5, [8192] * 5, dict(window_left=127), "fa2"),
+    # rows * keys per row from 2^19 up
+    ("short-kv-work-2^19 [m]", [128] * 32, [512] * 32, {}, "trtllm-gen"),
+    (
+        "short-kv-work-below-2^19",
+        [128] * 32,
+        [8192] * 32,
+        dict(window_left=510),
+        "fa2",
+    ),
+    ("short-kv-rows1536-kv256 [m]", [128] * 48, [256] * 48, {}, "fa2"),
+    ("short-kv-rows2048-kv256 [m]", [256] * 32, [256] * 32, {}, "trtllm-gen"),
     # ---- cuDNN region, prefix: 64 <= max_q <= 1024, 2048 <= max_kv <= 32768
     ("prefix-q128-kv16384 [m]", [128], [16384], {}, "cudnn"),
     ("prefix-q64 [m]", [64], [16384], {}, "cudnn"),

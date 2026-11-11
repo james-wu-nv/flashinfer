@@ -251,6 +251,51 @@ _SM100_MIN_ROWS_SMALL_HEAD_DIM = 96
 # eager, its host cost on a multi-request batch is larger than that gain.
 _SM100_MIN_FILL_GRAPH = 0.375
 _SM100_MIN_FILL_EAGER = 0.75
+# Eager only, for a batch the test above gives to trtllm-gen: when a query row
+# attends few keys (kv_eff: the longest KV length of the batch, or
+# window_left + 1 if that is smaller) the kernels take tens of microseconds
+# and the launch decides.
+# Measured on GB200 with fa2 launched directly (2026-11-10, 431 eager cases),
+# trtllm-gen time / fa2 time by rows and kv_eff:
+#
+#   rows       kv_eff 128   256         512         1024
+#   128..148   0.65-0.75    0.64-0.74   0.61-0.75   0.64-0.80
+#   160..256   1.27-1.46    1.23-1.54   1.10-1.16   0.75-0.96
+#   512        1.12-1.27    1.01-1.31   0.80-1.09   0.61-0.84
+#   768        1.23         1.06-1.12   0.94-0.95
+#   1024       1.02-1.22    0.90-1.06   0.73-0.94   0.56-0.78
+#   1536       1.11         0.97-1.07   0.87-0.88
+#   2048                    0.81-0.87   0.73        0.54-0.67
+#
+# - Up to 148 rows fa2 takes 71-88 us against 38-63 us at 160-256 rows: its
+#   planner splits the KV range while the CTA grid fits the 148 SMs of a B200
+#   and pays a merge kernel that short KV does not earn back.  trtllm-gen
+#   keeps those batches.
+# - From 1024 keys per row, or rows * kv_eff of 2^19, trtllm-gen leads again.
+#   Between 2^18 and 2^19 the two are within about 10% either way; fa2 is the
+#   legacy wrapper's choice there and keeps the batch.
+# - In CUDA-graph mode a replay has no launch cost and trtllm-gen leads in all
+#   117 such cases (0.25-0.73), so the exception is eager only.
+_SM100_EAGER_SHORT_KV = 1024
+_SM100_EAGER_SHORT_KV_SPLIT_ROWS = 148
+_SM100_EAGER_SHORT_KV_MIN_WORK = 1 << 19
+
+
+def _attended_kv(facts: _PlanFacts) -> int:
+    """Most keys one query row of the batch attends (``kv_eff`` above).
+
+    The longest KV length of the batch, capped by the sliding window.  The
+    length comes from the host mirror when the batch has one: ``max_kv_len``
+    is a bound a caller may declare well above the lengths (a bucket, the
+    table's capacity), and it stands in only for device-only lengths.
+    """
+    longest = facts.max_kv_len
+    lengths = facts.host_lengths()
+    if lengths is not None:
+        longest = max(lengths[1])
+    if facts.window_left >= 0:
+        longest = min(longest, facts.window_left + 1)
+    return longest
 
 
 def ordered_sm100_backends(facts: _PlanFacts) -> Tuple[str, ...]:
@@ -261,7 +306,18 @@ def ordered_sm100_backends(facts: _PlanFacts) -> Tuple[str, ...]:
         _SM100_MIN_ROWS if facts.head_dim_qk >= 128 else _SM100_MIN_ROWS_SMALL_HEAD_DIM
     )
     min_fill = _SM100_MIN_FILL_GRAPH if facts.use_cuda_graph else _SM100_MIN_FILL_EAGER
-    if rows >= min_rows and rows / ntg >= min_fill:
+    trtllm_gen_first = rows >= min_rows and rows / ntg >= min_fill
+    if (
+        trtllm_gen_first
+        and not facts.use_cuda_graph
+        and rows > _SM100_EAGER_SHORT_KV_SPLIT_ROWS
+    ):
+        kv_eff = _attended_kv(facts)
+        trtllm_gen_first = (
+            kv_eff >= _SM100_EAGER_SHORT_KV
+            or rows * kv_eff >= _SM100_EAGER_SHORT_KV_MIN_WORK
+        )
+    if trtllm_gen_first:
         order = _prefer("trtllm-gen", "fa2")
     else:
         order = _prefer("fa2", "trtllm-gen")
