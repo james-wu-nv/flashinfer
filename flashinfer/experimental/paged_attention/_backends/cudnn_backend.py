@@ -20,12 +20,19 @@ resolves from the same arguments, so both reach the same cached cuDNN graph.
 That functional entry remains the fallback where no plan can be staged (a
 cuDNN / frontend without the direct token-offset path) and the packed-LSE
 probe.
+
+Declared shape: an eager plan declares a shape class rather than the batch's
+exact maxes, so the plans of a serving loop share one cuDNN graph
+(``_CudnnBackend._declared_bounds``), and binds a table of its own at the
+class width, each request's own pages, instead of the caller's
+(``_CudnnBackend._own_pages_table``).  CUDA-graph mode declares its capacity
+through the controller's reserved table.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -40,8 +47,13 @@ _PACKED_LSE_SUPPORTED: Dict[torch.device, bool] = {}
 # (graph.get_workspace_size()) and the number is not derivable from the
 # library.  Measured on cuDNN 9.25 / frontend 1.29 / B200 for prefill,
 # decode, ragged and (192, 128) shapes up to 8192 query tokens: 0 or 8960
-# bytes.  This allowance stands in for that measurement in the bound; it is
-# not a proof.
+# bytes.  On cuDNN 9.27 / frontend 1.32 the frontend's SM100 prefill engine
+# prefers a plan that takes more where the buffer has the room (2.4 to 16.9
+# MB measured up to batch 4, declared (512, 8192)); a buffer of this
+# allowance gets a plan within its size instead, which the graph preparation
+# selects under the buffer's limit (1408 to 3072 bytes for those shapes).
+# This allowance stands in for those measurements in the bound; it is not a
+# proof.
 _CUDNN_WORKSPACE_ALLOWANCE = 1 << 20
 
 
@@ -143,7 +155,10 @@ class _CudnnBackend:
         self._workspace = workspace.view(torch.int8)
         self._meta: Optional[PlanMetadata] = None
         self._derived: Optional[Derived] = None
-        self._block_tables: Optional[torch.Tensor] = None  # width-exact view
+        # the table cuDNN binds: ceil(declared KV bound / page_size) columns
+        self._block_tables: Optional[torch.Tensor] = None
+        # (max_q, max_kv) declared to cuDNN for the published plan
+        self._declared: Tuple[int, int] = (0, 0)
         # "direct": batch_offsets_stats; "view": max_q_len == 1, padded ==
         # packed; "gather": padded native stats + plan-time gather indices
         self._lse_path = "gather"
@@ -193,12 +208,119 @@ class _CudnnBackend:
         """True when cuDNN writes the packed LSE directly (no gather)."""
         return self._lse_path != "gather"
 
+    def _declared_bounds(self, meta: PlanMetadata) -> Tuple[int, int]:
+        """``(graph_q, graph_kv)``: the per-request bounds declared to cuDNN.
+
+        cuDNN finalizes one execution plan per declared shape (about 5 ms),
+        and in a serving loop the longest KV grows every step, so the batch's
+        exact maxes would declare a new shape on every step.  An eager plan
+        declares a shape class instead; the per-request lengths stay the
+        actual ones and mask the live tokens.
+
+        - KV: the next power of two, whatever the paging form and the width
+          of the caller's table: cuDNN binds a table of the class width that
+          this backend builds (``_own_pages_table``).
+        - Q, from 64 tokens up and with a GQA group that divides 128: 64
+          stays 64, anything longer rounds up to whole ``128 // group``-token
+          query tiles, at least 128 (whole powers of two would hide an
+          underfilled tile grid).  Below 64 the bound stays exact: the
+          ``max_q_len == 1`` LSE "view" layout and cuDNN's single-token
+          paths depend on the exact value.
+
+        These are the formulas of the legacy wrapper's auto path
+        (``_cudnn_paged_bounds`` in flashinfer/prefill.py), so in the region
+        that path admits (a longest query of 64 tokens or more, a GQA group
+        of 1 to 16) both declare the same shapes, except through a caller
+        table narrower than the KV class, where that path keeps both bounds
+        exact.  For a shorter query its formula would declare 64, where the
+        bound stays exact here.
+
+        CUDA-graph mode keeps the capacity's values: a captured graph serves
+        every later batch of its bucket and cannot follow one batch's class.
+        """
+        graph_q, graph_kv = meta.max_q_len, meta.max_kv_len
+        if self._rows is not None:
+            return graph_q, graph_kv
+        graph_kv = 1 << (graph_kv - 1).bit_length()
+        group, ungrouped = divmod(meta.num_qo_heads, meta.num_kv_heads)
+        if graph_q > 64 and not ungrouped and 128 % group == 0:
+            q_tile = 128 // group
+            graph_q = max(128, -(-graph_q // q_tile) * q_tile)
+        return graph_q, graph_kv
+
+    @staticmethod
+    def _own_pages_table(
+        meta: PlanMetadata, table: torch.Tensor, width: int
+    ) -> torch.Tensor:
+        """The table an eager plan binds: ``width`` columns per request, its
+        own pages followed by its last live page again.  A new contiguous
+        ``(batch, width)`` tensor built on the device from the plan's dense
+        ``table`` -- the caller's, or the one derived from flat page ids --
+        with no host sync (five small kernels).
+
+        cuDNN never sees ``table`` itself.  The KV class reaches past the
+        columns the caller's ``max_kv_len`` covers, which were never
+        initialised for this batch, and cuDNN does load pages through the
+        columns past a request's own: one of its backend engines fetches
+        whole 128-token KV tiles, so up to ``128 / page_size - 1`` columns
+        past a request's last page, and multiplies the masked (zero)
+        probabilities with what it fetched.  A page id outside the pool is
+        harmless there, but a pool page holding NaN / Inf reaches the output
+        as ``0 * NaN`` (measured with NaN-filled pages on cuDNN 9.25 and
+        9.27, SM100).  The request's own last page is one whose content the
+        in-page tail contract already requires to be finite;
+        ``_planning.derive`` clamps the table it derives from flat page ids
+        the same way.
+
+        Only each request's own pages are read from ``table``: the column
+        index is clamped to the request's last live page, which lies within
+        the ``ceil(max_kv_len / page_size)`` columns plan() requires of it.
+        ``table`` may therefore be narrower than the class, and what the
+        caller left past a request's pages is not copied.  That last page
+        comes from the device lengths, which nothing validates (the host
+        checks hold their CPU mirror to ``max_kv_len``), so it is also
+        capped at the last column of ``table``: a device length past its
+        mirror repeats that column, where an index past the table would be
+        a device-side assert that ends every later CUDA call of the process.
+
+        One layout for every source.  The table's shape and strides are part
+        of the cuDNN graph key (``_prefill_descriptor_key`` in
+        flashinfer/cudnn/prefill.py), so a view that kept the caller's row
+        stride would build one graph per caller table width; with this one a
+        caller table of any width or row stride and a table derived from
+        flat page ids reach one graph per (batch, class).
+
+        CUDA-graph mode binds the controller's reserved table under its
+        capacity bound instead (a capture keeps that pointer), so there the
+        caller's columns do reach cuDNN; and where the bound is not a whole
+        number of 128-token tiles the same engine also loads pool page 0 for
+        the rest of the last tile, whatever the table names.  A KV class is
+        whole tiles from 128 tokens up, and no such load was measured below.
+        """
+        # A request's last live page is the number of page ends below its
+        # length, counted over the columns both tables have: 0 for a kv_len 0
+        # row, which repeats its first column, and never past ``table``.
+        # (kv_len - 1) // page_size costs the same two kernels without the
+        # cap.
+        page = meta.page_size
+        ends = torch.arange(
+            page,
+            min(table.shape[1], width) * page,
+            page,
+            device=table.device,
+            dtype=meta.kv_seq_lens.dtype,
+        )
+        last = torch.bucketize(meta.kv_seq_lens, ends)
+        cols = torch.arange(width, device=table.device, dtype=torch.int64)
+        return torch.gather(table, 1, torch.minimum(cols, last.unsqueeze(1)))
+
     def _stage_cudnn_plan(
         self,
         meta: PlanMetadata,
         derived: Derived,
         block_tables: torch.Tensor,
         path: str,
+        declared: Tuple[int, int],
     ) -> Optional[Any]:
         """Plan-time half of the prepared path: the ``_CudnnPrefillPlan`` that
         run() executes through, or None where only the functional entry can
@@ -206,10 +328,11 @@ class _CudnnBackend:
 
         The metadata is the one ``cudnn_batch_prefill_with_kv_cache`` resolves
         per call from the arguments run() hands it on the fallback path (the
-        same maxes, the same length / offset / table tensors, a stats offset
-        only on the direct LSE path), so both compute the same graph
-        descriptor key and share one cached cuDNN graph.  Nothing is written
-        to the backend here; plan() publishes the result with the rest.
+        same ``declared`` bounds, the same length / offset / table tensors, a
+        stats offset only on the direct LSE path), so both compute the same
+        graph descriptor key and share one cached cuDNN graph.  Nothing is
+        written to the backend here; plan() publishes the result with the
+        rest.
         """
         from ....cudnn import prefill as cudnn_prefill
 
@@ -223,14 +346,13 @@ class _CudnnBackend:
             return None
         b = meta.batch_size
         metadata = cudnn_prefill._PrefillMetadata(
-            meta.max_q_len,
-            meta.max_kv_len,
+            *declared,
             meta.causal,
             meta.need_lse,
             o_data_type=meta.q_dtype,
             actual_seq_lens_q=derived.require(FORM_Q_SEQ_LENS).view(b, 1, 1, 1),
             actual_seq_lens_kv=meta.kv_seq_lens.view(b, 1, 1, 1),
-            block_tables=block_tables,  # width == ceil(max_kv / page)
+            block_tables=block_tables,  # width == ceil(graph_kv / page)
             batch_offsets_q=meta.qo_indptr,
             batch_offsets_o=meta.qo_indptr,
             batch_offsets_stats=meta.qo_indptr if path == "direct" else None,
@@ -258,14 +380,17 @@ class _CudnnBackend:
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
         # Page-table ABI: cuDNN requires the table's page dimension to equal
         # ceil(max_sequence_kv / page_size) exactly (CUDNN_STATUS_BAD_PARAM
-        # otherwise), while engines hand over capacity-width tables.  The
-        # graph is stride-driven, so a narrow VIEW keeping the caller's row
-        # stride is correct (sibling probe) — take it here, never copy.  In
-        # graph mode the view is of the reserved buffer, so its pointer is as
-        # stable as the buffer's.
+        # otherwise), while engines hand over capacity-width tables and the
+        # table derived from flat page ids has the batch's own width.
         bt = meta.block_tables
         assert bt is not None  # needs_dense contract
-        width = (meta.max_kv_len + meta.page_size - 1) // meta.page_size
+        # once per plan: the table width, the staged metadata, the fallback
+        # call's maxes and the padded stats buffer all follow this one pair
+        graph_q, graph_kv = self._declared_bounds(meta)
+        page = meta.page_size
+        width = (graph_kv + page - 1) // page
+        # what the batch's own pages take; the declared width in graph mode
+        own_width = (meta.max_kv_len + page - 1) // page
         if bt.shape[1] > 1 and bt.stride(1) != 1:
             raise ValueError(
                 "cudnn requires block_tables rows to be unit-stride along the page "
@@ -273,12 +398,25 @@ class _CudnnBackend:
                 f"{tuple(bt.shape)} — pass a row-major (batch, width) table (a "
                 "column slice [:, :w] of a wider row-major table is fine)"
             )
-        if bt.shape[1] < width:
+        # The controller rejects such a table before any backend sees it.
+        # Kept for the eager table, which would otherwise repeat the last
+        # column for the missing ones instead of failing.
+        if bt.shape[1] < own_width:
             raise ValueError(
                 f"block_tables has {bt.shape[1]} page columns but max_kv_len "
-                f"{meta.max_kv_len} at page_size {meta.page_size} needs {width}"
+                f"{meta.max_kv_len} at page_size {page} needs {own_width}"
             )
-        block_tables = bt[:, :width] if bt.shape[1] != width else bt
+        if self._rows is None:
+            # Eager: the class's columns, built from each request's own pages
+            # (see _own_pages_table).  A new tensor per plan, so a plan that
+            # fails later leaves the published one's table as it was.
+            block_tables = self._own_pages_table(meta, bt, width)
+        else:
+            # Graph mode: the reserved table itself, the caller's columns
+            # included.  The graph is stride-driven, so a narrow VIEW keeping
+            # the reserved row stride is correct (sibling probe) — take it,
+            # never copy: a capture keeps the buffer's pointer.
+            block_tables = bt[:, :width] if bt.shape[1] != width else bt
 
         native_lse = batch_ids = pos = None
         path = "gather"
@@ -302,7 +440,9 @@ class _CudnnBackend:
         # can raise, and those indices are backend-owned storage a captured
         # run keeps reading, outside the controller's rollback of the
         # reserved buffers.
-        cudnn_plan = self._stage_cudnn_plan(meta, derived, block_tables, path)
+        cudnn_plan = self._stage_cudnn_plan(
+            meta, derived, block_tables, path, (graph_q, graph_kv)
+        )
         if meta.need_lse and path == "gather":
             # Gather fallback: the LSE-gather indices and the native padded
             # stats buffer are static per plan (qo_indptr and batch size are
@@ -318,10 +458,11 @@ class _CudnnBackend:
                 max=meta.batch_size - 1
             )
             new_pos = (token - meta.qo_indptr.to(torch.int64)[new_batch_ids]).clamp_(
-                0, meta.max_q_len - 1
+                0, graph_q - 1
             )
             batch_ids, pos, native_lse = self._batch_ids, self._pos, self._native_lse
-            lse_shape = (meta.batch_size, meta.max_q_len, meta.num_qo_heads)
+            # padded to the declared bound: the shape cuDNN writes
+            lse_shape = (meta.batch_size, graph_q, meta.num_qo_heads)
             if native_lse is None or tuple(native_lse.shape) != lse_shape:
                 native_lse = torch.empty(*lse_shape, device=dev, dtype=torch.float32)
             # Keep the storage stable when the shapes repeat (CUDA-graph
@@ -338,6 +479,7 @@ class _CudnnBackend:
         # publish only after every allocation above succeeded
         self._meta, self._derived = meta, derived
         self._block_tables = block_tables
+        self._declared = (graph_q, graph_kv)
         self._lse_path = path
         self._native_lse, self._batch_ids, self._pos = native_lse, batch_ids, pos
         self._cudnn_plan = cudnn_plan
@@ -406,11 +548,11 @@ class _CudnnBackend:
                 v_cache,
                 sm_scale,
                 self._workspace,
-                max_token_per_sequence=meta.max_q_len,
-                max_sequence_kv=meta.max_kv_len,
+                max_token_per_sequence=self._declared[0],
+                max_sequence_kv=self._declared[1],
                 actual_seq_lens_q=derived.require(FORM_Q_SEQ_LENS).view(b, 1, 1, 1),
                 actual_seq_lens_kv=meta.kv_seq_lens.view(b, 1, 1, 1),
-                block_tables=self._block_tables,  # width == ceil(max_kv / page)
+                block_tables=self._block_tables,  # width == ceil(graph_kv / page)
                 causal=meta.causal,
                 return_lse=meta.need_lse,
                 lse_base=self._lse_base,
