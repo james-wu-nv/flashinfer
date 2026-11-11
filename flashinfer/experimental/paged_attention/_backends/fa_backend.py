@@ -8,6 +8,14 @@ blocking staging copy (ledger M6, the vLLM pin_host_range_buf lesson).  The
 generated FA wrapper holds its own plan state, so this backend keeps one
 wrapper instance as stable storage and re-plans it in place.
 
+Launch: plan() goes through the wrapper's plan(), run() does not go through
+its run().  That run() hands the module's ``paged_run`` a positional argument
+list which changes only with the plan, so plan() stages the list from the
+wrapper's state (``_stage_paged_run``) and run() fills the entries only a
+call knows and launches the module itself.  The wrapper's run() stays the
+path of every plan the staging does not model (the AttentionSink variant
+among them).
+
 Features: ``logits_soft_cap`` and ``custom_mask`` go to the wrapper's plan()
 (the kernel's own soft-cap variant; the mask in the legacy flattened
 per-request layout, ANDed here with the causal / sliding-window envelope
@@ -156,6 +164,21 @@ def _fa2_graph_tiles(
     return -(-total_rows * gqa // cta_tile_q) + batch_size - 1
 
 
+# ---------------------------------------------------------------------------
+# Positions, in the argument list _FaBackend._stage_paged_run stages, of the
+# entries only run() knows.  The list is positional because the module's
+# ``paged_run`` is (flashinfer/prefill.py, get_batch_prefill_module), and its
+# order is the legacy wrapper's, which upstream extends from time to time:
+# tests/experimental/paged_attention/test_paged_attention_fa_prepared.py runs
+# one planned wrapper through its own run() and through the staged list and
+# compares what reaches ``paged_run``, so a change there fails that test
+# instead of shifting an argument here.
+# ---------------------------------------------------------------------------
+_ARG_Q, _ARG_K_CACHE, _ARG_V_CACHE = 3, 4, 5
+_ARG_OUT, _ARG_LSE = 10, 11
+_ARG_SM_SCALE = 23
+
+
 class _FaBackend:
     # CSR page ids on device; the indptr / last-page lengths / KV lengths
     # travel as pinned host arrays (the wrapper uploads them itself)
@@ -174,6 +197,10 @@ class _FaBackend:
         self._smem_optin: Optional[int] = getattr(
             props, "shared_memory_per_block_optin", None
         )
+        from ....utils import device_support_pdl
+
+        # a fact of the device (the wrapper's run() looks it up on every call)
+        self._enable_pdl = device_support_pdl(workspace.device)
         # The default-variant wrapper is the stable storage for plain plans;
         # attention sinks need the AttentionSink JIT variant, whose module is
         # specialized per (dtypes, head dims, sliding window), so those
@@ -183,6 +210,9 @@ class _FaBackend:
         # per wrapper: the stream point after its last schedule upload (see plan)
         self._upload_events: Dict[int, torch.cuda.Event] = {}
         self._active = self._wrapper
+        # the active plan's direct launch (_stage_paged_run), None when run()
+        # must go through the wrapper's own run()
+        self._staged: Optional[Tuple[Any, list, torch.dtype]] = None
         self._lse_mode = "none"
         self._use_sinks = False
         self._total_q_tokens = 0
@@ -235,8 +265,9 @@ class _FaBackend:
             # afterwards accepts any total_num_rows <= that budget (its CPU
             # scheduler plans for the budget; the kernel reads the live row
             # count from the int workspace).  Seeding it with the capacity
-            # lets the first batch be smaller than the bucket; this poke goes
-            # away when the backend calls the FA module directly.
+            # lets the first batch be smaller than the bucket.  It is the
+            # wrapper's plan() that reads it, so this poke stays for as long
+            # as plans go through the wrapper (only run() bypasses it).
             wrapper._max_total_num_rows = self._graph_capacity.total_q_tokens
         return wrapper
 
@@ -432,6 +463,118 @@ class _FaBackend:
         if need > avail:
             raise ValueError(_workspace_too_small(self.name, need, avail))
 
+    # --------------------------- direct launch ---------------------------
+
+    def _stage_paged_run(
+        self, wrapper, meta: PlanMetadata, alibi_slopes: Optional[torch.Tensor]
+    ) -> Optional[Tuple[Any, list, torch.dtype]]:
+        """The launch ``wrapper.run()`` would make for the plan the wrapper now
+        holds, as ``(module, paged_run arguments, output dtype)`` with the
+        ``_ARG_*`` entries left for run(); None when that run() would not take
+        its plain path, and run() here then calls it.
+
+        The list is BatchPrefillWithPagedKVCacheWrapper.run() from
+        ``run_args = [`` to ``self._cached_module.paged_run(*run_args)``, the
+        branch without a custom JIT module, entry for entry and read from the
+        same attributes; that code is the same for fa2 and fa3 (the two differ
+        inside ``paged_run``).  Where the wrapper reads the call's tensors the
+        plan's value stands in, because the controller rejects a call that
+        differs from the plan before it reaches the backend: the page size
+        (``k_cache``'s shape) and the head count and device of ``q`` that key
+        the cached ALiBi slopes (``alibi_slopes``, which plan() looks up).
+
+        Attribute reads and one list, no device allocation: this runs after
+        the wrapper's plan has committed, where a failure would leave the
+        previous plan's list published next to the new plan's schedule.
+        """
+        from ....prefill import BatchPrefillWithPagedKVCacheWrapper
+        from ....utils import MaskMode, TensorLayout
+
+        w = wrapper
+        # Every way that run() leaves the plain path, one test each:
+        if (
+            # a subclass owns its run(): the AttentionSink variant folds the
+            # scales into its positional arguments before delegating
+            type(w) is not BatchPrefillWithPagedKVCacheWrapper
+            # the batch-invariant class takes the whole call
+            or w._batch_invariant is not None
+            # cute-dsl / cute-dsl-prims / cudnn / trtllm-gen launch elsewhere
+            or w._backend not in ("fa2", "fa3")
+            # a custom JIT module gets its tail from prepare_jit_additional_args
+            or w._jit_module is not None
+            # NVFP4 (uint8) and per-(token, head) scaled KV pass kv_cache_sf
+            or w._cached_kv_data_type == torch.uint8
+            or getattr(w, "_use_token_head_sf", False)
+            # the specialized SM90 fp8-KV verify kernel may take the call
+            or w._eagle_verify_fp8kv_sm90_state is not None
+            # multi-item scoring switches the mask mode
+            or w._prefix_len_ptr is not None
+            # an fp8 q reads its scale tensors from positional *args
+            or w._cached_q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
+            # nothing planned to launch (that run() asserts on both)
+            or w._plan_info is None
+            or w._cached_module is None
+        ):
+            return None
+        if w._custom_mask_buf is not None or w._variant_owns_mask:
+            mask_mode = MaskMode.CUSTOM.value
+        elif w._causal:
+            mask_mode = MaskMode.CAUSAL.value
+        else:
+            mask_mode = MaskMode.NON_CAUSAL.value
+        args = [
+            w._float_workspace_buffer,
+            w._int_workspace_buffer,
+            w._plan_info,
+            None,  # _ARG_Q
+            None,  # _ARG_K_CACHE
+            None,  # _ARG_V_CACHE
+            w._qo_indptr_buf,
+            w._paged_kv_indptr_buf,
+            w._paged_kv_indices_buf,
+            w._paged_kv_last_page_len_buf,
+            None,  # _ARG_OUT
+            None,  # _ARG_LSE
+            mask_mode,
+            TensorLayout[w._kv_layout].value,
+            w._window_left,
+            self._enable_pdl,
+            w._custom_mask_buf,
+            w._mask_indptr_buf,
+            alibi_slopes,
+            w._prefix_len_ptr,
+            w._token_pos_in_items_ptr,
+            w._max_item_len_ptr,
+            0.0 if w._logits_soft_cap is None else w._logits_soft_cap,
+            None,  # _ARG_SM_SCALE
+            None,  # fp8 q scale tensor (positional *args of an fp8 q)
+            None,  # fp8 k scale tensor
+            None,  # fp8 v scale tensor
+            1.0 if w._rope_scale is None else w._rope_scale,
+            1e4 if w._rope_theta is None else w._rope_theta,
+            w._token_pos_in_items_len,
+            w._workspace_size,
+            w._num_qo_heads,
+            w._num_kv_heads,
+            w._block_tables,
+            w._kv_lens_buffer,
+            meta.page_size,
+            w._max_q_len,
+            w._max_kv_len,
+            w._batch_size,
+            w._qo_indptr_buf,
+            w._paged_kv_indptr_buf,
+            None,  # sinks (the default wrapper forwards them on trtllm-gen only)
+            None,  # NVFP4 key block scales
+            None,  # NVFP4 value block scales
+            None,  # skip_softmax_threshold_scale_factor
+            True,  # uses_shared_paged_kv_idx
+            None,  # use_fp16_softmax
+            None,  # uses_spcompress
+            w._trtllm_gen_multi_ctas_kv_counter_buffer,
+        ]
+        return w._cached_module, args, w._cached_o_data_type
+
     def plan(self, meta: PlanMetadata, derived: Derived) -> None:
         # The kernel walks kv_page_indices as a raw int32 pointer bounded by
         # the page indptr; a strided view would be silently misread.  In graph
@@ -457,6 +600,20 @@ class _FaBackend:
                 self._sink_wrappers[key] = wrapper
         else:
             wrapper = self._wrapper
+        # The ALiBi slopes of the staged launch (one buffer per head count and
+        # device, cached for the process; the wrapper's run() looks it up on
+        # every call) are allocated on first use, so the lookup can fail.  It
+        # is made here, before the wrapper's plan moves any state: once that
+        # plan has returned, nothing that can fail may run before publication,
+        # or run() would launch the previous plan's staged list against the
+        # new plan's schedule.  A sink plan is not staged.
+        alibi_slopes = None
+        if not meta.use_sinks:
+            from ....utils import _get_cache_alibi_slopes_buf
+
+            alibi_slopes = _get_cache_alibi_slopes_buf(
+                meta.num_qo_heads, wrapper.device
+            )
         # The wrapper's C++ plan writes the kernel schedule into ONE pinned
         # host buffer of its own and uploads it with an asynchronous copy on
         # the current stream.  Rewriting that host buffer before the previous
@@ -499,8 +656,13 @@ class _FaBackend:
         if upload is None:
             upload = self._upload_events[id(wrapper)] = torch.cuda.Event()
         upload.record(torch.cuda.current_stream(self._device))
-        # publish only after the wrapper's plan returned
+        staged = self._stage_paged_run(wrapper, meta, alibi_slopes)
+        # publish only after the wrapper's plan returned -- the launch staged
+        # from it included, as one object: a failed re-plan leaves the
+        # previous plan's list (and the tensors it holds) in place, and no
+        # run() sees one plan's arguments next to another's
         self._active = wrapper
+        self._staged = staged
         self._lse_mode = meta.lse_mode
         self._total_q_tokens = meta.total_q_tokens
         self._head_dim_vo = meta.head_dim_vo
@@ -534,9 +696,10 @@ class _FaBackend:
         rows, n = q.shape[0], self._total_q_tokens
         if rows != n:
             # Graph mode: q/out/lse are the capacity-sized capture buffers, and
-            # the wrapper insists on q.shape[0] == qo_indptr[-1].  Hand it the
-            # batch's row prefix — the same storage, so a captured graph keeps
-            # reading the same pointers — and return the caller's buffers whole.
+            # the wrapper insists on q.shape[0] == qo_indptr[-1].  The launch
+            # gets the batch's row prefix on either path below — the same
+            # storage, so a captured graph keeps reading the same pointers —
+            # and the caller's buffers are returned whole.
             if out is None:
                 out = torch.empty(
                     rows, q.shape[1], self._head_dim_vo, dtype=q.dtype, device=q.device
@@ -558,7 +721,38 @@ class _FaBackend:
         # would give.  v_scale is applied below, over the caller's whole buffer.
         if k_scale is not None:
             sm_scale = sm_scale * k_scale
-        if self._use_sinks:
+        staged = self._staged
+        if staged is not None:
+            # Hot path, one call per attention layer: launch the planned
+            # module with the list plan() staged.  The wrapper's run() reaches
+            # the same paged_run with the same arguments, after a second
+            # API-decorator layer, a repeat of the checks the controller has
+            # made and a rebuild of this list from the wrapper's attributes:
+            # 7.7 of the 22.7 us one unified fa2 run() spent on the host
+            # (x86 host of a B200, batch 1, q 128 / kv 8192, 2026-11-10; the
+            # legacy wrapper's own run(): 16.8 us), 10-20% of a short kernel.
+            # A copy is filled, because the staged list would otherwise keep
+            # the caller's tensors alive between calls.  The alternative, and
+            # the path of every plan _stage_paged_run declines, is the
+            # wrapper's run() below.
+            module, args, o_dtype = staged
+            if out_v is None:
+                # zeros, in the plan's output dtype, as the wrapper allocates
+                out_v = torch.zeros(
+                    n, q.shape[1], self._head_dim_vo, dtype=o_dtype, device=q.device
+                )
+            if lse_v is None and need_lse:
+                lse_v = torch.empty(n, q.shape[1], dtype=torch.float32, device=q.device)
+            args = args.copy()
+            args[_ARG_Q] = q_v
+            args[_ARG_K_CACHE] = k_cache
+            args[_ARG_V_CACHE] = v_cache
+            args[_ARG_OUT] = out_v
+            args[_ARG_LSE] = lse_v
+            args[_ARG_SM_SCALE] = sm_scale
+            module.paged_run(*args)
+            r = (out_v, lse_v) if need_lse else out_v  # as the wrapper's run() returns
+        elif self._use_sinks:
             # AttentionSink variant: the sink tensor and sm_scale are the
             # module's additional run() arguments (positional, in that order);
             # sm_scale already carries k_scale (folded above), v_scale is
@@ -573,11 +767,12 @@ class _FaBackend:
                 return_lse=need_lse,
             )
         else:
-            # The generated-FA wrapper reads sm_scale from plan-time state and
-            # its run() has no override, while the kernel takes it as a launch
-            # arg.  Setting it here keeps sm_scale a per-run (per-layer)
-            # value; this poke goes away when the backend calls the FA module
-            # directly.
+            # A plain plan the staging declined.  The generated-FA wrapper
+            # reads sm_scale from plan-time state and its run() has no
+            # override, while the kernel takes it as a launch arg; setting it
+            # here keeps sm_scale a per-run (per-layer) value on this path as
+            # well.  The direct launch passes it as the argument it is and
+            # leaves the wrapper's attribute alone.
             self._active._sm_scale = sm_scale
             r = self._active.run(
                 q_v,
