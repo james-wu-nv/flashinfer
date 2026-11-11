@@ -45,7 +45,7 @@ are those of `flashinfer/_paged_attention.py` at the integration head.
 +    window_left=self.sliding_window_size if swa_layer_group else -1,
 +)
 +# workspace_buffer: hand it the workspace sglang already shares with its
-+# legacy wrappers (:438-444); omitted, instances share a 128 MiB per-device
++# legacy wrappers (:438-444); omitted, instances share a 512 MiB per-device
 +# library pool
 +self.prefill_attn = PagedAttention(self.device, workspace_buffer=self.workspace_buffer)
 ```

@@ -413,9 +413,10 @@ class _CudnnBackend:
             block_tables = self._own_pages_table(meta, bt, width)
         else:
             # Graph mode: the reserved table itself, the caller's columns
-            # included.  The graph is stride-driven, so a narrow VIEW keeping
-            # the reserved row stride is correct (sibling probe) — take it,
-            # never copy: a capture keeps the buffer's pointer.
+            # included.  The reserved table has the declared width
+            # (GraphCapacity pairs table_width with max_kv_len;
+            # reserve_dense_table uses the same width), so this takes the
+            # table itself; never copy: a capture keeps the buffer's pointer.
             block_tables = bt[:, :width] if bt.shape[1] != width else bt
 
         native_lse = batch_ids = pos = None

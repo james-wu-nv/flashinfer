@@ -42,8 +42,8 @@ below are those of `flashinfer/_paged_attention.py` at the integration head.
 +# Eager instance, constructed ONCE (per-build construction would redo backend
 +# setup every scheduler step).  Pass the workspace vLLM already shares with
 +# its legacy wrappers; without it every instance on the device shares one
-+# 128 MiB library pool, which the fa2 split-KV planner can overflow on a
-+# single long prefill (ledger M14).
++# 512 MiB library pool (PagedAttention.workspace_requirements() bounds the
++# need of a bucket; ledger M14).
 +self._prefill_attn = PagedAttention(
 +    self.device, workspace_buffer=self._get_workspace_buffer()
 +)
@@ -99,8 +99,9 @@ too, so it can only go with the decode follow-up.
 Notes that came out of the review and the library work:
 
 - **Block table width.** Pass the persistent capacity-width table with the
-  actual `max_seq_len`. cuDNN needs a table exactly
-  `ceil(max_kv_len / page_size)` wide and takes that view internally;
+  actual `max_seq_len`. An eager cuDNN plan binds a table of its own at
+  its shape-class width, built from each request's own pages; a CUDA-graph
+  plan binds the reserved table, which has the capacity's width;
   trtllm-gen and cake walk the table as a packed `(batch, width)` array and
   **decline a narrow view** (a `block_table_tensor[:, :w]` slice) at plan
   time, so never pre-trim the table for them.
@@ -114,14 +115,12 @@ Notes that came out of the review and the library work:
   row is a padding row whose page is never read and whose output row and LSE
   are unspecified (trtllm-gen leaves them unwritten; vLLM never reads padded
   rows). The padding rows' `q_len == 0`
-  (`query_start_loc.np[num_reqs + 1:].fill(...)`, `:2084`) is **not** yet
-  accepted (ledger M17), so the eager prefill path above is unaffected but a
-  captured decode-shaped bucket would have to give each padding row one query
-  token until M17 lands.
+  (`query_start_loc.np[num_reqs + 1:].fill(...)`, `:2084`) is legal input
+  as well (ledger M17): such a row owns no query token and no output row.
 - **Fused-QKV queries.** `q = qkv[:, :num_qo_heads]` is accepted without a
-  copy by fa2, fa3 and trtllm-gen (only `q.stride(-1) == 1` is required);
-  cuDNN and cake require packed storage and reject the slice, so `auto` on a
-  cuDNN-only configuration needs a packed copy.
+  copy by every backend. `run()` requires `q.stride(-1) == 1`, token-major
+  storage and 16-byte alignment (data pointer and both strides), which the
+  head slice of an aligned fused buffer meets for bf16 at head dim 128.
 
 ## 3. forward(): one run replaces the trtllm / FlashInfer fork
 
@@ -167,8 +166,7 @@ exactly; `total_q_tokens`, `max_q_len`, `max_kv_len` and the table width are
 bounds (`table_width` exact). Backends are planned with the capacity maxes
 (capacity substitution), so pass the step's actual maxes. `update()` rolls
 back on failure and raises during capture. `sm_scale` is a launch scalar
-baked into the captured graph. Until M17 lands, every padded row needs
-`q_len >= 1`.
+baked into the captured graph. Padded rows may have `q_len == 0`.
 
 ## What stays (v1 scoping, honest)
 
@@ -182,8 +180,7 @@ baked into the captured graph. Until M17 lands, every padded row needs
 - cascade (fa2 `MultiLevelCascadeAttentionWrapper` hardwired);
 - fp8-Q, nvfp4 and the shared `q_data_type` un-quantize mutation (fp8 e4m3
   KV with a bf16/fp16 q is inside the envelope on fa2 only);
-- spec-decode reorder policy;
-- graph-mode buckets whose padding rows have `q_len == 0` (M17).
+- spec-decode reorder policy.
 
 Models with `logits_soft_cap` or attention sinks are **in** scope now: both
 are plan-time axes, and a backend that cannot apply one is excluded at

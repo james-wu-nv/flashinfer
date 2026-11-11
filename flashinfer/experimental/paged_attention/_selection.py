@@ -125,12 +125,11 @@ def _bind_device(
 # ascending and the last one (``bound=None``) is the default, used with no hint
 # or a hint above every bound.  This is the order of ``Resolution.backends``
 # before any batch exists; plan() ranks the same set from the batch itself
-# (``_auto_policy.py``), so the hint no longer decides what a plan tries first.
+# (``_auto_policy.py``), so the hint does not decide what a plan tries first.
 # ``cake`` is in no bucket: it is not an auto candidate.
 #
 # sm_100 numbers (B200, bf16, GQA 32/8, head_dim 128, page 16, causal, dense
-# table, CUDA-graph ``run`` medians in µs; full sweep in
-# reports/unified-prefill-implementation-20260916/wp-k.md).  trtllm-gen and
+# table, CUDA-graph ``run`` medians in µs).  trtllm-gen and
 # cake run the paged CONTEXT kernel for every batch, whose per-request tile
 # is sized for prefill, so at decode / speculative query lengths it reads the
 # whole KV of a request for a handful of tokens and fa2's split-KV decode
@@ -146,7 +145,10 @@ def _bind_device(
 #   (B=8, kv=1024, q=16 tie) median 2.5-5.3 max 9.5; q=64 min 0.47 median
 #   1.31; q>=256 always < 1 (0.25-0.84).  The bound below is the largest
 #   q_len at which fa2 is at least as fast as trtllm-gen on every measured
-#   cell; sweep in wp-k-sweep.csv.
+#   cell.
+# These B200 numbers back the resolve-time order and
+# ``_auto_policy.ordered_sm10x_backends`` only; the SM100 plan-time rule is
+# fitted on GB200 (``_auto_policy.py``).
 HEURISTIC_ORDER: Dict[int, Tuple[Tuple[Optional[int], Tuple[str, ...]], ...]] = {
     10: (
         # decode / speculative: fa2 first, then the context kernels

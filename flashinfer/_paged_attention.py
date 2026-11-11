@@ -33,8 +33,8 @@ Design rules enforced (each traces to a documented failure mode):
 4.  Two-level selection.  ``resolve_paged_attention()`` is a static, tensor-free
     query usable at engine init (before pool allocation / graph capture);
     passing the returned ``Resolution`` to ``plan(backend=...)`` pins the
-    candidate set — plan() verifies the config matches and may only choose
-    within it.
+    candidate set — plan() verifies the config matches, ranks the set for the
+    batch and may only choose within it.
 5.  One output contract.  LSE base is declared at plan time (``lse_mode`` =
     ``"none"`` / ``"base2"`` / ``"basee"``, the Batch MLA vocabulary), shape
     ``(total_q_tokens, num_qo_heads)``, fp32 — backends deliver the declared
@@ -50,11 +50,15 @@ Prototype simplifications (documented, not hidden):
   table declares it (fa2).  The same two scales multiply a fp16/bf16 KV
   cache on every backend (folded into the softmax scale / the output).
   fp8 Q and nvfp4 are undeclared axes.
-- ``auto`` ranks the resolved candidates at every ``plan()`` from host
-  facts of the batch (``experimental/paged_attention/_auto_policy.py``: a
-  measured rule on sm_100, the previous static order elsewhere); cake is
-  never an auto candidate.  Autotune hook (§5.4) is not wired: ``auto``
-  never times anything.
+- ``auto`` ranks the resolved candidates in ``plan()`` from host facts of
+  the batch (``experimental/paged_attention/_auto_policy.py``): on every
+  eager plan, and in CUDA-graph mode on the capacity's bounds and the
+  planned batch's lengths until the first successful plan freezes the
+  backend.  Exact sm_100 has a rule fitted to GB200 measurements; the
+  other architectures have fixed orders, of which sm_90 (the legacy
+  wrapper's rule) and the other sm_10x parts put fa2 first for short
+  queries.  cake is never an auto candidate.  Autotune hook (§5.4) is not
+  wired: ``auto`` never times anything.
 - ``logits_soft_cap`` / ``custom_mask`` / ``use_sinks`` are explicit
   capability axes (fa2: all three; fa3: soft cap + sinks; trtllm-gen and
   cake: sinks; cuDNN: none) — a backend lacking a requested feature is excluded, never
@@ -185,10 +189,11 @@ def resolve_paged_attention(
 
     Callable at engine init, before the KV pool is allocated and before any
     CUDA graph is captured (vLLM decides its cudagraph mode and Q dtype at
-    that point).  Returns an ordered candidate set plus a reason for every
-    excluded backend; raises ``ValueError`` when nothing can run.  Pass the
-    result to :meth:`PagedAttention.plan` as ``backend=`` to pin the
-    candidate set.
+    that point).  Returns the candidate set plus a reason for every excluded
+    backend; raises ``ValueError`` when nothing can run.  Pass the result to
+    :meth:`PagedAttention.plan` as ``backend=`` to pin the candidate set.
+    The order of the set is the estimate available without a batch;
+    ``plan()`` ranks the set again for each batch.
 
     - ``device`` / ``cc_major``: the Resolution is pinned to ``device`` (its
       full compute capability and index; the default is the current CUDA
@@ -203,19 +208,25 @@ def resolve_paged_attention(
       plain decode, the draft length for speculative decode; leave ``None``
       for prefill or mixed batches).  It is a promise about the batches,
       not the thing that picks the backend: ``plan()`` ranks the candidates
-      from each batch's own shape (in CUDA-graph mode: the capacity, once),
-      so a hinted and an unhinted Resolution plan the same batch on the same
-      backend.  The hint only orders ``Resolution.backends`` / ``chosen`` /
-      ``explain()`` before a batch exists (a per-architecture table: on
-      sm_100 hints ``<= 16`` list fa2 first, where the paged context kernel
-      behind trtllm-gen is 1.0-9.5x slower on B200), and it never changes
-      the candidate set.  Nothing is timed.
+      from each batch's own shape (in CUDA-graph mode: the capacity's bounds
+      and the planned batch's lengths, until the first successful plan), so
+      a hinted and an unhinted Resolution plan the same batch on the same
+      backend.  The hint does two things.
+      ``plan()`` checks the promise: a batch — in CUDA-graph mode, a
+      capacity — with a larger ``max_q_len`` is rejected with a
+      ``ValueError``; hold one Resolution per query-length bucket, as
+      vLLM's decode / prefill split does.  And it orders
+      ``Resolution.backends`` / ``chosen`` / ``explain()`` before a batch
+      exists (a per-architecture table: on compute-capability major 10
+      hints ``<= 16`` list fa2 first, where the paged context kernel behind
+      trtllm-gen is 1.0-9.5x slower on B200).  It never changes the
+      candidate set.  Nothing is timed.
       The hint is pinned in the Resolution (``explain()`` shows it, and two
       Resolutions of one model configuration with different hints have
-      different ``config`` keys), and a ``plan()`` whose batch — in
-      CUDA-graph mode, whose capacity — has a larger ``max_q_len`` is
-      rejected with a ``ValueError``; hold one Resolution per query-length
-      bucket, as vLLM's decode / prefill split does.
+      different ``config`` keys).
+    - ``backend``: ``"auto"`` resolves the auto candidates (fa2, fa3,
+      trtllm-gen, cuDNN) that can run the configuration; a name resolves
+      that backend alone.  ``cake`` is never an auto candidate: name it.
     """
     from .experimental.paged_attention import resolve_paged_attention as _resolve
 
@@ -315,8 +326,12 @@ class PagedAttention:
           device shares one lazily allocated library-owned 512 MiB pool (the
           upper end of the engines' own defaults for these kernels), so
           holding one instance per graph bucket costs no workspace per
-          bucket.  ``plan()`` raises ``ValueError`` naming the required bytes
-          when a batch's planner allocation would not fit the buffer in use.
+          bucket.  A backend whose planner allocation for a batch would not
+          fit the buffer in use declines the batch in ``plan()``: ``"auto"``
+          moves on to a candidate that fits, and a named backend, or a
+          candidate set in which none fits, raises ``ValueError`` naming the
+          required bytes (``backend 'fa2' cannot plan this batch: needs N
+          bytes of scratch workspace ...``).
           Instances sharing a workspace must not run concurrently on
           different streams; pass a private buffer where that isolation is
           needed.
@@ -402,8 +417,11 @@ class PagedAttention:
         - **trtllm-gen / cake**: with an LSE output, softmax stats of
           ``8 * H * B * round_up(max_q_len, 256)`` bytes plus a 1 MiB guard;
           nothing otherwise.
-        - **cuDNN**: sizes its own graph workspace; measured 0-8960 bytes
-          across shapes, carried as a 1 MiB allowance (not derived).
+        - **cuDNN**: sizes its own graph workspace; carried as a 1 MiB
+          allowance (not derived).  Measured 0 or 8960 bytes on cuDNN 9.25 /
+          frontend 1.29; on cuDNN 9.27 / frontend 1.32 the SM100 prefill
+          engine takes 2.4 to 16.9 MB where the buffer has the room and a
+          plan within the buffer's size otherwise.
         - **fa3**: nothing from this buffer (its planner uses the wrapper's
           own int workspace).
 
@@ -464,7 +482,11 @@ class PagedAttention:
           CPU mirrors; construction validates once, so plan() is zero-sync and
           several plans over the same batch derive their metadata once.
         - ``num_qo_heads / num_kv_heads / head_dim_qk / head_dim_vo / q_dtype /
-          kv_dtype / kv_layout``: the static model configuration.
+          kv_dtype / kv_layout``: the static model configuration.  The head
+          counts and head dims must be positive Python ints, whatever
+          ``backend`` is (a ``bool`` or a numpy integer raises
+          ``ValueError``); so must the metadata's ``page_size``,
+          ``max_q_len`` and ``max_kv_len``.
         - ``causal``: also enforces ``q_len_i <= kv_len_i`` per request, except
           for padding rows (``kv_len_i == 0``, see
           :class:`PagedAttentionMetadata`): those are legal and read no KV
@@ -500,6 +522,16 @@ class PagedAttention:
           decided at engine init (plan() verifies the config, including the
           three feature flags, matches).  Backends that cannot apply a
           requested feature are excluded with a reason, never silently.
+          With ``"auto"`` or a Resolution of several candidates, plan() ranks
+          them for this batch from host facts (the rule is in
+          ``experimental/paged_attention/_auto_policy.py``) and takes the
+          first one that accepts the batch, so an eager instance may change
+          :attr:`backend` between plans.  In CUDA-graph mode the ranking
+          reads the capacity's bounds with this batch's per-request lengths,
+          and the first successful plan freezes the backend.  ``"auto"``
+          never ranks ``cake`` in: name it.  A backend name, or a Resolution
+          resolved with one, pins the backend; a batch it cannot plan raises
+          ``ValueError``.
 
         Publication is transactional: a failing ``plan()`` leaves the previous
         plan runnable (see ``experimental/paged_attention/_controller.py`` for
@@ -543,10 +575,10 @@ class PagedAttention:
 
         Raises ``RuntimeError`` when the instance is not in graph mode, when
         no ``plan()`` has succeeded yet, or when the current stream is
-        capturing.  It re-issues ``plan()`` with the frozen arguments and the
-        frozen backend name, so a ``plan()`` spelled that way is equivalent;
-        ``update()`` is the engine-facing spelling (sglang's
-        ``fast_prefill_plan`` role).
+        capturing.  It re-issues ``plan()`` with the frozen arguments and, as
+        ``backend=``, the plan's ``Resolution`` narrowed to the frozen
+        backend, so nothing is resolved or ranked per step; ``update()`` is
+        the engine-facing spelling (sglang's ``fast_prefill_plan`` role).
         """
         self._impl.update(metadata)
         return self
@@ -567,17 +599,35 @@ class PagedAttention:
         """Run the planned batch.
 
         - ``q``: ``(total_q_tokens, num_qo_heads, head_dim_qk)``, dtype as
-          planned, dense along ``head_dim`` (``q.stride(-1) == 1``).  fa2/fa3,
-          trtllm-gen and cake address any such view (e.g. the head slice
-          ``qkv[:, :num_qo_heads]`` of a fused QKV projection); cuDNN needs
-          packed storage and rejects other layouts.  Nothing is copied here.
+          planned, dense along ``head_dim`` (``q.stride(-1) == 1``), stored
+          token-major and 16-byte aligned: head stride ``>= head_dim_qk``,
+          token stride ``>= (num_qo_heads - 1) * head stride +
+          head_dim_qk``, both strides multiples of 16 bytes and the data
+          pointer on a 16-byte boundary.  Any other layout raises
+          ``ValueError`` for every backend (a permuted ``(H, T, D)``
+          buffer, an expanded dim, an unaligned slice; overlapping strides
+          are refused too, although fa2, cuDNN and trtllm-gen read them
+          correctly when measured; the alignment rule was measured for
+          bf16, head_dim 128 on SM100).  Every backend addresses any view
+          that meets the rule (e.g. the head slice
+          ``qkv[:, :num_qo_heads]`` of a fused QKV projection), so the
+          backend ``"auto"`` chose at ``plan()`` does not restrict the
+          layout of ``q``.  Nothing is copied here.  Each new stride layout
+          of ``q`` costs one cuDNN graph build inside ``run()``: warm up
+          with the layout that will be used.
           In CUDA-graph mode ``q`` is the capture buffer and may carry up to
           the capacity's rows; rows past the batch are not read, and the
           ``out`` / ``lse`` rows past it are unspecified (they may be written
           by whole-buffer post-processing).
         - ``kv_cache``: ``(k_cache, v_cache)`` pair, each paged in the planned
           layout — HND ``(pages, num_kv_heads, page_size, head_dim)`` or NHD
-          ``(pages, page_size, num_kv_heads, head_dim)``.
+          ``(pages, page_size, num_kv_heads, head_dim)``.  fa3, trtllm-gen
+          and cake read V with K's strides and raise ``ValueError`` for a
+          pair whose strides differ; fa2 and cuDNN take each pool's own
+          strides.  ``plan()`` does not see these tensors, so under
+          ``"auto"`` the requirement is that of the backend planned for the
+          batch and can change from batch to batch: give both pools one
+          layout, or pin a backend.
         - ``out``: optional preallocated output, contiguous
           ``(q.shape[0], num_qo_heads, head_dim_vo)``, dtype == q dtype.
         - ``lse``: optional preallocated LSE buffer, contiguous fp32
@@ -614,8 +664,8 @@ class PagedAttention:
         exports a flashinfer-bench definition whose identity is the plan's
         paging form, KV layout, causal / window / LSE settings and geometry,
         with the plan-owned metadata read from the last successful ``plan()``.
-        A plan that uses ``logits_soft_cap``, a custom mask or sinks refuses
-        to trace, because the definition does not encode those yet.
+        ``logits_soft_cap`` (an integer cap; a non-integer cap refuses to
+        trace), a custom mask and sinks are part of the identity as well.
         """
         return self._impl.run(
             q,
@@ -629,8 +679,13 @@ class PagedAttention:
         )
 
     def explain(self) -> str:
-        """Chosen backend, the plan-time trace (every candidate tried and why
-        it was accepted or declined) and the resolve-time exclusion reasons.
+        """Chosen backend, the candidates the last plan could choose from in
+        the order it walked them (the auto policy's order for that batch;
+        the frozen backend alone on a CUDA-graph re-plan, through ``plan()``
+        or ``update()``), the plan-time trace (every candidate tried and why
+        it was accepted or declined; on such a re-plan the frozen backend's
+        entry alone) and the resolve-time exclusion reasons, which on such
+        a re-plan include the candidates the freeze left out.
         Raises ``ValueError`` before the first successful ``plan()``."""
         return self._impl.explain()
 

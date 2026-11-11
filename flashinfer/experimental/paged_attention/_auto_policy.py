@@ -124,7 +124,7 @@ class _PlanFacts:
 
 
 def ordered_sm80_backends(facts: _PlanFacts) -> Tuple[str, ...]:
-    """Prefer FA2 on SM80, with cuDNN as fallback."""
+    """Prefer FA2 on SM8x, with cuDNN as fallback."""
     return _prefer("fa2", "cudnn")
 
 
@@ -140,7 +140,8 @@ def ordered_sm90_backends(facts: _PlanFacts) -> Tuple[str, ...]:
 
 
 def ordered_sm10x_backends(facts: _PlanFacts) -> Tuple[str, ...]:
-    """Blackwell parts other than SM100: the unmeasured B200 order.
+    """Blackwell parts other than SM100: the order measured on B200 (SM100),
+    not measured on these parts.
 
     The context kernel reads a request's whole KV for a handful of query
     tokens, so FA2's split-KV schedule leads at decode / speculative lengths
@@ -153,7 +154,7 @@ def ordered_sm10x_backends(facts: _PlanFacts) -> Tuple[str, ...]:
 
 
 def ordered_sm12x_backends(facts: _PlanFacts) -> Tuple[str, ...]:
-    """Prefer FA2 on SM120, with cuDNN as fallback."""
+    """Prefer FA2 on SM12x, with cuDNN as fallback."""
     return _prefer("fa2", "cudnn")
 
 
@@ -178,8 +179,8 @@ def _in_sm100_cudnn_region(facts: _PlanFacts) -> bool:
       admits and differ only by this widening.
     * ``qo_indptr`` / ``kv_seq_lens`` are the lengths of the batch being
       planned.  The exact work (``>= 8 Mi``) and the ``q_i == kv_i`` proof of
-      full prefill read those.  A graph-mode instance ranks once, on its
-      first plan, so they are the first batch's: two instances with one
+      full prefill read those.  A graph-mode instance ranks until a plan
+      succeeds, so they are the first planned batch's: two instances with one
       capacity can freeze different backends, and later batches are not
       checked against the region.
 
@@ -237,35 +238,53 @@ def _in_sm100_cudnn_region(facts: _PlanFacts) -> bool:
     return work >= 8 * 1024 * 1024
 
 
-# SM100 rule, fitted on GB200 (cuDNN 9.27, cudnn-frontend 1.32) over 594
-# cases (297 shapes, eager and CUDA graph): against the legacy wrapper's auto
-# the geomean speedup is 1.56x in graph mode (one case more than 5% slower,
-# worst 0.92) and 1.37x eager.
+# SM100 rule.  The thresholds are fitted on GB200 (cuDNN 9.27, cudnn-frontend
+# 1.32) and measured there against the legacy wrapper's auto over 862 cases
+# (431 shapes, eager and CUDA graph; 2026-11-10).  A case passes when no
+# paired measurement block is more than 1% slower than the legacy time and is
+# a regression when every block is more than 1% slower:
+#
+#   shapes           mode   geomean speedup  pass  inconclusive  regression
+#   219, main list   graph  1.67x             184            30           5
+#                    eager  1.49x             214             5           0
+#   431, all lists   graph  1.73x             383            41           7
+#                    eager  1.33x             418            12           1
+#
+# The graph regressions run the same backend under both APIs (at most 6.1%
+# and 2.2 us longer, speedup 0.942) and are an effect of the measurement: the
+# legacy wrapper compared with itself is flagged as often (about 3% of such
+# shapes per run), and over 24 processes per shape the unified time is 0.975
+# to 1.017 of the legacy time (mean 1.002).  The eager one takes 1.7% longer.  The
+# main list holds engine benchmark and CI configurations, the shapes the
+# legacy wrapper's cuDNN region was admitted on and length-regime probes; the
+# other 212 shapes are placed on the thresholds below, so the main list is
+# the representative one.
 #
 #   rows = num_qo_heads * total_q / 128              query rows, in 128-row tiles
 #   ntg  = batch * num_qo_heads * ceil(max_q / 128)  the context kernel's CTA grid
 #   fill = rows / ntg                                how full those tiles are
 #
-# run() medians in us; bf16, causal, page 16, GQA 32/8 unless noted:
+# run() medians in us of each backend named through this API, from that
+# measurement; bf16, causal, page 16, GQA 32/8 unless noted:
 #
 #   mode   shape                         rows  fill   fa2  trtllm-gen  cudnn  first
-#   graph  B1 q128  kv16384                32  1.00   146         225     99  cudnn (region)
-#   graph  B1 q1024 kv32768 8/1            64  1.00   465         403    187  cudnn (region)
-#   graph  B8 q48   kv2048                 96  0.375   88          61     76  trtllm-gen
-#   graph  B6 q128  kv2048  16/4           96  1.00    74          36     47  trtllm-gen
-#   graph  B1 q2048 kv2048  4/1            64  1.00    54          34     36  trtllm-gen
-#   graph  B8 q32   kv2048                 64  0.25    55          60     76  fa2
-#   graph  B16 q24  kv8192                 96  0.19   249         421    538  fa2
-#   graph  B4 q32   kv8192                 32  0.25    72         107    173  fa2
-#   graph  B2 q128  kv16384 d64            64  1.00   166         187      -  fa2
-#   graph  B3 q128  kv16384 d64            96  1.00   230         190      -  trtllm-gen
-#   eager  B8 q96   kv2048                192  0.75   151         103    153  trtllm-gen
-#   eager  B16 q64  kv2048                256  0.50   142         165    182  fa2
-#   eager  B16 q48  kv2048                192  0.375  144         163    185  fa2
+#   graph  B1 q128  kv16384                32  1.00   115         193     52  cudnn (region)
+#   graph  B1 q1024 kv32768 8/1            64  1.00   431         367    133  cudnn (region)
+#   graph  B8 q48   kv2048                 96  0.375   89          63     78  trtllm-gen
+#   graph  B6 q128  kv2048  16/4           96  1.00    73          36     46  trtllm-gen
+#   graph  B1 q2048 kv2048  4/1            64  1.00    53          33     35  trtllm-gen
+#   graph  B8 q32   kv2048                 64  0.25    56          61     77  fa2
+#   graph  B16 q24  kv8192                 96  0.19   242         432    526  fa2
+#   graph  B4 q32   kv8192                 32  0.25    72         112    174  fa2
+#   graph  B2 q128  kv16384 d64            64  1.00   166         181      -  fa2
+#   graph  B3 q128  kv16384 d64            96  1.00   229         189      -  trtllm-gen
+#   eager  B8 q96   kv2048                192  0.75   130         106    150  trtllm-gen
+#   eager  B16 q64  kv2048                256  0.50   132         165    185  fa2
+#   eager  B16 q48  kv2048                192  0.375  132         168    185  fa2
 #
-# (the two region rows are the eager measurements; graph mode agrees.)  The
-# thresholds are coarse crossovers, not exact optima: at rows 48 / fill 0.375
-# trtllm-gen already leads by a few microseconds in graph mode.
+# The thresholds are coarse crossovers, not exact optima: at rows 48 / fill
+# 0.375 (B4 q48) trtllm-gen already leads in graph mode, 35 against 51 us at
+# kv 2048 and 115 against 128 us at kv 8192.
 _SM100_MIN_ROWS = 64
 _SM100_MIN_ROWS_SMALL_HEAD_DIM = 96
 # Between fill 0.375 and 0.75 the context kernel is only a few percent ahead;
@@ -320,7 +339,18 @@ def _attended_kv(facts: _PlanFacts) -> int:
 
 
 def ordered_sm100_backends(facts: _PlanFacts) -> Tuple[str, ...]:
-    """Order every candidate for SM100 from the plan facts, without deciding support."""
+    """Order every candidate for SM100 from the plan facts, without deciding support.
+
+    1. cuDNN first inside ``_in_sm100_cudnn_region`` (the cuDNN version gate
+       is one of its conditions).
+    2. Otherwise trtllm-gen ahead of fa2 when ``rows`` reaches 64 (96 below
+       head dim 128) at a ``fill`` of 0.375 in CUDA-graph mode, 0.75 eager.
+       Eager and above 148 rows it also needs 1024 keys per query row
+       (``_attended_kv``) or ``rows * keys`` of 2^19.
+    3. Otherwise fa2 ahead of trtllm-gen.
+
+    fa3 and, outside its region, cuDNN follow as the last resorts.
+    """
     rows = facts.num_qo_heads * facts.total_q_tokens / 128
     ntg = facts.batch_size * facts.num_qo_heads * math.ceil(facts.max_q_len / 128)
     min_rows = (
@@ -354,8 +384,13 @@ def ordered_backends(
 ) -> Tuple[str, ...]:
     """Every auto candidate in preference order for one plan().
 
-    Only exact SM100 has a measured policy; the other architectures keep the
-    order they had before plan-time selection.
+    Only exact SM100 ``(10, 0)`` has a rule fitted to measurements
+    (``ordered_sm100_backends``).  The other architectures are dispatched by
+    compute-capability major to fixed orders: SM90 takes the legacy wrapper's
+    short-query rule, the other SM10x parts the resolve-time order
+    (``_selection.HEURISTIC_ORDER``) evaluated on the plan's ``max_q_len``
+    in place of the hint, SM8x and SM12x fa2 then cuDNN whatever the shape.
+    An unknown major gets the default order.
     """
     major, _minor = compute_capability
     if compute_capability == (10, 0):
@@ -378,8 +413,11 @@ def plan_order(
 ) -> Tuple[str, ...]:
     """``candidates`` (a Resolution's pinned set) in the policy's order.
 
-    The set is never changed: a member the policy does not rank (a caller's
-    own Resolution may carry one) keeps its place after the ranked ones.
+    The controller asks on every eager plan() and, in CUDA-graph mode, on
+    each plan() until one succeeds and freezes the backend; it does not ask
+    for a single candidate.  The set is never changed: a member the policy
+    does not rank (a caller's own Resolution may carry one, ``cake`` for
+    instance) keeps its place after the ranked ones.
     """
     order = ordered_backends(compute_capability, facts)
     return tuple(b for b in order if b in candidates) + tuple(

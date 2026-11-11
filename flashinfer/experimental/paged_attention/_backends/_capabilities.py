@@ -352,8 +352,9 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         supports_window_noncausal=False,
         # The launcher passes q's token and head strides; a fused-QKV head
         # slice, a padded head stride and a storage offset all match the
-        # oracle (native probe, B200).  Only the unit inner stride is a TMA
-        # requirement, and the controller enforces that for every backend.
+        # oracle (native probe, B200).  The TMA descriptor needs a unit
+        # inner stride, token-major storage and 16-byte alignment; the
+        # controller enforces the three for every backend (see run()).
         requires_contiguous_q=False,
         needs_dense=True,
         # sinks: native run-time argument of trtllm_batch_context_with_kv_cache

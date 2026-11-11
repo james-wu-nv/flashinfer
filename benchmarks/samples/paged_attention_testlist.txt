@@ -8,7 +8,7 @@
 #
 #   python3 flashinfer_benchmark.py --testlist samples/paged_attention_testlist.txt --output_path pa.csv
 
-## Decode: B=32, one query token per request (auto regret hot spot on SM100)
+## Decode: B=32, one query token per request
 --routine PagedAttention --backends fa2 cudnn trtllm-gen auto --batch_size 32 --s_qo 1 --s_kv 4096 --num_qo_heads 32 --num_kv_heads 8 --head_dim_qk 128 --head_dim_vo 128 --page_size 16 --causal --kv_layout HND --lse_mode none --refcheck --pa_legacy --num_iters 20 --dry_run_iters 3 --generate_repro_command --case_tag "decode-B32-q1-kv4096"
 
 ## Speculative / multi-token decode: B=8, 4 draft tokens, LSE requested

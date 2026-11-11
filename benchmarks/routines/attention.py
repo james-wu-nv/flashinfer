@@ -651,9 +651,9 @@ def parse_attention_args(line, parser):
         default=None,
         help=(
             "PagedAttention only: pass max_q_len=N to resolve_paged_attention() "
-            "(the shape hint that picks the candidate order of 'auto'; a batch "
-            "with a larger max query length is rejected by plan()). Default: "
-            "no hint."
+            "(a bound on the query tokens per request: plan() rejects a batch "
+            "with a larger max query length. It orders only the resolve-time "
+            "candidate list, not what 'auto' plans). Default: no hint."
         ),
     )
 

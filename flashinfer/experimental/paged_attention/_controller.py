@@ -456,7 +456,8 @@ class PagedAttentionController:
             )
         # Plan-time choice within the pinned set (level 2): walk the
         # candidates in the auto policy's order for this batch (eager: every
-        # plan; graph mode: the first plan, which freezes the backend).  The
+        # plan; graph mode: each plan until one succeeds and freezes the
+        # backend).  The
         # policy only ranks.  A candidate may decline THIS batch
         # from its cheap preflight() with the typed unsupported signal, in
         # which case the next member is tried; every other exception (invalid
@@ -984,7 +985,10 @@ class PagedAttentionController:
 
     @property
     def selection_trace(self) -> Tuple[Tuple[str, str, str], ...]:
-        """``(backend, phase, reason)`` for every candidate the last plan() tried."""
+        """``(backend, phase, reason)`` for every candidate the last successful
+        plan() tried, in the order tried.  On a CUDA-graph re-plan the
+        resolution is narrowed to the frozen backend before the walk, so the
+        trace holds that backend's entry alone."""
         return tuple(self._trace)
 
     @property

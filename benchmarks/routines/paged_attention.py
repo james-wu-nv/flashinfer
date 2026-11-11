@@ -52,11 +52,24 @@ shape the oracle cannot hold, and the rows then say so) — and every
 Rows for unsupported / erroring / incorrect candidates are KEPT with a
 ``status`` column (never dropped, never NaN-only) and ``refcheck_passed``
 (True / False, empty when no comparison happened).  ``static_backend`` is
-the facade's static choice (``resolve_paged_attention(...).chosen``);
-``resolved_backend`` is the backend the plan actually ran (``attn.backend``
-after ``plan()``), which differs when a candidate declined the batch at
-plan time and the walk moved on.  ``auto`` is the facade's static
-selection, not autotuning.
+the first candidate in resolve-time order
+(``resolve_paged_attention(...).chosen``); ``resolved_backend`` is the
+backend the plan ran (``attn.backend`` after ``plan()``).  Under ``auto``
+the two differ when the plan-time policy ranks another candidate first for
+the batch, or when a candidate declines the batch at plan time and the walk
+moves on.  ``auto`` is a fixed rule over host-side facts of the batch, not
+autotuning: with CUDA graphs on, the instance ranks once on the capacity
+inferred from the case and keeps that backend for the ``plan`` / ``run`` /
+``step`` rows; with ``--no_cuda_graph`` it ranks on every plan.  In the
+dense form the inferred capacity's KV bound is the table's full width, spare
+columns included, and that is the bound the SM100 cuDNN region tests under
+CUDA graphs.  The second instance behind the ``update`` rows ranks on its
+own explicit capacity (the table's full width as the KV bound).  In the
+dense form that is the capacity the first instance infers, so both run the
+same backend; with ``--kv_input_form csr`` the first instance keeps the
+case's ``max_kv_len``, so the second one's choice, which is not recorded,
+can differ from ``resolved_backend`` where a KV bound of the SM100 cuDNN
+region lies between the two.
 
 ``--pa_legacy`` adds ``api_variant=legacy`` rows: the SAME inputs through the
 legacy public API of the same kernel, with the same phases, so
@@ -72,7 +85,10 @@ legacy public API of the same kernel, with the same phases, so
   native API insists on a page table exactly ``ceil(max_kv_len / page_size)``
   columns wide, so the provider hands it the width-exact column view of the
   case's wider table (same row stride, same live page ids, the actual
-  ``max_kv_len``) — the same view the unified cuDNN backend takes.
+  ``max_kv_len``).  The unified cuDNN backend declares other bounds: its
+  capacity's in CUDA-graph mode (here the table's full width, spare columns
+  included, with its reserved table), a shape class (KV to the next power of
+  two) with a table of its own in an eager plan.
 - trtllm-gen: ``trtllm_batch_context_with_kv_cache`` (dense table only).
 
 Legacy rows keep each API's NATIVE LSE contract (fa/trtllm-gen: packed
@@ -135,10 +151,9 @@ LSE_TOL = dict(rtol=2e-2, atol=3e-2)
 TABLE_SLACK_COLUMNS = 3
 POOL_SLACK_PAGES = 8
 # One caller-owned scratch buffer handed to the facade AND to the legacy APIs,
-# sized like testBatchPrefillWithPagedKVCacheWrapper's. The facade's default
-# per-device pool is 128 MB, which fa2's split-KV planner overflows at
-# B=1 q=kv=2048 x 32 heads; passing the same larger buffer to both sides
-# keeps the comparison about the API path, not the pool size.
+# sized like testBatchPrefillWithPagedKVCacheWrapper's and like the facade's
+# default per-device pool (512 MiB). Passing one buffer to both sides keeps
+# the comparison about the API path, not the pool size.
 WORKSPACE_BYTES = 512 * 1024 * 1024
 
 
@@ -464,7 +479,7 @@ class _PhaseRows:
             self.rows.append(row)
 
     def set_static(self, static_backend):
-        """The static choice of ``resolve_paged_attention`` (before plan)."""
+        """The first candidate in resolve-time order (before plan)."""
         for row in self.rows:
             row["static_backend"] = static_backend
 
@@ -660,10 +675,10 @@ def _bench_unified(args, case, backend, ctx):
             reason = reason[len(prefix) : -1]
         phases.set_all(f"unsupported: {reason[:240]}")
         return phases, None
-    # The static choice is provisional: plan() walks the pinned candidates and
-    # a typed preflight decline (trtllm-gen on a narrow page-table view, cake
-    # on a batch with a padding row, ...) moves on to the next one, so the
-    # backend that ran is read from the instance after plan().
+    # The resolve-time choice is provisional: plan() ranks the pinned
+    # candidates for the batch and a typed preflight decline (trtllm-gen on a
+    # narrow page-table view, ...) moves on to the next one, so the backend
+    # that ran is read from the instance after plan().
     phases.set_static(resolution.chosen)
     phases.set_resolved(resolution.chosen)
     if args.verbose >= 1 and backend == "auto":
@@ -876,7 +891,8 @@ class _LegacyCudnnProvider:
         # (CUDNN_STATUS_BAD_PARAM); the case's table carries spare columns, so
         # the API sees the width-exact column VIEW of it: same storage, same
         # row stride, same live page ids, and the actual longest context as
-        # max_sequence_kv — exactly what the unified cuDNN backend passes.
+        # max_sequence_kv.  The unified backend declares its capacity (graph
+        # mode) or a shape class (eager) instead.
         width = (case["max_kv_len"] + case["page_size"] - 1) // case["page_size"]
         self.block_tables = case["block_tables"][:, :width]
         self.native_lse = (
@@ -1128,8 +1144,8 @@ def testPagedAttention(args):
         return res
     if getattr(args, "autotune", False):
         print(
-            "[ERROR] PagedAttention has no autotuner; 'auto' is a static "
-            "selection. Drop --autotune. Exiting."
+            "[ERROR] PagedAttention has no autotuner; 'auto' ranks its candidates "
+            "at plan() with a fixed rule. Drop --autotune. Exiting."
         )
         return res
     if args.enable_pdl:

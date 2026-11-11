@@ -641,7 +641,7 @@ def test_other_architectures_keep_their_order(
     cudnn_gate_forbidden, cc, q_lens, over, order
 ):
     """Only exact SM100 has the measured rule; the same facts that pick cuDNN
-    there leave every other architecture on its previous order, without
+    there leave every other architecture on its fixed order, without
     asking the cuDNN version gate."""
     facts = _facts(q_lens, [16384], **over)
     full = ordered_backends(cc, facts)
@@ -1375,7 +1375,7 @@ def test_a_narrowed_resolution_is_ranked_within_its_set(planners):
 )
 def test_non_sm100_keeps_its_order(monkeypatch, cc, q_lens, order):
     """The SM100 cuDNN-region batch on other architectures: the walk follows
-    their previous order to the last candidate."""
+    their fixed order to the last candidate."""
     planners = _cpu_planners(monkeypatch, cc)
     planners.decline(*order[:-1])
     attn = planners.controller()

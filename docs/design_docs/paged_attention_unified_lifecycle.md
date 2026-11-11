@@ -25,8 +25,9 @@ design separates four concerns:
   resolution promised (`Resolution`), validation, and the canonical-to-derived
   conversions.
 - The controller owns the plan/update/run lifecycle: level-1 pinning against a
-  `Resolution`, the level-2 candidate walk, capacity substitution, the
-  frozen contract of a captured graph, transactional staging and publication.
+  `Resolution`, the level-2 candidate walk in the auto policy's order,
+  capacity substitution, the frozen contract of a captured graph,
+  transactional staging and publication.
 - Each backend module owns one complete implementation behind three calls:
   `preflight(meta)`, `plan(meta, derived)` and `run(...)`.
 
@@ -34,14 +35,16 @@ The plan/run flow is:
 
 ```text
 flashinfer.prefill.resolve_paged_attention()        (engine init, tensor-free)
-  -> Resolution: ordered candidates + exclusion reasons, pinned to a device
+  -> Resolution: the candidate set + exclusion reasons, pinned to a device
 
 flashinfer.prefill.PagedAttention(device, graph_capacity=..., workspace_buffer=...)
   -> PagedAttentionMetadata.dense(...) / .csr(...)   (once per scheduler step)
   -> plan(metadata, **semantic kwargs, backend=Resolution | name | "auto")
        -> validate; pin against the Resolution or resolve now
        -> [graph mode] capacity preflight; substitute capacity maxes
-       -> for each pinned candidate: derive its declared forms, preflight()
+       -> rank the pinned candidates for this batch (_auto_policy.py;
+          graph mode: until the first successful plan, which freezes the backend)
+       -> for each candidate in that order: derive its declared forms, preflight()
        -> [graph mode] check the frozen contract; stage into reserved storage
        -> chosen backend.plan(meta, derived)
        -> publish
@@ -80,8 +83,9 @@ error or returns results matching the oracle.
 - Closed input set with loud errors. Combinations outside the contract raise
   `ValueError` with the fix in the message.
 - Two-level selection: a tensor-free `resolve_paged_attention()` at engine
-  init, then a plan-time walk within the pinned candidate set in which only a
-  typed unsupported signal from a candidate's `preflight()` moves on.
+  init fixes the candidate set; each `plan()` ranks that set from host facts
+  of the batch and walks it, and only a typed unsupported signal from a
+  candidate's `preflight()` moves on to the next candidate.
 - Capacity-based CUDA-graph lifecycle: construct with a `GraphCapacity`, let
   the first plan freeze the semantic contract, then `update()` per step.
 - Transactional publication: a failed plan leaves the previous plan runnable
@@ -128,14 +132,18 @@ resolve_paged_attention(
     causal=True, need_lse=False, window_left=-1,
     kv_input_form="block_tables",
     logits_soft_cap=None, custom_mask=False, sinks=False,
+    max_q_len=None,
     backend="auto",
 ) -> Resolution
 ```
 
-Tensor-free. Returns the ordered candidate set and a reason for every
-excluded backend; raises `ValueError` when nothing can run. The result is
-pinned to `device` (compute capability major, minor and device index) or, with
-only `cc_major`, to that major and no device (`_selection._bind_device`).
+Tensor-free. Returns the candidate set, in resolve-time order, and a reason
+for every excluded backend; raises `ValueError` when nothing can run. The
+result is pinned to `device` (compute capability major, minor and device
+index) or, with only `cc_major`, to that major and no device
+(`_selection._bind_device`). `max_q_len` is an optional shape hint, the
+largest number of query tokens per request the batches planned with this
+`Resolution` have; see "Level 1" under "Backend selection".
 
 ### `PagedAttentionMetadata`
 
@@ -173,10 +181,12 @@ PagedAttention(device=None, *, graph_capacity=None, use_cuda_graph=False,
 .explain() -> str
 .backend -> Optional[str]
 .device -> torch.device
+PagedAttention.workspace_requirements(capacity, *, device=None, ...) -> int
 ```
 
 `plan()` returns `self`. `run()` returns `(out, lse)` with `lse` `None` when
-`lse_mode="none"`.
+`lse_mode="none"`. `workspace_requirements()` is a static method; see
+"Workspace".
 
 ### `GraphCapacity`
 
@@ -187,8 +197,9 @@ GraphCapacity.from_metadata(metadata)
 ```
 
 The capture shapes of one CUDA-graph bucket. Validation in `__post_init__`
-(`_graph.py`): positive ints; `total_q_tokens >= batch_size`;
-`max_q_len <= total_q_tokens`; dense form requires `table_width` with
+(`_graph.py`): positive ints; `max_q_len <= total_q_tokens` (a bucket may
+hold fewer query tokens than requests, because `q_len == 0` rows are legal);
+dense form requires `table_width` with
 `table_width == ceil(max_kv_len / page_size)` and derives
 `flat_capacity = batch_size * table_width`; flat form requires
 `flat_capacity >= max(batch_size, ceil(max_kv_len / page_size))` and forbids
@@ -244,8 +255,10 @@ for step in scheduler:
     g.replay()
 ```
 
-`q_buf`, `out_buf` and `lse_buf` are sized to `cap.total_q_tokens` rows; rows
-past the batch are neither read nor written. The `Resolution` passed to
+`q_buf`, `out_buf` and `lse_buf` are sized to `cap.total_q_tokens` rows. Rows
+past the batch are not read; `out` and `lse` rows past it are unspecified and
+may be written by a backend's whole-buffer post-processing. The `Resolution`
+passed to
 `plan()` must have been resolved with `need_lse=True` when `lse_mode` is not
 `"none"`, because `need_lse` is part of the pinned config key.
 
@@ -265,7 +278,9 @@ package. It contains no backend logic.
   `logits_soft_cap`, the custom-mask contract, the causal envelope);
 - level-1 pinning against a `Resolution` (semantic key and device binding)
   or an inline resolve;
-- the level-2 candidate walk and the plan-time selection trace;
+- level 2: the host-only `_PlanFacts` of the batch, the call into
+  `_auto_policy.plan_order()`, the candidate walk in that order, and the
+  published selection order and trace;
 - graph mode: capacity preflight, capacity substitution, reserved-table
   reservation, the frozen contract, the staging transaction;
 - publication of the plan state, `update()`, `run()` validation and dispatch,
@@ -288,12 +303,15 @@ copies and the backend's plan).
 ### Selection and capabilities
 
 `_selection.py` owns `resolve_paged_attention()`, the environment probes and
-`HEURISTIC_ORDER`. `_backends/_capabilities.py` owns the declarative
-`PagedAttentionCapabilities` table, its pure `rejection_reason()` and the
-typed `_BackendPlanUnsupportedError`. The capability table only holds facts
-that drive selection; adapter details such as which derived forms a backend
-reads live on the backend class (`DERIVED_NEEDS`) and are exposed through
-`_backends.derived_needs(name)`.
+`HEURISTIC_ORDER`, the resolve-time order of the candidate set.
+`_auto_policy.py` owns the plan-time ranking of that set (`plan_order`, the
+per-architecture `ordered_*_backends` over `_PlanFacts`) and the list of auto
+candidates; it never decides support. `_backends/_capabilities.py` owns the
+declarative `PagedAttentionCapabilities` table, its pure
+`rejection_reason()` and the typed `_BackendPlanUnsupportedError`. The
+capability table only holds facts that drive selection; adapter details such
+as which derived forms a backend reads live on the backend class
+(`DERIVED_NEEDS`) and are exposed through `_backends.derived_needs(name)`.
 
 ### Backends
 
@@ -303,6 +321,36 @@ reads live on the backend class (`DERIVED_NEEDS`) and are exposed through
 and `cake`). Each owns its native dialect, its plan state, its LSE
 normalization and its ABI checks. Nothing outside a backend knows its
 dialect.
+
+How each backend launches:
+
+- fa2 / fa3 keep one `BatchPrefillWithPagedKVCacheWrapper` as stable storage
+  and plan it in place through its `plan()`. `plan()` then stages the
+  positional argument list of the kernel module's `paged_run` from the
+  wrapper's state (`_FaBackend._stage_paged_run`), and `run()` fills the six
+  entries only a call knows (`q`, the two caches, `out`, `lse`, the softmax
+  scale) and launches the module itself. The list changes only with the
+  plan, whereas the wrapper's `run()` rebuilds it from the wrapper's
+  attributes on every call, behind a second API-decorator layer and a repeat
+  of the checks `PagedAttention.run()` has made. The wrapper's `run()` stays
+  the path of a sink plan (the `AttentionSink` variant wrapper owns its
+  `run()`) and of every plan the staging declines because that `run()` would
+  leave its plain path: a batch-invariant wrapper, a custom JIT module, NVFP4
+  or per-(token, head) scaled KV, an fp8 `q`, multi-item scoring and the SM90
+  fp8-KV verify kernel.
+  `tests/experimental/paged_attention/test_paged_attention_fa_prepared.py`
+  runs one planned wrapper through its own `run()` and through the staged
+  list and compares what reaches `paged_run`, so an upstream change to that
+  positional list fails the test.
+- cuDNN stages a `_CudnnPrefillPlan` at `plan()`, and `run()` executes a
+  prepared cuDNN graph through it, rebinding only Q, K, V, O and the stats.
+  `cudnn_batch_prefill_with_kv_cache` remains the fallback where no plan can
+  be staged (a cuDNN / frontend below the direct token-offset path) and the
+  packed-LSE probe. What the plan declares to cuDNN and which page table it
+  binds differ between eager and CUDA-graph mode; see "Page-table ABI per
+  backend".
+- trtllm-gen / cake call `trtllm_batch_context_with_kv_cache` with the
+  canonical tensors and the cumulative KV lengths.
 
 ## Package structure
 
@@ -334,25 +382,41 @@ flashinfer/
 `plan()` runs these phases (`_controller.PagedAttentionController.plan`):
 
 1. Validate the metadata object and its device, normalize `head_dim_vo`,
-   `kv_dtype`, `logits_soft_cap`, check `kv_layout`, `window_left`,
-   `lse_mode`, the custom mask, and the causal envelope when `causal=True`.
+   `kv_dtype`, `logits_soft_cap`, check the head counts and head dims,
+   `kv_layout`, `window_left`, `lse_mode`, the custom mask, and the causal
+   envelope when `causal=True`. The head counts and the head dims get one
+   check each (`_expect_heads`: positive host ints, `num_qo_heads` divisible
+   by `num_kv_heads`; `_expect_head_dims`: positive host ints), shared with
+   `resolve_paged_attention()` and applied whatever the `backend` argument
+   is: the auto policy divides by the head counts, the backends size launch
+   grids from them and put the head dims into a JIT module name, and a
+   pinned `Resolution` is not re-resolved (its config key compares with
+   `==`, which a float or a numpy integer of the same value passes). A host
+   int is a Python `int`: a `bool`, a numpy integer and a float are
+   rejected with `ValueError`. The same holds for `page_size`, `max_q_len`
+   and `max_kv_len`, which are checked when the metadata is constructed.
 2. Pin: with a `Resolution`, compare the semantic part of the config key and
    the device binding; with a name or `"auto"`, resolve now on the instance's
    device.
-3. Walk the pinned candidates in order. For each: derive exactly the forms
+3. Rank the pinned candidates with the auto policy (a single candidate is not
+   ranked), then walk them in that order. For each: derive exactly the forms
    its `DERIVED_NEEDS` declares (cached on the metadata object), build a
    `PlanMetadata`, construct or reuse the backend object, and call
    `preflight(meta)`. A `_BackendPlanUnsupportedError` records the reason and
    moves on; any other exception propagates; an explicit backend name turns
-   the typed signal into a `ValueError`.
+   the typed signal into a plain `ValueError`.
 4. Call the chosen backend's `plan(meta, derived)`.
-5. Publish the backend, the metadata, the derived forms, the resolution and
-   the selection trace together.
+5. Publish the backend, the metadata, the derived forms, the resolution, the
+   walked order and the selection trace together.
 
 A failed re-plan leaves the previous plan runnable, with one caveat the
 controller documents: the generated-FA backend re-plans its legacy wrapper
 in place, so a failure inside that wrapper's plan can leave backend-internal
-state ahead of the published metadata.
+state ahead of the published metadata. The argument list of the backend's
+direct launch (see "Backends" under "Layering and ownership") is staged from
+the wrapper after its plan has returned and is published together with it,
+so `run()` never launches one plan's arguments against another plan's
+schedule.
 
 ### Graph mode: three stages
 
@@ -377,10 +441,12 @@ width stays usable.
 `GraphBuffers.preflight(metadata)` checks the batch against the capacity:
 exact for `batch_size`, `kv_input_form`, `page_size` and the dense table
 width; upper bounds for `total_q_tokens`, `max_q_len`, `max_kv_len` and the
-flat page-id length. Then the candidate walk runs, and the controller builds
-the frozen contract of the chosen plan: the backend name, whether a dense
-table is present, and every `PlanMetadata` field that is not a per-batch
-value (`_PER_BATCH_FIELDS` = `qo_indptr`, `kv_seq_lens`, `block_tables`,
+flat page-id length. Then the candidates are ranked, on the capacity's bounds
+and the first batch's host lengths (see "Level 2: the auto policy"), and
+walked, and the controller builds the frozen contract of the chosen plan:
+the backend name, whether a dense table is present, and every `PlanMetadata`
+field that is not a per-batch value
+(`_PER_BATCH_FIELDS` = `qo_indptr`, `kv_seq_lens`, `block_tables`,
 `custom_mask`, `qo_indptr_cpu`, `kv_seq_lens_cpu`, `batch_size`, `max_q_len`,
 `max_kv_len`). The set is computed from `dataclasses.fields(PlanMetadata)`,
 so a semantic keyword added later is frozen automatically. A later graph-mode
@@ -422,17 +488,22 @@ publication, so a failed first plan leaves neither a capacity nor a backend
 sized to it.
 
 **Stage 3, `update()`.** `update(metadata)` re-issues `plan()` with the
-keyword arguments the first graph-mode plan froze, including the chosen
-backend name as an explicit `backend=`, so it stages into the reserved
-storage, preflights against the capacity and rolls back on failure exactly as
-a re-plan does; there is no second staging path. It raises `RuntimeError`
-when the instance is not in graph mode, when no plan has succeeded yet, or
-when the current stream is capturing. `plan()` in graph mode is also rejected
-during capture. `update()` has no stream binding; call it on the stream the
-graph is replayed on.
+keyword arguments the first graph-mode plan froze and, as `backend=`, the
+plan's `Resolution` narrowed to the frozen backend, so it stages into the
+reserved storage, preflights against the capacity and rolls back on failure
+exactly as a re-plan does; there is no second staging path, and nothing is
+resolved or ranked per step. It raises `RuntimeError` when the instance is
+not in graph mode, when no plan has succeeded yet, or when the current
+stream is capturing. `plan()` is also rejected during capture. After the
+first graph-mode plan, `plan()` and `update()` must run on that plan's
+stream, the stream the graph is replayed on, so that the staging copies
+precede the replay; on another stream they raise `ValueError`.
 
 **Warm-up before capture.** Every backend needs one eager `run()` after the
 plan and before capture for its lazy work (module load, cuDNN graph build).
+The cuDNN graph is keyed on `q`'s strides, so each new stride layout of `q`
+costs one cuDNN graph build inside `run()`: warm up with the layout that
+will be used.
 Cake additionally binds `q`, `k_cache` and `v_cache` through TMA descriptors
 keyed by storage address, shape and strides, created eagerly and pinned when
 capture first replays them; a q/k/v binding that never ran eagerly is refused
@@ -447,11 +518,17 @@ capture succeeds.
 **`run()` under a captured graph.** `q`, `out` and `lse` are the capture
 buffers. The controller accepts `total_q_tokens <= q.shape[0] <=
 capacity.total_q_tokens` and checks `out` and `lse` against `q.shape[0]`
-rows. The FA backend hands its wrapper the batch's row prefix of the same
-storage (`q[:n]`, `out[:n]`, `lse[:n]`), because the legacy wrapper insists
-on `q.shape[0] == qo_indptr[-1]`; cuDNN and trtllm-gen read the row count
-from `qo_indptr`. `sm_scale`, `k_scale` and `v_scale` are launch scalars: a
-captured graph keeps the values it was captured with
+rows. The FA backend launches with the batch's row prefix of the same
+storage (`q[:n]`, `out[:n]`, `lse[:n]`), so a captured graph keeps reading
+the same pointers. The prefix goes to the launch on either path: the direct
+launch of the kernel module from the argument list staged at `plan()`, and
+the wrapper's `run()` (sink plans and plans the staging declines), which
+insists on `q.shape[0] == qo_indptr[-1]`. The backend's post-processing (the
+`v_scale` multiply, the LSE base fold) covers the caller's whole buffers,
+because a capture fixes the prefix at the first batch's row count. cuDNN and
+trtllm-gen read the row count from `qo_indptr`. `sm_scale`, `k_scale` and
+`v_scale` are launch scalars: a captured graph keeps the values it was
+captured with
 (`tests/experimental/paged_attention/test_paged_attention_coverage.py::test_tc02_graph_bakes_the_captured_sm_scale`).
 
 ## Backend selection
@@ -477,8 +554,8 @@ capability table (`rejection_reason`) and, if admitted, the environment probe
 
 The result is a frozen `Resolution(backends, excluded, kv_layout, config)`.
 `config` is `resolve_config_key(...)`: the semantic arguments including the
-three feature flags, and as its last element the device binding
-`(cc_major, cc_minor, device_index)`.
+three feature flags and the `max_q_len` hint, and as its last element the
+device binding `(cc_major, cc_minor, device_index)`.
 
 `HEURISTIC_ORDER` (`_selection.py`):
 
@@ -490,11 +567,11 @@ three feature flags, and as its last element the device binding
 | 12 | fa2, cudnn |
 
 This is only the order of `Resolution.backends` before a batch exists (what
-`chosen` and `Resolution.explain()` show). It fixes the candidate set;
-`plan()` ranks that set per batch (next section). The `max_q_len` hint picks
-the bucket here and stays a pinned promise — `plan()` rejects a batch, or a
-graph capacity, above it — but it no longer decides which backend a plan
-tries first.
+`chosen` and `Resolution.explain()` show). Resolution fixes the candidate
+set; `plan()` ranks that set per batch ("Level 2: the auto policy"). The
+`max_q_len` hint picks the bucket here and is a pinned promise — `plan()`
+rejects a batch, or a graph capacity, above it — but it does not decide
+which backend a plan tries first.
 
 ### Capability axes
 
@@ -509,11 +586,16 @@ is one the conformance matrix and fuzzer exercise on hardware.
 
 | backend | cc | head dims | page sizes | layouts | noncausal | window | window + noncausal | contiguous q | kv dtypes | dense table | soft cap | custom mask | sinks |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| fa2 | 8, 9, 10, 12 | 64, 128, 256, 512 | any | HND, NHD | yes | yes | yes | no | f16/bf16, fp8 e4m3 / e5m2 | no | yes | yes | yes |
-| fa3 | 9 | 64, 128, 256 | any | HND, NHD | yes | yes | yes | no | f16/bf16 | no | yes | no | yes |
-| cudnn | 8, 9, 10, 12 | 128, (192, 128) | any | HND, NHD | yes | no | n/a | yes | f16/bf16 | yes | no | no | no |
-| trtllm-gen | 10 | 128 | 16, 32, 64, 128, 256, 512, 1024 | HND, NHD | yes | yes | no | no | f16/bf16 | yes | no | no | yes |
+| fa2 | 8, 9, 10, 12 | 64, 128, 256, 512 | any | HND, NHD | yes | yes | no | no | f16/bf16, fp8 e4m3 / e5m2 | no | yes | yes | yes |
+| fa3 | 9 | 64, 128, 256 | any | HND, NHD | yes | yes | no | no | f16/bf16 | no | yes | no | yes |
+| cudnn | 8, 9, 10, 12 | 128, (192, 128) | any | HND, NHD | yes | no | n/a | no | f16/bf16 | yes | no | no | no |
+| trtllm-gen | 10 | 64, 128 | 16, 32, 64, 128, 256, 512, 1024 | HND, NHD | yes | yes | no | no | f16/bf16 | yes | no | no | yes |
 | cake | 10 | 128 | 16, 32, 64, 128, 256, 512, 1024 | HND, NHD | yes | yes | no | no | f16/bf16 | yes | no | no | yes |
+
+No backend declares `requires_contiguous_q`. `q` reaches the library only at
+`run()`, after `plan()` has ranked the candidates, so the ranking cannot
+route around a backend that needs a packed `q`: an auto candidate must
+declare `False`.
 
 `rejection_reason()` checks, in order: compute capability, q dtype, kv dtype,
 the q/kv pair (only an fp8 KV with an f16/bf16 q may differ), head dims, page
@@ -526,7 +608,10 @@ to derive its table from flat page ids below `MIN_DENSE_PAGE_SIZE`.
 `_auto_policy.py` orders the resolved candidates for one `plan()`. It only
 ranks: the capability table and probes own the set, and each backend's
 `preflight()` owns eligibility for the batch. A single candidate (an explicit
-backend name) is not ranked.
+backend name, or a `Resolution` with one member) is not ranked. `cake` is in
+no order, because it is not an auto candidate; a member of a caller's own
+`Resolution` that the policy does not rank keeps its place after the ranked
+ones (`plan_order`). Nothing is timed.
 
 What it reads (`_PlanFacts`, host values only, built by the controller):
 
@@ -534,84 +619,228 @@ What it reads (`_PlanFacts`, host values only, built by the controller):
 | --- | --- | --- |
 | `batch_size` | the batch | the batch (equal to the capacity's) |
 | `total_q_tokens`, `max_q_len`, `max_kv_len` | the metadata's values | the capacity's values |
-| per-request Q / KV lengths | the metadata's host mirrors | the first plan's host mirrors |
+| per-request Q / KV lengths | the metadata's host mirrors | the host mirrors of the batch being planned (a frozen instance does not rank) |
 | heads, head dims, page size, layout, dtypes, causal, window, soft cap, custom mask, sinks | `plan()` arguments | `plan()` arguments |
 
 The mirrors are read on every call and never fetched from the device; a
-device tensor in their place is treated as absent.
+device tensor in their place is treated as absent. A
+`PagedAttentionMetadata` always carries both mirrors.
 
-Dispatch is by exact compute capability. SM100 `(10, 0)` has the measured
-rule (GB200, cuDNN 9.27, cudnn-frontend 1.32, 594 cases; the table of
-measurements is next to the rule in the module):
+#### The SM100 rule
 
-1. cuDNN first inside the legacy wrapper's qualified cuDNN region (a copy of
-   `flashinfer.prefill._blackwell_paged_auto_cudnn` and the feature conditions
-   around its call: causal, no window, soft cap, custom mask or sinks; HND,
-   bf16, head dim 128, page 16, batch 1-4, 8-64 query heads; prefix
-   `64 <= max_q <= 1024`, `2048 <= max_kv <= 32768`, `max_kv >= 4 * max_q`, or
-   full prefill `1024 <= max_q == max_kv <= 8192` with every request's Q equal
-   to its KV; at least 8 Mi head x Q x KV work, exact when the lengths are on
-   the host).
-2. otherwise trtllm-gen first when `rows >= W` and `fill >= F`, with
-   `rows = num_qo_heads * total_q / 128`,
-   `ntg = batch * num_qo_heads * ceil(max_q / 128)` (the context kernel's CTA
-   grid), `fill = rows / ntg`; `W` is 64 at head dim >= 128 and 96 below; `F`
-   is 0.375 in graph mode and 0.75 eager.
-3. otherwise fa2 first.
+Only exact SM100, compute capability `(10, 0)`, has a measured rule. Below,
+`max_q` and `max_kv` are the `max_q_len` and `max_kv_len` facts: declared
+upper bounds, which a caller may set above the batch's longest lengths. The
+rule puts one backend first:
 
-The other candidates follow in a fixed order: the loser of 2 / 3 next, cuDNN
-last outside its region. Other architectures keep their previous order, with
-the batch's `max_q_len` in place of the hint: SM90 fa3, fa2, cudnn (fa2
-first at `max_q_len <= 64`, as the legacy wrapper does); other SM10x
-trtllm-gen, cudnn, fa2 (fa2 first at `max_q_len <= 16`); SM80 and SM120 fa2,
-cudnn.
+1. cuDNN, inside the legacy wrapper's qualified cuDNN region. The region
+   duplicates `flashinfer.prefill._blackwell_paged_auto_cudnn` and the
+   feature conditions around its call; on eager facts the two are equal
+   (`tests/experimental/paged_attention/test_paged_attention_auto_policy.py::test_sm100_cudnn_region_equals_the_legacy_predicate`).
+   All of the following hold:
+   - causal, with no sliding window, soft cap, custom mask or sinks;
+   - HND layout, bf16 `q` and KV, head dim 128, page size 16, batch 1 to 4,
+     8 to 64 query heads, GQA group 1, 2, 4, 8 or 16;
+   - the bounds are a prefix, `64 <= max_q <= 1024`,
+     `2048 <= max_kv <= 32768` and `max_kv >= 4 * max_q`, or a full prefill,
+     `1024 <= max_q == max_kv <= 8192`. Equal maxima do not show that a batch
+     is a full prefill, so the full-prefill case also needs, on the host
+     mirrors, every request's Q length nonzero and equal to its KV length
+     and a longest query of at least 1024 tokens. Facts without host lengths admit the
+     prefix case only;
+   - at least 8 Mi (2^23) of `num_qo_heads x Q x KV` work: from the bounds
+     (`total_q_tokens * max_kv`) and then exactly, as the sum of
+     `q_len * kv_len` over the requests on the host mirrors;
+   - `flashinfer.cudnn.prefill._cudnn_supports_paged_auto()` holds:
+     cudnn-frontend 1.32 or newer with the FROST runtime and the paged
+     packed-split selector, on cuDNN 9.27 or newer. With an older cuDNN the
+     region is empty and cuDNN stays last.
+
+   In CUDA-graph mode the bounds are the capacity's: the upper bounds of a
+   bucket, not one batch's maxima. An inferred capacity's KV bound is the
+   table's whole width in tokens, which exceeds a full-prefill length that
+   is not a multiple of the page size, so equal bounds cannot identify full
+   prefill there. The full-prefill bound test in CUDA-graph mode is
+   `1024 <= max_q <= max_kv <= 8192`, still with the per-request proof,
+   taken from the first plan's host lengths; a capacity that also meets the
+   prefix bounds needs no proof. This is the one place where the region
+   differs from the legacy predicate on equal arguments. It admits a
+   full-prefill batch planned under a KV bound wider than its query bound,
+   which the legacy wrapper admits when it derives its bounds from the
+   batch, as long as the capacity's KV bound is at most 8192. Under a wider
+   bound (a 4096-token full prefill in a table sized for a longer context)
+   the batch is outside the region.
+2. Otherwise trtllm-gen, when the query rows fill enough of the context
+   kernel's 128-row tiles: `rows >= W` and `rows / ntg >= F`, with
+   `rows = num_qo_heads * total_q_tokens / 128` and
+   `ntg = batch_size * num_qo_heads * ceil(max_q / 128)`, the context
+   kernel's CTA grid. `W` is 64 at head dim 128 and above and 96 below. `F`
+   is 0.375 in CUDA-graph mode and 0.75 eager: between the two the context
+   kernel is a few percent ahead, less than its host cost on an eager
+   multi-request batch.
+
+   Eager only, and only above 148 rows, trtllm-gen also needs
+   `kv_eff >= 1024` or `rows * kv_eff >= 2^19`. `kv_eff` is the most keys one
+   query row attends: the batch's longest KV length, capped at
+   `window_left + 1` under a sliding window. The length comes from the host
+   mirror; the declared `max_kv_len` may be a loose bound (a bucket, the
+   table's capacity) and stands in only when the facts carry no host
+   lengths. Where a row attends few keys the kernels take tens of
+   microseconds and the launch decides, so fa2, the legacy wrapper's choice
+   outside the cuDNN region, keeps the batch. Up to 148 rows trtllm-gen keeps
+   it: fa2's planner splits the KV range while its CTA grid fits the 148 SMs
+   of a B200 and pays a merge kernel that short KV does not earn back. A
+   graph replay has no launch cost, and trtllm-gen leads in every measured
+   short-KV case there, so CUDA-graph mode has no such exception.
+3. Otherwise fa2.
+
+The remaining candidates follow in a fixed order: the other one of
+trtllm-gen and fa2 next, and cuDNN last when the batch is outside its
+region. Inside the region the order is cuDNN, then the choice of rules 2 and
+3, then the other one.
+
+#### Other architectures
+
+The other orders are fixed per compute-capability major. SM90 and the other
+SM10x parts read `max_q_len` (the metadata's in eager mode, the capacity's
+in CUDA-graph mode); SM8x and SM12x read no shape fact:
+
+| architecture | order |
+| --- | --- |
+| SM90 | fa3, fa2, cudnn; fa2 first at `max_q_len <= 64`, the legacy wrapper's rule |
+| SM10x other than `(10, 0)` | trtllm-gen, cudnn, fa2; fa2 first at `max_q_len <= 16`, the `HEURISTIC_ORDER` buckets evaluated on the plan's `max_q_len` |
+| SM8x, SM12x | fa2, cudnn |
+
+#### Measurement basis
+
+The SM100 rule is fitted and checked on GB200 only (cudnn-frontend 1.32,
+cuDNN 9.27, 2026-11-10). The check compares unified `backend="auto"` with
+`BatchPrefillWithPagedKVCacheWrapper(backend="auto")` on identical inputs.
+The timed unit is one eager `run()`, or one replay of a graph that captured
+one `run()`; `plan()` is outside the timed region. Timing is in paired
+blocks. A shape passes when no block is more than 1% slower than the legacy
+time, is a confirmed regression when every block is, and is inconclusive
+otherwise.
+
+| shapes | mode | geomean speedup | pass | inconclusive | confirmed regression |
+| --- | --- | --- | --- | --- | --- |
+| main list, 219 | CUDA graph | 1.67x | 184 | 30 | 5 |
+| main list, 219 | eager | 1.49x | 214 | 5 | 0 |
+| all six lists, 431 | CUDA graph | 1.73x | 383 | 41 | 7 |
+| all six lists, 431 | eager | 1.33x | 418 | 12 | 1 |
+
+- The CUDA-graph regressions all run the same backend under both APIs, so
+  the order is not their cause; they take at most 6.1% longer (speedup
+  0.942) and at most 2.2 us longer, on the main list and over all lists.
+  They are an effect of the measurement, not of the API: with the legacy
+  wrapper in both measured slots (34 same-backend shapes, 24 independent
+  processes each) the second slot is between 0.967 and 1.025 of the first
+  per shape and about 3% of the shapes of a run are flagged the same way;
+  legacy against unified gives 0.975 to 1.017, mean 1.002, and 2%. The
+  eager regression is one head-dim-64 shape on which the rule picks
+  trtllm-gen, which takes 1.7% longer than the legacy wrapper's fa2.
+- Five of the six lists sit on the rule's thresholds on purpose (the
+  sliding-window, short-KV, row-bound, 128-to-160-row and threshold-fit
+  lists), so the main list is the representative one.
+- Fitted on GB200: the row and fill thresholds of rule 2 and the eager
+  short-KV exception. The tables are next to the constants in
+  `_auto_policy.py`.
+- Not refitted: the cuDNN region, which is the legacy wrapper's predicate.
+  Only its CUDA-graph bound test is this package's own.
+- Not measured through this API: the SM90, other SM10x, SM8x and SM12x
+  orders. CPU tests pin them; see "Known limitations".
+
+#### When a ranking applies
 
 Eager instances rank on every `plan()`, so the backend can change between
-batches. A graph-mode instance ranks once: the first successful plan freezes
-its backend, and later plans and `update()` keep it. To pin a backend, pass
-its name (`backend="fa2"`), or a `Resolution` resolved with that name.
+batches. A graph-mode instance ranks on the capacity's bounds and the
+planned batch's host lengths until a plan succeeds: the first successful
+plan freezes its backend, and later plans and `update()` keep it without
+consulting the policy.
+
+The row and fill rule reads only the capacity. The cuDNN region also reads
+the first plan's per-request lengths (the exact work and the Q == KV proof),
+so two instances with one capacity can freeze different backends. A capacity
+of one request with 128 query tokens over 16384 keys (32 query and 8 KV
+heads) freezes cuDNN when the first batch fills it and fa2 when the first
+batch is a 4-token warm-up over 64 keys. Plan the first batch with
+representative lengths, or pin the backend: pass its name (`backend="fa2"`),
+or a `Resolution` resolved with that name.
+
+The policy ranks from `plan()` facts and cannot see what arrives at `run()`.
+The `run()` tensor requirements are those of the backend planned for the
+batch (see "`run()` tensors"), so under eager `auto` they can change from
+batch to batch. fa3, trtllm-gen and cake read the V cache with the K cache's
+strides and reject a `(k_cache, v_cache)` pair whose strides differ; fa2 and
+cuDNN walk each pool by its own strides. Two separately allocated contiguous
+pools of one shape have equal strides and pass. An engine whose pools differ
+in strides (for example V as a view of a wider buffer next to a packed K)
+gets that `ValueError` for the batches `auto` plans on trtllm-gen (SM10x) or
+fa3 (SM90) and not for the others: give both pools one layout, or pin a
+backend. The layout of `q` is not such a requirement: the controller checks
+one rule for every backend (unit inner stride, token-major storage, 16-byte
+alignment; see "`run()` tensors"), and every backend takes any view that
+meets it.
 
 ### Level 2: the candidate walk
 
-In `plan()`, the controller walks the candidates in the policy's order. A candidate
-may decline the specific batch from `preflight(meta)` with
-`_BackendPlanUnsupportedError` (a `RuntimeError` subclass defined in
-`_capabilities.py`, the twin of the MLA package's private type). Preflight is
-allocation-free and runs before any live-state write, so declining is free of
-side effects. The walk finishes before any reserved buffer is written in
-graph mode. Every other exception propagates unchanged; `run()` never falls
-back. With an explicit backend name the typed signal becomes a `ValueError`
-`"backend 'x' cannot plan this batch: ..."`. If every candidate declines, the
-controller raises `ValueError` `"no pinned candidate can plan this batch"`
-listing each reason.
+In `plan()`, the controller walks the candidates in the policy's order. A
+candidate may decline the specific batch from `preflight(meta)` with
+`_BackendPlanUnsupportedError`, a private `ValueError` subclass defined in
+`_capabilities.py`. The MLA package's private type of the same name has the
+same base class; there the typed error itself reaches the caller, here the
+controller converts it (below). Preflight is allocation-free and runs before
+any live-state write, so declining is free of side effects. The walk
+finishes before any reserved buffer is written in graph mode. The
+controller's handler names the typed class, so every other exception
+propagates unchanged, a plain `ValueError` for invalid input included;
+`run()` never falls back. With an explicit backend name the typed signal
+becomes a plain `ValueError` `"backend 'x' cannot plan this batch: ..."`. If
+every candidate declines, the controller raises `ValueError`
+`"no pinned candidate can plan this batch"` listing each reason.
 
 Current preflight rules:
 
 - `fa2`/`fa3` (`_FaBackend.preflight`): `fa3` requires SM90a and CUDA >= 12.3
-  on the instance's device; with `use_sinks=True`, a soft cap (the
-  AttentionSink variant has no soft-cap hook) and a custom mask are declined
-  as unverified (an fp8 KV cache with sinks is verified — ledger M22 — with
-  `k_scale` folded into the launch scale and `v_scale` applied to the whole
-  output buffer). A custom mask in graph mode raises
-  `ValueError` (not the typed signal, since no other backend takes custom
-  masks): the wrapper's packed-mask storage is not part of the capacity yet.
+  on the instance's device; `fa2` declines a batch whose split-KV planner
+  allocation does not fit the scratch workspace (see "Workspace"); with
+  `use_sinks=True`, a soft cap (the AttentionSink variant has no soft-cap
+  hook) and a custom mask are declined as unverified (an fp8 KV cache with
+  sinks is verified — ledger M22 — with `k_scale` folded into the launch
+  scale and `v_scale` applied to the whole output buffer). A custom mask in
+  graph mode raises `ValueError` (not the typed signal, since no other
+  backend takes custom masks): the wrapper's packed-mask storage is not part
+  of the capacity yet.
 - `cudnn` (`_CudnnBackend.preflight`): the cudnn-frontend package must be
   importable.
 - `trtllm-gen`/`cake` (`_TrtllmGenBackend.preflight`): the page size must be
   one the paged context kernel ships for; non-causal with a sliding window has
   no kernel; a non-contiguous dense block table is declined (see the input
-  contract).
+  contract); an LSE plan whose softmax-stats scratch does not fit the
+  workspace is declined (see "Workspace"); `cake` declines a batch with a
+  `kv_len == 0` request (ledger M19).
 
 ### `explain()`
 
 `PagedAttention.explain()` raises `ValueError` before the first successful
-plan. Afterwards it prints the chosen backend, the order the policy gave the
-candidates for that plan, the plan-time trace (one line per candidate tried:
-`name [preflight]: accepted` or the decline reason) and the
+plan. Afterwards it prints the chosen backend, the candidates that plan could
+choose from in the order it walked them, the plan-time trace (one line per
+candidate tried: `name [preflight]: accepted` or the decline reason) and the
 `Resolution.explain()` text (the device the resolution answers for, the
-candidates in resolve-time order, and each exclusion reason). The trace and
-the order are also available as `PagedAttentionController.selection_trace`
-and `.selection_order`.
+candidates in resolve-time order, and each exclusion reason). The trace and the order are also available as
+`PagedAttentionController.selection_trace` and `.selection_order`.
+
+The walked order is the auto policy's order for an eager plan and for a
+graph-mode plan made before a backend is frozen. Once a graph-mode backend
+is frozen nothing is ranked and the order is the frozen backend alone, on a
+re-plan through `plan()` and through `update()`. Either way the controller
+narrows the `Resolution` to the frozen backend before the walk
+(`_narrowed_to`), so the trace holds only that backend's entry, no other
+member is constructed or asked, and the `Resolution.explain()` text lists
+the other members among its exclusions ("not the backend the first
+graph-mode plan froze"). A re-plan with a `Resolution` that does not contain
+the frozen backend raises `ValueError`. The order the freezing plan ranked
+is not kept.
 
 ## Planning contract
 
@@ -624,7 +853,7 @@ and `.selection_order`.
 | backend | `DERIVED_NEEDS` | native dialect |
 | --- | --- | --- |
 | fa2 / fa3 | `kv_page_indices`, `host_arrays` | CSR page ids on device; `qo_indptr`, page indptr, last-page lengths and KV lengths as pinned host arrays for the wrapper's CPU split-KV scheduler |
-| cudnn | `q_seq_lens`, `block_tables` | token-unit `batch_offsets_q`, `actual_seq_lens_{q,kv}` as `(b, 1, 1, 1)`, a width-exact dense table |
+| cudnn | `q_seq_lens`, `block_tables` | token-unit `batch_offsets_q`, `actual_seq_lens_{q,kv}` as `(b, 1, 1, 1)`, a dense table of exactly the declared width (eager: built by the backend from the plan's table; graph mode: the reserved one, which has the capacity's width) |
 | trtllm-gen / cake | `cum_kv_seq_lens`, `block_tables` | the canonical form natively plus cumulative KV lengths |
 
 `Derived.require(name)` raises at the use site if a backend reads a form it
@@ -656,17 +885,22 @@ only device work is the two cross-form conversions:
 
 The mirrors are trusted to match the device tensors; validating equality
 would cost the sync this path removes. With the mirrors supplied, the eager
-plan on trtllm-gen or cuDNN with a dense table issues zero kernel launches
-and one pinned host-to-device copy (`wp-c.md` §2.2 measurement; pinned by
-`tests/experimental/paged_attention/test_paged_attention_prototype.py::test_warm_plan_uploads_from_pinned_memory_only`).
+plan on trtllm-gen with a dense table issues zero kernel launches and one
+pinned host-to-device copy (`benchmarks/bench_paged_attention_plan.py`
+counts the launches and copies of a plan). The eager cuDNN plan adds the
+five small kernels that build its own page table (see "Page-table ABI per
+backend"). No warm plan uploads from pageable memory or
+copies from the device to the host
+(`tests/experimental/paged_attention/test_paged_attention_prototype.py::test_warm_plan_uploads_from_pinned_memory_only`).
 
 ### Validation
 
 `validate_structure` (host-only, shape-derived): every metadata tensor is an
 int32 CUDA tensor on the metadata's device with the right rank; `qo_indptr`
 has `batch_size + 1` entries; `block_tables` has `batch_size` rows; the page
-size respects the dense floor; `max_q_len` and `max_kv_len` are positive host
-ints; `max_kv_len` fits the table capacity.
+size is a positive host int and respects the dense floor; `max_q_len` and
+`max_kv_len` are positive host ints (a Python `int`; a `bool` and a numpy
+integer are rejected); `max_kv_len` fits the table capacity.
 
 `validate_values` (always runs, from the mirrors): `qo_indptr` is
 non-decreasing (`q_len == 0` is a padding row) and the batch holds at least
@@ -694,16 +928,34 @@ The controller checks (`_controller.run`):
   `q.stride(-1) == 1` for every backend (the FA and trtllm-gen bindings pass
   only the token and head strides, so a non-unit inner stride is silently
   misread; cuDNN rejects it). Eager: `rows == total_q_tokens`; graph mode:
-  bounded as above. Backends with `requires_contiguous_q` (cudnn, cake) also
-  require `q.is_contiguous()`: cuDNN builds its graph from `q.stride()` but
-  scales the token-unit ragged offsets by `num_qo_heads * head_dim`, so a
-  head slice of a fused QKV buffer is misaddressed. fa2, fa3 and trtllm-gen
-  accept any unit-inner-stride view (a fused-QKV head slice, a padded head
-  stride, a storage offset), measured natively in
-  `tests/experimental/paged_attention/test_paged_attention_strides.py`.
+  bounded as above. `q` must also be stored token-major and 16-byte
+  aligned, for every backend: head stride `>= head_dim_qk`, token stride
+  `>= (num_qo_heads - 1) * head stride + head_dim_qk`, both strides
+  multiples of 16 bytes (8 elements of an f16/bf16 `q`), and the data
+  pointer on a 16-byte boundary. Anything else raises `ValueError`: a
+  `(H, T, D)` buffer viewed as `(T, H, D)` and an expanded (zero-stride)
+  dim are misread by trtllm-gen, and an unaligned offset or stride is
+  refused at launch by trtllm-gen and cuDNN and faults on the device in
+  fa2. The alignment rule was measured for bf16, head dim 128 on SM100.
+  Strides that are positive but overlap (below the two bounds) are refused
+  as well, although fa2, cuDNN and trtllm-gen read them correctly when
+  measured. Every backend accepts any view that meets the rule (a
+  fused-QKV head slice, a padded head or token stride, an aligned storage
+  offset), measured natively in
+  `tests/experimental/paged_attention/test_paged_attention_strides.py`. cuDNN
+  declares `q` to its graph with `q`'s own strides and scales the token-unit
+  ragged offsets by `q`'s token stride, so a head slice of a fused QKV
+  buffer is addressed correctly; its graph is keyed on those strides, so
+  each new stride layout costs one graph build inside `run()`. The
+  controller keeps a guard for a backend that declares
+  `requires_contiguous_q` (a `ValueError` naming the backends that take a
+  strided `q`); no backend declares it.
 - `kv_cache`: a `(k_cache, v_cache)` pair, each 4-D in the planned layout
   (`HND`: `(pages, H, page_size, D)`; `NHD`: `(pages, page_size, H, D)`), with
-  the planned `kv_dtype`. A transposed pair gets a hint naming the layout.
+  the planned `kv_dtype` and a unit stride along the head dim. A transposed
+  pair gets a hint naming the layout. fa3, trtllm-gen and cake read V with
+  K's strides and reject a pair whose strides differ; fa2 and cuDNN walk each
+  pool by its own strides.
 - `out`: contiguous `(q.shape[0], num_qo_heads, head_dim_vo)` in q's dtype.
 - `lse`: contiguous fp32 `(q.shape[0], num_qo_heads)`; requires
   `lse_mode != "none"`.
@@ -720,28 +972,60 @@ with the constraint named.
 
 ### Page-table ABI per backend
 
-- **cuDNN** (`_CudnnBackend.plan`): the table's page dimension must equal
-  `ceil(max_kv_len / page_size)` exactly, or cuDNN fails at finalize. Engines
-  hand over capacity-width tables, so the backend takes the internal narrow
-  view `block_tables[:, :width]`, which keeps the caller's row stride (the
-  cuDNN graph is stride-driven). It requires a unit stride along the page
-  dimension and at least `width` columns. The prefill graph cache key in
+- **cuDNN** (`_CudnnBackend.plan`): cuDNN requires the page dimension of the
+  table it binds to equal `ceil(declared KV bound / page_size)` exactly, or
+  it fails at finalize. The prefill graph cache key in
   `flashinfer/cudnn/prefill.py` includes the table's shape and strides, the
   q/k/v strides and dtypes and the softmax scale, and the cache decorator sits
-  outside the build step so a failed build inserts nothing. In graph mode the
-  view is of the reserved buffer.
+  outside the build step so a failed build inserts nothing. What the plan
+  declares and which table it binds depend on the mode:
+  - Eager: the plan declares a shape class, not the batch's exact maxes
+    (`_declared_bounds`). cuDNN finalizes one execution plan per declared
+    `(max_q, max_kv)`, about 5 ms each, and the longest KV of a serving loop
+    grows every step, so exact maxes would build a plan on every step. KV
+    rounds up to the next power of two. A longest query above 64 tokens,
+    with a GQA group that divides 128, rounds up to whole
+    `128 // group`-token query tiles, at least 128; up to 64 tokens the Q
+    bound stays exact, because the `max_q_len == 1` LSE layout and cuDNN's
+    single-token paths depend on the exact value. These are the formulas of
+    the legacy wrapper's auto path. The per-request lengths stay the actual
+    ones and mask the live tokens.
+
+    The class reaches past the table columns the caller filled for the
+    batch, and one cuDNN engine loads pages through the columns past a
+    request's own pages: it fetches whole 128-token KV tiles and multiplies
+    the masked probabilities with what it fetched, so a pool page holding
+    NaN reaches the output as `0 * NaN`. The backend therefore binds a table
+    of its own (`_own_pages_table`): a new contiguous
+    `(batch, ceil(class / page_size))` tensor that holds each request's own
+    pages followed by its last live page again. It is built on the device at
+    `plan()` without a host sync, at the cost of five small kernels and
+    about 0.1 ms of host time per eager plan. The plan's table, the
+    caller's or the one derived from flat page ids, is only read: it needs a
+    unit stride along the page dimension and at least
+    `ceil(max_kv_len / page_size)` columns, and its width and row stride are
+    otherwise free, so every source reaches one cuDNN graph per (batch,
+    class).
+  - CUDA-graph mode: the plan declares the capacity's bounds, because a
+    captured graph serves every later batch of its bucket. It binds the
+    controller's reserved table, which is exactly
+    `ceil(capacity.max_kv_len / page_size)` columns wide in both paging
+    forms, without a copy, so a capture keeps its pointer and row stride. In the
+    dense form the columns the caller left past a request's own pages
+    therefore do reach cuDNN, and where the capacity's KV bound is not a
+    whole number of 128-token tiles the same engine also loads pool page 0
+    for the rest of the last tile; see "Known limitations".
 - **trtllm-gen / cake** (`_TrtllmGenBackend.preflight`): the launcher takes
   the row stride from `block_tables.size(-1)` and the kernel walks a raw int32
   pointer, so a narrow view of a wider table is read as a packed array and is
   silently wrong. A non-contiguous table is declined with the typed signal;
-  under `auto` the walk moves to a backend that walks the table by its
-  strides, an explicit backend surfaces a `ValueError` with the
-  `.contiguous()` hint. Extra columns past `max_kv_len` are fine. The check
+  under `auto` the walk moves on to the next candidate, an explicit backend
+  surfaces a `ValueError` with the `.contiguous()` hint. Extra columns past
+  `max_kv_len` are fine. The check
   runs on the table the backend is handed: the caller's in eager mode, the
   reserved contiguous one in graph mode (the caller's table is copied into
   it at staging), so a narrow view is declined eagerly and accepted under a
-  graph (measured on B200, 2026-09-21; the round-4 M24 note claimed the
-  opposite and was wrong).
+  graph (measured on B200, 2026-09-21).
 - **fa2 / fa3** (`_FaBackend.plan`): the flat `kv_page_indices` must be
   contiguous (the kernel walks it as a packed int32 array); only the eager
   flat form can fail this, since the reserved graph buffer is contiguous.
@@ -756,7 +1040,7 @@ unspecified by contract and may be left unwritten, so an engine must never
 read a padding row. fa2/fa3 and cuDNN write a zero output row and an LSE of
 `-inf`, trtllm-gen leaves the rows untouched (measured with a NaN-poisoned
 output allocation), cake declines the batch; measured on
-B200 with the native calls (`wp-c.md` §3). Implementation: value validation
+B200 with the native calls. Implementation: value validation
 rejects only negative lengths; the causal envelope exempts padding rows; the
 derived last-page length of a padding row is `page_size` by the
 `kv - (pages - 1) * page_size` formula (the FA kernel never reads it, since
@@ -769,7 +1053,7 @@ toggled live/padding across graph re-plans
 `query_start_loc` tail) are legal as well (ledger M17). Such a row owns no
 query token and no output row, so there is nothing unspecified about it; the
 contract is that every other row is unchanged. Measured on B200 with the
-native calls (`wp-n.md`): fa2 (CSR planner), cuDNN (`actual_seq_lens_q = 0`
+native calls: fa2 (CSR planner), cuDNN (`actual_seq_lens_q = 0`
 with a repeated `batch_offsets_q`), trtllm-gen and cake (a repeated
 `cum_seq_lens_q` value) all accept a q_len 0 row in the middle or at the tail,
 with `kv_len > 0` or `kv_len == 0`, and leave the other rows exact; cake's
@@ -802,8 +1086,9 @@ no host sync) succeeds (`lse_path == "direct"`). At `max_q_len == 1` the padded
 `(b, 1, h)` layout is byte-identical to the packed one and is used as a view
 (`"view"`), because cuDNN 9.25 writes no stats there when a ragged stats
 offset is set. Otherwise the backend gathers padded native stats with
-plan-time precomputed indices (`"gather"`); in graph mode those indices keep
-the capacity's row count.
+plan-time precomputed indices (`"gather"`); the padded buffer has the Q bound
+declared to cuDNN (a shape class in eager mode), and in graph mode the
+indices keep the capacity's row count.
 
 ## Feature axes
 
@@ -816,8 +1101,9 @@ time, and frozen by the first graph-mode plan:
   capability by measurement`).
 - `window_left` (default `-1` = unlimited; values below `-1` are rejected
   because backends disagree on their meaning): plan-time because it selects a
-  compiled kernel variant on the FA backends. cuDNN declares no window;
-  trtllm-gen and cake decline non-causal plus window.
+  compiled kernel variant on the FA backends. cuDNN declares no window.
+  Non-causal plus window has no backend: trtllm-gen and cake ship no such
+  kernel, and fa2 and fa3 declare it unsupported (ledger M20).
 - `logits_soft_cap` (`None` or `0` = off; otherwise a positive finite float):
   `cap * tanh(score / cap)` on the scaled scores. fa2 and fa3 only, through
   the wrapper's soft-cap kernel variant.
@@ -885,8 +1171,9 @@ scales.
 Every backend runs on one plain scratch buffer, the role of the legacy
 wrappers' `float_workspace_buffer` (`_controller.py`, top of file). By
 default all instances on a device share one lazily allocated library-owned
-pool of `_WORKSPACE_BYTES = 128 MiB`, so one instance per graph bucket costs
-no workspace per bucket. A caller may pass `workspace_buffer=`: a contiguous
+pool of `_WORKSPACE_BYTES = 512 MiB` (the upper end of what the engines
+allocate for the same kernels), so one instance per graph bucket costs no
+workspace per bucket. A caller may pass `workspace_buffer=`: a contiguous
 1-D `uint8` or `int8` tensor on the instance's device, viewed as `uint8`. The
 generated-FA wrapper receives it as its float workspace; cuDNN views it as
 `int8`; trtllm-gen and cake use it as their softmax-stats scratch and keep a
@@ -894,11 +1181,27 @@ separate small zero-initialized multi-CTA counter buffer of their own.
 Instances sharing a workspace must not run concurrently on different streams;
 pass a private buffer where that isolation is needed.
 
-The 128 MiB default has been observed to overflow the fa2 split-KV planner
-on a single 2048-token request with 32 heads (ledger M14, found by the
-benchmark smoke run). The sibling work package WP-I (branch
-`next/workspace-sizing`) is adding `PagedAttention.workspace_requirements()` and revisiting the
-default; this section describes the code at the integration head only.
+The fa2 split-KV planner is the only consumer whose need grows with the
+geometry (ledger M14). trtllm-gen and cake need the softmax-stats scratch of
+an LSE plan, and cuDNN sizes its own graph workspace.
+`PagedAttention.workspace_requirements(capacity, ...)` returns a conservative
+upper bound in bytes for every plan within a `GraphCapacity`: the maximum
+over the backends that resolve for the configuration, or over the one named
+or the pinned `Resolution`. It is tensor-free and sync-free, for sizing a
+caller-owned buffer at engine init.
+
+A backend whose scratch does not fit the buffer declines the batch in its
+`preflight()`, before any kernel-side allocator error. fa2 replays its
+planner's arithmetic on the host mirrors (`workspace_need`, a lower bound on
+the planner's allocation, so the decline is never spurious); trtllm-gen and
+cake compute the softmax-stats bytes. The decline is the typed signal: under
+`auto` the walk moves on to the next candidate and the byte counts stay in
+the selection trace, and a named backend, or a set in which no candidate
+fits, raises `ValueError` naming the required and the available bytes. For
+a named backend the message reads `"backend 'fa2' cannot plan this batch:
+needs N bytes of scratch workspace for this batch but the workspace buffer
+holds M bytes; ..."` (`_workspace_too_small` gives the reason, the
+controller adds the backend's name as for every preflight reason).
 
 ## Benchmark and trace
 
@@ -921,13 +1224,17 @@ wall, the replayed buffers re-checked against the oracle), `step` (one plan
 plus N eager runs). Rows for unsupported, erroring or incorrect candidates
 are kept with a `status` column; the typed preflight signal, alone or chained
 under the candidate walk's `ValueError`, is classified as `unsupported`.
-`auto` rows record the resolved backend. `--pa_legacy` adds rows through the
-legacy public API of the same kernel; its cuDNN provider hands the native API
-the width-exact column view of the case's wider block table (the view the
-unified cuDNN backend takes), and its `update` rows time the per-step re-arm
-of the captured legacy call (the graph-mode wrapper's `plan()` for fa2/fa3,
-the device-metadata derivation into fixed buffers for cuDNN and
-trtllm-gen/cake).
+`auto` rows record the first candidate of the resolve-time order
+(`static_backend`) and the backend the plan ran (`resolved_backend`); the two
+differ when the plan-time policy ranks another candidate first or the first
+one declines. `--pa_legacy` adds rows through the legacy public API of the
+same kernel; its cuDNN provider hands the native API the width-exact column
+view of the case's wider block table with the actual `max_kv_len` (the
+unified cuDNN backend declares other bounds: its capacity's in CUDA-graph
+mode, here the table's full width, and a shape class with a table of its
+own in an eager plan), and its `update` rows time the per-step re-arm of the
+captured legacy call (the graph-mode wrapper's `plan()` for fa2/fa3, the
+device-metadata derivation into fixed buffers for cuDNN and trtllm-gen/cake).
 `benchmarks/bench_paged_attention_plan.py` is the micro-benchmark for
 metadata construction, eager plan and graph re-plan cost, with launch and
 memcpy counts from the profiler.
@@ -970,6 +1277,22 @@ them for `total_q < batch_size`.
 Tracing before the first successful plan or through the unbound
 `PagedAttention.run.fi_trace(...)` raises.
 
+### Records of the inner fa wrapper
+
+The API log, the dump and the trace described above belong to the unified
+entry, `PagedAttention.run`. For a plain fa2 / fa3 plan, `run()` launches the
+kernel module from the argument list staged at `plan()` and does not enter
+`BatchPrefillWithPagedKVCacheWrapper.run()`, so a unified fa run does not
+produce that method's own records:
+
+- its `FLASHINFER_LOGLEVEL` entry and its level-10 dump;
+- the `gqa_paged_prefill_*` trace dump under `FLASHINFER_TRACE_DUMP`;
+- Trace Apply under that definition name.
+
+A consumer that keyed on those records uses the `PagedAttention.run` entry
+and the `paged_attention_*` definitions. A sink plan and a plan the staging
+declines run through the wrapper's `run()` and produce its records.
+
 ## Correspondence to the Batch MLA package
 
 | Batch MLA (`flashinfer/mla/_batch_mla/`) | Paged attention (`flashinfer/experimental/paged_attention/`) |
@@ -979,8 +1302,8 @@ Tracing before the first successful plan or through the unbound
 | `MLAPlanMetadata.csr()` / `.dense()` / `.dual()` | `PagedAttentionMetadata.dense()` / `.csr()` (no dual form: one truth) |
 | `MLAInputContract` | `PlanMetadata` plus the frozen contract dict in graph mode |
 | `_MLAPlanArguments` and its lazy resolver | `PlanMetadata`, `Derived`, `HostArrays` (`_planning.py`) |
-| backend fixed at construction; `determine_mla_backend()` picks fa2/fa3 | `resolve_paged_attention()` at init, candidate walk within the pinned set at plan |
-| `_backends/_capabilities.py`, `_BackendPlanUnsupportedError` | same module name and twin exception type (to be unified) |
+| `_auto_policy.py`: `backend="auto"` is resolved in `plan()`; per-architecture `ordered_*_backends` over the plan request; `_BatchMLAPagedAttentionAutoBackend.plan_from_wrapper` walks that order and moves on only on `_BackendPlanUnsupportedError`; a graph re-plan keeps the previous backend; the module also owns the `autotune` policy | `_auto_policy.py` only ranks (`plan_order`, per-architecture `ordered_*_backends` over `_PlanFacts`); `resolve_paged_attention()` fixes the candidate set at init (`cake` excluded under `auto`) and the controller walks it in `plan()`, moving on only on `_BackendPlanUnsupportedError`; a graph-mode instance keeps the first successful plan's backend; no autotune policy |
+| `_backends/_capabilities.py`, `_BackendPlanUnsupportedError` (a `ValueError` subclass that reaches the caller) | same module name, same-named private type with the same base class; the controller converts it to a plain `ValueError` that names the backend or lists every candidate's reason (to be unified) |
 | `_fa_common.py` + `fa2_backend.py` + `fa3_backend.py` | `fa_backend.py` (one class, backend name parameter) |
 | `cutlass_backend.py`, `trtllm_gen_backend.py`, ... | `cudnn_backend.py`, `trtllm_gen_backend.py` (trtllm-gen and cake) |
 | reserved metadata buffers, `supports_cuda_graph_replan` per backend | `GraphCapacity`, `GraphBuffers`, `Transaction` in `_graph.py`; every backend re-plans through reserved storage |
@@ -990,14 +1313,17 @@ Tracing before the first successful plan or through the unbound
 Differences worth knowing: paged attention has no deprecated argument forms
 and no compatibility adapters; its `plan()` accepts every backend's semantic
 arguments in one signature and excludes backends by capability instead of
-raising per backend; and its graph lifecycle is uniform across backends
-because the controller, not the backend, owns the reserved storage.
+raising per backend; its graph lifecycle is uniform across backends
+because the controller, not the backend, owns the reserved storage; and its
+auto policy only orders candidates, with the walk in the controller and the
+order and trace of a plan readable through `explain()`, where the MLA
+wrapper exposes neither.
 
 ## Known limitations
 
 | id | limitation | state |
 | --- | --- | --- |
-| M14 | The 128 MiB shared default workspace overflows the fa2 split-KV planner on a single 2048-token request with 32 heads. | WP-I adds `workspace_requirements()`; pass the engine's buffer meanwhile. |
+| M14 | The fa2 split-KV planner carves scratch that grows with the geometry (heads, head dim, SM count, and in graph mode the capacity's query tokens), so a bucket can need more than the buffer in use, the shared 512 MiB default included. | `PagedAttention.workspace_requirements()` bounds the need for sizing a caller-owned buffer. fa2 declines a batch that does not fit at `plan()` with the typed signal: `auto` moves on to the next candidate, a named backend raises `ValueError` naming the bytes. |
 | M15 | `flashinfer/cudnn/decode.py` keeps the older graph-cache key and decorator order that the prefill path fixed. | Out of this package; recorded. |
 | M16 | trtllm-gen and cake compute silently wrong results when the V cache's page stride differs from the K cache's (independently allocated pools); cuDNN and fa2 are correct. | Rejected at `run()` in the trtllm-gen backend (a `ValueError` naming the stride constraint); `tests/experimental/paged_attention/test_paged_attention_coverage.py::test_tc05_strided_inputs[trtllm-gen-kv_independent_strides]` pins it. |
 | M18 | Cake creates its TMA descriptors for `q`, `k_cache` and `v_cache` (storage address, shape, strides) eagerly and pins them at capture; a `run()` whose q/k/v binding was never run eagerly raises `RuntimeError("... prewarm each Cake FMHA tensor/layout binding before CUDA Graph capture")` inside the capture. The eager descriptor pool is bounded (`kMaxReusableSlots = kMaxPinnedSlots = 4096` in `csrc/cake_fmha/jit/*_jit_binding.cu`), so a capture over thousands of distinct binding sets — the timing helper's cold-L2 rotating clones for an input far below L2 — cannot be prewarmed into it. | Documented rule, not fixable from `plan()` (it sees no tensors): run the exact `q`, `k_cache`, `v_cache` once eagerly before capturing them; `out` and `lse` may be fresh. The failed capture is clean (no device fault, instance reusable). The benchmark therefore captures one `run()` on fixed buffers and flushes L2 between replays. `tests/experimental/paged_attention/test_paged_attention_cuda_graph.py::test_cake_capture_requires_an_eager_run_on_the_captured_tensors`. |
@@ -1005,11 +1331,11 @@ because the controller, not the backend, owns the reserved storage.
 | M21 | The fa2 attention-sink kernel variant is wrong at head_dim 512 (B200: max abs err 1.4–1.75, LSE off by ~3; D64/128/256 sinks and D512 without sinks are exact; the legacy `BatchAttentionWithAttentionSinkWrapper` shows the same). Found by the XQA legacy grid once WP-T declared D512. | fa2 declares `sinks_head_dims = {64, 128, 256}`, so `use_sinks=True` at (512, 512) is excluded at resolve with the reason; `tests/experimental/paged_attention/test_paged_attention_features.py::test_fa2_kernel_sinks_head_dim_512_defect` is a strict xfail on the kernel through the legacy sink wrapper — a kernel fix turns it into XPASS and asks for the capability flip; the XQA conversion's D512 + sink rows skip with the resolve reason. |
 | M22 | `_FaBackend.preflight` declined `use_sinks=True` with an fp8 KV cache as "not verified" although the capability table admits both; the XQA legacy suite runs the pair natively. Measured on B200 (e4m3 / e5m2, D128 / D256): the sink variant with `sm_scale * k_scale` and `out * v_scale` matches the sink-aware oracle to 4e-3. | Decline removed; `tests/experimental/paged_attention/test_paged_attention_features.py::test_attention_sinks_with_fp8_kv` pins the pair against the oracle. |
 | M23 | trtllm-gen, cake and cuDNN read the slots of a request's last page past `kv_len` (the masked probabilities are 0, but `0 * NaN` reaches the output); fa2 zeroes the tail before the PV product. The TensorSpeed and modular legacy suites poison exactly that tail and expect it ignored. | Input contract (`PagedAttentionMetadata` docstring, "In-page tail"): the tail must be finite, any finite content is exact. Not a backend defect — the legacy TensorSpeed kernel masks it, the shared native kernels do not. Measured on B200 with a NaN tail: fa2 is exact, trtllm-gen, cake and cuDNN are not; the contract therefore requires finite tails (no test pins the per-backend outcome). |
-| — | `auto` is a static order. On SM100 it picks trtllm-gen for a decode-shaped batch (B=32, q=1, kv=4096) that fa2 runs about five times faster in the benchmark smoke run. | Shape-bucket order table is wave-2 work; the benchmark's `resolved_backend` column shows the regret. |
+| — | Only exact SM100 `(10, 0)` has a measured `auto` rule, fitted on GB200 with cudnn-frontend 1.32 / cuDNN 9.27. SM90 and the other SM10x parts take fixed orders keyed on `max_q_len`, SM8x and SM12x one fixed order; those orders are pinned by CPU tests and not measured through this API. | Needs a measured run per architecture; `explain()` shows the order a plan walked. |
+| — | The GB200 comparison flags a few CUDA-graph shapes that run the same backend under both APIs as confirmed regressions in each run (5 of the 219 main-list shapes, at most 6.1% and 2.2 us). The comparison flags as many when both measured slots run the legacy wrapper (about 3% of same-backend shapes per run; per-shape slot ratio 0.967 to 1.025 over 24 processes), so the flags measure the harness, not the API. | Read same-backend CUDA-graph rows against that A/A floor; see "Measurement basis". |
 | — | `custom_mask` with graph mode raises `ValueError`: the FA wrapper's packed-mask storage is not part of `GraphCapacity`. | Follow-up. |
 | — | The generated-FA backend re-plans its wrapper in place; a failure inside that plan can leave backend-internal state ahead of the published metadata. | Same caveat as the MLA generated backends. |
-| — | `update()` has no stream binding. | Call it on the replay stream. |
-| — | `cake` keeps `requires_contiguous_q=True`; only the trtllm-gen kernel was probed for strided q. | Probe pending. |
-| — | fa3 rows are compiled-checked only; the verification pool has no SM90 device. | Needs one H100 run. |
+| — | fa3 rows are compiled-checked only; the verification pool has no SM90 device. fa3 shares fa2's staged launch list, which has not been executed on SM90 either. | Needs one H100 run. |
 | — | The trace definition constrains `min(kv_seq_lens) >= 1`, older than the zero-row contract; a batch with padding rows refuses to trace rather than export a self-violating workload. | Give the reference a padding-row convention, relax the constraint and regenerate the fixture. |
-| — | Capacity substitution plans kernels for the capacity maxes; its performance effect on short batches is unmeasured. | Benchmark item. |
+| — | Capacity substitution plans kernels for the capacity maxes, and a graph-mode instance ranks `auto` on those bounds and the host lengths of the first batch it plans successfully, and keeps that backend. A short batch replayed in a prefill-sized capacity stays on the capacity's choice; the performance effect on short batches is unmeasured. | Benchmark item. Plan the first batch with representative lengths, or pin the backend. |
+| — | cuDNN in CUDA-graph mode binds the controller's reserved table, the caller's columns included. One cuDNN engine loads pages through the columns past a request's own pages, up to the end of the request's last 128-token KV tile, and, where the capacity's KV bound is not a whole number of 128-token tiles, pool page 0 for the rest of the last tile; a NaN or Inf in such a page reaches the output as `0 * NaN`. An eager plan binds a table that names only each request's own pages, so no page the batch does not own reaches the result (`tests/experimental/paged_attention/test_paged_attention_cudnn_bounds.py::test_pages_the_batch_does_not_own_do_not_reach_the_result`). | In graph mode keep the pages those columns name finite, and either choose a capacity KV bound of whole 128-token tiles or keep pool page 0 finite. |
