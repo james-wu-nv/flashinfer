@@ -21,6 +21,8 @@ from ._backends._capabilities import CAPABILITIES
 from ._contracts import (
     Resolution,
     _expect,
+    _expect_head_dims,
+    _expect_heads,
     _expect_page_size,
     _expect_window_left,
     _normalize_logits_soft_cap,
@@ -230,16 +232,8 @@ def resolve_paged_attention(
     if kv_dtype is None:
         kv_dtype = q_dtype
     dev, cc_major, cc_minor, device_index = _bind_device(device, cc_major)
-    if num_qo_heads <= 0 or num_kv_heads <= 0:
-        raise ValueError(
-            f"num_qo_heads ({num_qo_heads}) and num_kv_heads ({num_kv_heads}) "
-            "must be positive integers"
-        )
-    if num_qo_heads % num_kv_heads != 0:
-        raise ValueError(
-            f"num_qo_heads ({num_qo_heads}) must be divisible by "
-            f"num_kv_heads ({num_kv_heads}) for GQA/MQA"
-        )
+    _expect_heads(num_qo_heads, num_kv_heads)
+    _expect_head_dims(head_dim_qk, head_dim_vo)
     if kv_input_form not in ("block_tables", "page_indices"):
         raise ValueError(
             f"kv_input_form must be 'block_tables' or 'page_indices', got "

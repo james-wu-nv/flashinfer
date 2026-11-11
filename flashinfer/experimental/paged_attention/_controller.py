@@ -41,6 +41,8 @@ from ._contracts import (
     Resolution,
     _expect,
     _expect_custom_mask,
+    _expect_head_dims,
+    _expect_heads,
     _expect_lse_mode,
     _expect_pinned_device,
     _expect_window_left,
@@ -73,8 +75,10 @@ from ._selection import resolve_paged_attention
 # 1024 requests (80.5 MiB), 4096-token graph prefill (64.5 MiB) and an
 # 8192-token single-request graph capture (129 MiB).  It is one allocation
 # per device.  Anything larger is a caller-owned buffer sized by
-# workspace_requirements(); plan() rejects a buffer the planner would
-# overflow before any kernel-side error.
+# workspace_requirements().  A backend whose planner would overflow the
+# buffer declines the batch in its preflight (typed), before any kernel-side
+# error: auto tries the next candidate, and a named backend -- or a set in
+# which no candidate fits -- gets a ValueError naming the bytes.
 # ---------------------------------------------------------------------------
 _WORKSPACE_BYTES = 512 * 1024 * 1024
 _shared_workspaces: Dict[torch.device, torch.Tensor] = {}
@@ -252,6 +256,24 @@ def _check_frozen_contract(frozen: Dict[str, Any], current: Dict[str, Any]) -> N
             )
 
 
+def _narrowed_to(resolution: Resolution, name: str) -> Resolution:
+    """``resolution`` with ``name`` as its only candidate: what a graph-mode
+    re-plan chooses from.  explain() keeps the resolve-time exclusion reasons
+    and lists the other members as frozen out."""
+    return dataclasses.replace(
+        resolution,
+        backends=(name,),
+        excluded={
+            **resolution.excluded,
+            **{
+                other: "not the backend the first graph-mode plan froze"
+                for other in resolution.backends
+                if other != name
+            },
+        },
+    )
+
+
 class PagedAttentionController:
     def __init__(
         self,
@@ -295,7 +317,7 @@ class PagedAttentionController:
         self._backend_name: Optional[str] = None
         self._resolution: Optional[Resolution] = None
         # plan-time selection trace: (backend, phase, reason) per candidate tried,
-        # and the order the last plan walked the candidates in
+        # and what the last plan could choose from, in the order it walked them
         self._trace: List[Tuple[str, str, str]] = []
         self._order: Tuple[str, ...] = ()
         self._meta: Optional[PlanMetadata] = None
@@ -357,6 +379,10 @@ class PagedAttentionController:
         )
         head_dim_vo = head_dim_vo if head_dim_vo is not None else head_dim_qk
         kv_dtype = kv_dtype if kv_dtype is not None else q_dtype
+        # here, not only in resolve_paged_attention(): a pinned Resolution is
+        # not re-resolved, and its config key compares with ``==``
+        _expect_heads(num_qo_heads, num_kv_heads)
+        _expect_head_dims(head_dim_qk, head_dim_vo)
         _expect(
             kv_layout in ("HND", "NHD"),
             f"kv_layout must be 'HND' or 'NHD', got {kv_layout!r}",
@@ -494,8 +520,15 @@ class PagedAttentionController:
             _check_frozen_contract(
                 {"backend": frozen_backend}, {"backend": resolution.backends[0]}
             )
+        if frozen_backend is not None and len(resolution.backends) > 1:
+            # A captured graph launches the frozen backend's kernels, so a
+            # graph-mode re-plan has one candidate whatever set it was given:
+            # nothing is ranked, and no other member is constructed, asked or
+            # reserved for.  plan() and update() then publish the same order,
+            # trace, explain() text and error.
+            resolution = _narrowed_to(resolution, frozen_backend)
         candidates = resolution.backends
-        if frozen_backend is None and len(candidates) > 1:
+        if len(candidates) > 1:
             # Host values only: the bounds the kernels are planned with and
             # the batch's host mirrors, never a device readback.
             candidates = plan_order(
@@ -525,14 +558,6 @@ class PagedAttentionController:
                 ),
             )
         for name in candidates:
-            if frozen_backend is not None and name != frozen_backend:
-                # a captured graph launches the frozen backend's kernels; skip
-                # every other candidate before constructing or reserving
-                # anything for it
-                trace.append(
-                    (name, "frozen", "not the backend the first graph-mode plan froze")
-                )
-                continue
             # derive exactly the forms this candidate declared it reads (cached
             # on the metadata per need set and width; in graph mode the dense
             # table derived from flat page ids is sized to the reserved one)
@@ -655,23 +680,13 @@ class PagedAttentionController:
             # update() re-plans within the pinned resolution narrowed to the
             # frozen backend: no level-1 re-resolution per step, and explain()
             # keeps the resolve-time exclusion reasons
-            self._frozen_plan_kwargs["backend"] = dataclasses.replace(
-                resolution,
-                backends=(name,),
-                excluded={
-                    **resolution.excluded,
-                    **{
-                        other: "not the backend the first graph-mode plan froze"
-                        for other in resolution.backends
-                        if other != name
-                    },
-                },
-            )
+            self._frozen_plan_kwargs["backend"] = _narrowed_to(resolution, name)
         self._backends[key] = candidate
         self._active = candidate
         self._backend_name = name
         self._resolution = resolution
         self._trace = trace
+        # on a graph-mode re-plan this is the frozen backend alone
         self._order = candidates
         self._meta = meta
         self._derived = derived
@@ -815,12 +830,16 @@ class PagedAttentionController:
                 )
         elif q.shape[0] != total:
             raise ValueError(f"q has {q.shape[0]} tokens but qo_indptr sums to {total}")
-        # Query ABI shared by every backend: the FA2/FA3 and trtllm-gen bindings
-        # pass only the token and head strides (the kernels assume a dense
-        # head_dim), so a non-unit inner stride is silently misread (native
-        # probe: max abs error 1.5 / 1.3 against 0.0025); cuDNN rejects it in
-        # graph construction.  See
-        # tests/experimental/paged_attention/test_paged_attention_strides.py.
+        # Query ABI shared by every backend, checked here because q's layout
+        # reaches the library only at run(), after plan() chose the backend:
+        # a layout only some backends address cannot be routed around.  See
+        # tests/experimental/paged_attention/test_paged_attention_strides.py
+        # (NATIVE_Q_OUTCOME and Q_REJECTED hold the measurements).
+        #
+        # 1. Dense head_dim.  The FA2/FA3 and trtllm-gen bindings pass only
+        #    the token and head strides, so a non-unit inner stride is
+        #    silently misread (native probe: max abs error 1.5 / 1.3 against
+        #    0.0025); cuDNN rejects it in graph construction.
         if q.stride(-1) != 1:
             raise ValueError(
                 f"q must be dense along head_dim (stride(-1) == 1), got strides "
@@ -828,6 +847,41 @@ class PagedAttentionController:
                 "stride only; pass a view whose last dim is unit-stride (a head "
                 "slice of a fused QKV buffer is fine) or a packed copy"
             )
+        # 2. Token-major storage: a head's head_dim values inside one head
+        #    stride, a token's heads inside one token stride.  trtllm-gen
+        #    builds a TMA descriptor from the two strides and silently
+        #    misreads a (H, T, D) buffer viewed as (T, H, D) and an expanded
+        #    (zero-stride) dim, where its launcher falls back to the packed
+        #    stride (max abs error 1.0 to 1.2); cuDNN raises from its graph
+        #    on a zero token stride, or misreads it on the element-offset
+        #    path of a cuDNN below 9.25.
+        # 3. 16-byte alignment of the first element and of both strides: the
+        #    TMA descriptor and the cuDNN graph refuse anything else at
+        #    launch, and FA2's vector loads fault on the device
+        #    (cudaErrorMisalignedAddress, which poisons the CUDA context).
+        token_stride, head_stride = q.stride(0), q.stride(1)
+        align = 16 // q.element_size()
+        if not (
+            head_stride >= m.head_dim_qk
+            and token_stride >= (m.num_qo_heads - 1) * head_stride + m.head_dim_qk
+            and token_stride % align == 0
+            and head_stride % align == 0
+            and q.data_ptr() % 16 == 0
+        ):
+            raise ValueError(
+                "q must be stored token-major and 16-byte aligned: head stride "
+                f">= head_dim ({m.head_dim_qk}), token stride >= (num_qo_heads - 1) "
+                "* head stride + head_dim, both strides multiples of "
+                f"{align} elements and the first element on a 16-byte boundary; "
+                f"got strides {tuple(q.stride())}, storage offset "
+                f"{q.storage_offset()} — a permuted (H, T, D) buffer, an "
+                "expanded (zero-stride) dim or an unaligned slice is misread "
+                "or faults in at least one backend; pass a packed copy "
+                "(q.contiguous())"
+            )
+        # Generic guard for a backend that declares it reads q as packed THD.
+        # None does today, and an auto candidate must not: q's layout is
+        # known only here, after plan() ranked the candidates.
         cap = CAPABILITIES[self._backend_name]
         if cap.requires_contiguous_q and not q.is_contiguous():
             strided = [
@@ -935,7 +989,10 @@ class PagedAttentionController:
 
     @property
     def selection_order(self) -> Tuple[str, ...]:
-        """The candidates in the order the last successful plan() walked them."""
+        """What the last successful plan() could choose from, in the order it
+        walked them: the pinned candidates in the auto policy's order for the
+        batch, or -- on a CUDA-graph re-plan, through plan() or update(), where
+        nothing is ranked -- the frozen backend alone."""
         return self._order
 
     def explain(self) -> str:

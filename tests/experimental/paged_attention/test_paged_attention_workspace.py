@@ -35,24 +35,47 @@ mode (129 MiB; now 32.25 MiB).  Contract:
    actually allocates (observed through the legacy wrapper's
    ``workspace_size()``, the planner's own counting mode), and the per-batch
    need the plan-time check computes equals the planner's.
-6. A buffer smaller than a batch's need is rejected at ``plan()`` with a
-   ``ValueError`` naming the required bytes, before any kernel-side error.
+6. A backend whose need for a batch exceeds the buffer declines it at
+   ``plan()``, before any kernel-side error, with the typed plan-time
+   rejection: ``backend="auto"`` moves on to the next candidate and keeps the
+   required bytes in the selection trace; a named backend, or a candidate set
+   in which nothing fits, gets a ``ValueError`` naming the required bytes.
+   The tests of the walk itself force its order and run on the host with the
+   backends' real ``preflight()``; one runs the fallback's kernels.
 """
 
+import dataclasses
 import gc
 import re
 
 import pytest
 import torch
 
-from flashinfer.experimental.paged_attention._controller import _WORKSPACE_BYTES
+from flashinfer.experimental.paged_attention import _controller, _selection
+from flashinfer.experimental.paged_attention._backends import (
+    CAPABILITIES,
+    _BackendPlanUnsupportedError,
+)
+from flashinfer.experimental.paged_attention._backends._capabilities import (
+    _workspace_too_small,
+)
+from flashinfer.experimental.paged_attention._backends.fa_backend import _FaBackend
+from flashinfer.experimental.paged_attention._backends.trtllm_gen_backend import (
+    _TrtllmGenBackend,
+)
+from flashinfer.experimental.paged_attention._controller import (
+    _WORKSPACE_BYTES,
+    PagedAttentionController,
+)
 from flashinfer.prefill import (
     BatchPrefillWithPagedKVCacheWrapper,
     GraphCapacity,
     PagedAttention,
+    resolve_paged_attention,
 )
 
 from .paged_attention_reference import reference_paged_prefill
+from .test_paged_attention_contract_cpu import _host_metadata
 from .test_paged_attention_prototype import (
     BACKENDS,
     LSE_TOL,
@@ -63,7 +86,7 @@ from .test_paged_attention_prototype import (
     quantize_kv,
 )
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 MB = 1024 * 1024
 # What _controller._shared_workspace() reserves per device (the trtllm-gen
@@ -146,6 +169,7 @@ def _describe(instances) -> str:
     return "\n".join(lines)
 
 
+@needs_cuda
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_workspace_not_duplicated_per_graph_bucket(backend):
     """One instance per graph bucket must not mean one 128 MB workspace per bucket."""
@@ -175,6 +199,7 @@ def test_workspace_not_duplicated_per_graph_bucket(backend):
     )
 
 
+@needs_cuda
 def test_trtllm_gen_runs_on_the_shared_workspace():
     """trtllm-gen's 128 MB buffer is ordinary scratch: it must be the shared
     workspace, not a second private allocation next to it.  The only thing the
@@ -202,6 +227,7 @@ def test_trtllm_gen_runs_on_the_shared_workspace():
     )
 
 
+@needs_cuda
 def test_trtllm_gen_run_allocates_nothing():
     """With out=/lse= supplied, run() must not allocate: the zero-initialized
     multi-CTA KV counter buffer is owned by the backend and passed explicitly,
@@ -235,6 +261,7 @@ def test_trtllm_gen_run_allocates_nothing():
     )
 
 
+@needs_cuda
 @pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn", "trtllm-gen"])
 def test_caller_supplied_workspace_is_used(backend):
     """The engine's existing workspace (shared with legacy wrappers) is honored:
@@ -267,6 +294,7 @@ def test_caller_supplied_workspace_is_used(backend):
     assert torch.isfinite(out).all() and torch.isfinite(lse).all()
 
 
+@needs_cuda
 def test_workspace_buffer_validation():
     dev = torch.device("cuda:0")
     with pytest.raises(ValueError, match="1-D"):
@@ -482,6 +510,7 @@ def _requirements(p, *, graph, total_q_tokens=None, window_left=-1, backend="fa2
     )
 
 
+@needs_cuda
 @pytest.mark.parametrize("graph", [True, False], ids=["graph", "eager"])
 def test_m14_shape_runs_on_default_workspace(graph):
     """The shape that overflowed the 128 MiB default before #5177 (fa2 graph
@@ -660,6 +689,7 @@ _SIZING_SHAPES = [
 ]
 
 
+@needs_cuda
 @pytest.mark.parametrize(
     "shape,graph,total,window_left",
     [(s, g, t, w) for _, s, g, t, w in _SIZING_SHAPES],
@@ -685,6 +715,7 @@ def test_workspace_requirements_covers_fa2_planner(shape, graph, total, window_l
         assert bound == planner
 
 
+@needs_cuda
 def test_workspace_requirements_bound_is_runnable():
     """A buffer of exactly the bound plans and runs the M14 shape (graph mode,
     where the planner's need is the bound); one byte less is rejected."""
@@ -708,6 +739,7 @@ def test_workspace_requirements_bound_is_runnable():
         short.plan(make_metadata(p), backend="fa2", **_plan_kwargs(p))
 
 
+@needs_cuda
 def test_too_small_workspace_rejected_at_plan_fa2():
     """A 32 MiB buffer is a quarter MiB short for the M14 shape in graph
     mode: plan() says so (required and available bytes), before the planner's
@@ -723,9 +755,16 @@ def test_too_small_workspace_rejected_at_plan_fa2():
     assert "33816576 bytes" in msg and f"holds {32 * MB} bytes" in msg
     assert "workspace_requirements" in msg
     assert "Buffer overflow" not in msg
+    # a named backend never falls back: its name and the whole rejection text
+    # reach the caller
+    assert msg == (
+        "backend 'fa2' cannot plan this batch: "
+        + _workspace_too_small(33816576, 32 * MB)
+    )
     assert attn.backend is None
 
 
+@needs_cuda
 def test_too_small_workspace_rejected_at_plan_trtllm_gen():
     """trtllm-gen's softmax-stats carve-out (LSE plans) is checked the same way."""
     p = make_problem(seed=7, **_SHAPE)
@@ -737,8 +776,11 @@ def test_too_small_workspace_rejected_at_plan_trtllm_gen():
     attn = PagedAttention(
         dev, workspace_buffer=torch.empty(MB, dtype=torch.uint8, device=dev)
     )
-    with pytest.raises(ValueError, match=rf"needs {need} bytes"):
+    with pytest.raises(ValueError, match=rf"needs {need} bytes") as info:
         attn.plan(make_metadata(p), backend="trtllm-gen", **_plan_kwargs(p))
+    assert str(info.value) == (
+        "backend 'trtllm-gen' cannot plan this batch: " + _workspace_too_small(need, MB)
+    )
     assert attn.backend is None
     # without an LSE output nothing is carved out: the same buffer plans
     attn.plan(
@@ -747,6 +789,191 @@ def test_too_small_workspace_rejected_at_plan_trtllm_gen():
     assert attn.backend == "trtllm-gen"
 
 
+def _lead_with(monkeypatch, *leading):
+    """Replace the auto policy: the ``leading`` candidates are walked first,
+    in that order, then the rest of the set.  The tests below are about the
+    walk, not about what the policy ranks first for a shape."""
+    monkeypatch.setattr(
+        _controller,
+        "plan_order",
+        lambda candidates, cc, facts: (
+            *(name for name in leading if name in candidates),
+            *(name for name in candidates if name not in leading),
+        ),
+    )
+
+
+@needs_cuda
+def test_too_small_workspace_moves_auto_to_the_next_candidate(monkeypatch):
+    """The 32 MiB buffer fa2 cannot plan the M14 graph bucket on is enough
+    for another candidate: with fa2 leading the walk, auto records fa2's
+    rejection (bytes and sizing hint), plans the next candidate that accepts
+    and runs it on that buffer."""
+    p = _exact_problem(seed=6, **M14)
+    res = _resolve_or_skip(p, "auto")
+    if "fa2" not in res.backends or len(res.backends) < 2:
+        pytest.skip("needs fa2 and one more runnable candidate")
+    _lead_with(monkeypatch, "fa2")
+    dev = torch.device(p["device"])
+    ws = torch.empty(32 * MB, dtype=torch.uint8, device=dev)
+    attn = PagedAttention(dev, graph_capacity=_capacity(p), workspace_buffer=ws)
+    attn.plan(make_metadata(p), backend="auto", **_plan_kwargs(p))
+    trace = attn._impl.selection_trace
+    assert trace[0] == (
+        "fa2",
+        "preflight",
+        _workspace_too_small(33816576, 32 * MB),
+    )
+    assert trace[-1] == (attn.backend, "preflight", "accepted")
+    assert attn.backend != "fa2"
+    assert "fa2 [preflight]: needs 33816576 bytes" in attn.explain()
+    out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]))
+    torch.cuda.synchronize(dev)
+    ref_out, ref_lse = reference_paged_prefill(
+        p["q"],
+        p["k_ref"],
+        p["v_ref"],
+        p["qo_indptr_cpu"],
+        p["kv_seq_lens_cpu"],
+        p["block_tables"],
+        p["page_size"],
+        True,
+    )
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+
+# ---------------------------------------------------------------------------
+# The same contract on the host: the real controller walk and the real fa2 /
+# trtllm-gen preflight(), no kernel and no device.
+# ---------------------------------------------------------------------------
+
+_M14_PLAN = dict(
+    num_qo_heads=32,
+    num_kv_heads=8,
+    head_dim_qk=128,
+    q_dtype=torch.bfloat16,
+    lse_mode="base2",
+)
+_M14_CAPACITY = GraphCapacity(
+    batch_size=1,
+    total_q_tokens=2048,
+    max_q_len=2048,
+    max_kv_len=2048,
+    page_size=16,
+    table_width=128,
+)
+# what each backend carves out for the M14 graph bucket with an LSE output
+_M14_NEED = {
+    "fa2": 33816576,
+    # 8 B x 32 heads x 1 request x 2048 tokens + the 1 MiB guard
+    "trtllm-gen": 8 * 32 * 2048 + MB,
+}
+
+
+def _host_controller(monkeypatch, workspace_bytes, *, first):
+    """A graph-mode controller for the M14 bucket on the host, as SM100 sees
+    it (candidates fa2, trtllm-gen and cudnn), walked ``first``, then the
+    other of fa2 / trtllm-gen, then cuDNN.  fa2 and trtllm-gen are the real
+    backends with their real preflight() and a plan() that does nothing; the
+    walk must not get as far as cuDNN."""
+
+    def make_backend(name, device, kv_layout, workspace, *, graph_capacity=None):
+        if name == "fa2":
+            # the constructor reads the device and builds the wrapper;
+            # preflight() reads only these (148 SMs: a B200)
+            backend = object.__new__(_FaBackend)
+            backend.name, backend._workspace = name, workspace
+            backend._graph_capacity = graph_capacity
+            backend._sm_count, backend._smem_optin = 148, None
+        else:
+            assert name == "trtllm-gen", f"the walk reached {name}"
+            backend = _TrtllmGenBackend(device, kv_layout, workspace)
+        backend.plan = lambda meta, derived: None
+        return backend
+
+    monkeypatch.setattr(
+        _selection, "PROBES", {name: (lambda device: None) for name in CAPABILITIES}
+    )
+    monkeypatch.setattr(
+        _controller,
+        "resolve_paged_attention",
+        lambda *, device, **kwargs: resolve_paged_attention(cc_major=10, **kwargs),
+    )
+    monkeypatch.setattr(
+        PagedAttentionController, "_device_binding", lambda self: (10, 0, 0)
+    )
+    monkeypatch.setattr(_controller, "make_backend", make_backend)
+    monkeypatch.setattr(_controller, "derived_needs", lambda name: frozenset())
+    monkeypatch.setattr(_controller, "_expect_not_capturing", lambda what: None)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: "stream")
+    _lead_with(monkeypatch, first, *(n for n in _M14_NEED if n != first))
+    return PagedAttentionController(
+        torch.device("cpu"),
+        graph_capacity=_M14_CAPACITY,
+        workspace_buffer=torch.empty(workspace_bytes, dtype=torch.uint8),
+    )
+
+
+def test_workspace_overflow_is_a_typed_rejection_auto_walks_past(monkeypatch):
+    """backend="auto", fa2 leading on a 32 MiB buffer: fa2's overflow is one
+    more typed preflight rejection, so the walk goes on to trtllm-gen (1.5 MiB
+    of softmax stats) and the trace keeps fa2's bytes."""
+    attn = _host_controller(monkeypatch, 32 * MB, first="fa2")
+    attn.plan(_host_metadata([2048], [2048]), **_M14_PLAN)
+    assert attn.backend == "trtllm-gen"
+    assert attn.selection_trace == (
+        ("fa2", "preflight", _workspace_too_small(33816576, 32 * MB)),
+        ("trtllm-gen", "preflight", "accepted"),
+    )
+    # a buffer of exactly fa2's need: no rejection, the walk ends at fa2
+    attn = _host_controller(monkeypatch, _M14_NEED["fa2"], first="fa2")
+    attn.plan(_host_metadata([2048], [2048]), **_M14_PLAN)
+    assert attn.selection_trace == (("fa2", "preflight", "accepted"),)
+
+
+def test_workspace_overflow_of_every_candidate_is_a_value_error(monkeypatch):
+    """No candidate of the set fits a 1 MiB buffer (trtllm-gen's rejection is
+    typed too, or the walk would stop on it): a ValueError that names each
+    one's bytes, and nothing is published."""
+    attn = _host_controller(monkeypatch, MB, first="fa2")
+    pinned = dataclasses.replace(
+        resolve_paged_attention(
+            cc_major=10,
+            num_qo_heads=32,
+            num_kv_heads=8,
+            head_dim_qk=128,
+            q_dtype=torch.bfloat16,
+            page_size=16,
+            need_lse=True,
+        ),
+        backends=("fa2", "trtllm-gen"),
+    )
+    with pytest.raises(ValueError, match="no pinned candidate") as info:
+        attn.plan(_host_metadata([2048], [2048]), backend=pinned, **_M14_PLAN)
+    for name, need in _M14_NEED.items():
+        assert f"{name}: {_workspace_too_small(need, MB)}" in str(info.value)
+    assert attn.backend is None and attn.selection_trace == ()
+
+
+@pytest.mark.parametrize("backend", sorted(_M14_NEED))
+def test_workspace_overflow_of_a_named_backend_is_a_value_error(monkeypatch, backend):
+    """A named backend never falls back: the typed rejection becomes a plain
+    ValueError whose text is the rejection's (bytes needed and held, the
+    workspace_requirements hint), and nothing is published."""
+    attn = _host_controller(monkeypatch, MB, first=backend)
+    with pytest.raises(ValueError) as info:
+        attn.plan(_host_metadata([2048], [2048]), backend=backend, **_M14_PLAN)
+    rejection = _workspace_too_small(_M14_NEED[backend], MB)
+    assert str(info.value) == f"backend {backend!r} cannot plan this batch: {rejection}"
+    assert "workspace_requirements" in rejection
+    assert type(info.value) is ValueError
+    assert type(info.value.__cause__) is _BackendPlanUnsupportedError
+    assert str(info.value.__cause__) == rejection
+    assert attn.backend is None
+
+
+@needs_cuda
 def test_workspace_requirements_auto_is_max_over_candidates():
     p = _exact_problem(seed=9, **M14)
     dev = torch.device(p["device"])

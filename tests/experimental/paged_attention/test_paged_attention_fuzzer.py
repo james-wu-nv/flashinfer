@@ -313,10 +313,10 @@ def m_block_tables_negative(p):
 
 
 def m_q_noncontig(p):
-    # fused-QKV-style slice: valid semantics, strided storage.  Backends
-    # that can address it (fa2/fa3/trtllm-gen) must be correct; the
-    # token-offset backend (cuDNN) must REJECT rather than silently
-    # mis-address (the #3921 multiplier trap).
+    # fused-QKV-style slice: valid semantics, strided storage.  Every
+    # backend addresses it (cuDNN scales its token offsets by q's token
+    # stride since the graph refactor; the #3921 multiplier trap is gone)
+    # and must be correct.
     p = _clone(p)
     total, h, d = p["q"].shape
     fused = torch.randn(total, 3 * h, d, dtype=p["q"].dtype, device=p["q"].device)

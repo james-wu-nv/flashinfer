@@ -31,6 +31,7 @@ and the work package that fixes them, so they flip to XPASS when fixed; none
 remain at the integrated head.
 """
 
+import dataclasses
 import math
 
 import pytest
@@ -533,6 +534,8 @@ def test_tc02_graph_bakes_the_captured_kv_scales(backend):
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         run(attn, p, out=out, lse=lse, k_scale=ks, v_scale=vs)
+    out.fill_(float("nan"))  # the warm-up left the same result in the buffers
+    lse.fill_(float("nan"))
     g.replay()
     torch.cuda.synchronize()
     assert_matches(out, lse, _scaled(p, v_scale=vs), sm_scale=s * ks, lse_mode="base2")
@@ -565,6 +568,8 @@ def test_tc02_graph_bakes_the_captured_sm_scale(backend):
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         run(attn, p, out=out, lse=lse, sm_scale=s)
+    out.fill_(float("nan"))  # the warm-up left the same result in the buffers
+    lse.fill_(float("nan"))
     g.replay()
     torch.cuda.synchronize()
     assert_matches(out, lse, p, sm_scale=s, lse_mode="base2")
@@ -605,6 +610,24 @@ def _with_indptr(p, ip_cpu):
 
 def _with_kv_lens(p, kv_cpu):
     return dict(p, kv_seq_lens_cpu=kv_cpu, kv_seq_lens=kv_cpu.to(p["device"]))
+
+
+def _without_request_1(p):
+    """The query rows of requests 0 and 2 of a ``_legal()`` batch, and that
+    batch without request 1: the oracle for those rows when request 1 is a
+    padding row."""
+    keep = torch.cat([torch.arange(0, 4), torch.arange(12, 14)]).to(DEVICE)
+    compact = dict(
+        p,
+        q=p["q"][keep],
+        qo_indptr_cpu=torch.tensor([0, 4, 6], dtype=torch.int32),
+        qo_indptr=torch.tensor([0, 4, 6], dtype=torch.int32, device=DEVICE),
+        kv_seq_lens_cpu=p["kv_seq_lens_cpu"][[0, 2]],
+        kv_seq_lens=p["kv_seq_lens"][[0, 2]],
+        block_tables=p["block_tables"][[0, 2]],
+        max_q_len=4,
+    )
+    return keep, compact
 
 
 def _md_rows():
@@ -700,6 +723,21 @@ def _md_rows():
             lambda p: dict(p, max_kv_len=float(p["max_kv_len"])),
             "must be a positive host int",
         ),
+        (
+            "max_q_len_bool",
+            lambda p: dict(p, max_q_len=True),
+            "max_q_len must be a positive host int",
+        ),
+        (
+            "max_kv_len_bool",
+            lambda p: dict(p, max_kv_len=True),
+            "max_kv_len must be a positive host int",
+        ),
+        (
+            "page_size_bool",
+            lambda p: dict(p, page_size=True),
+            "page_size must be a positive host int",
+        ),
         ("dense_page_size4", lambda p: dict(p, page_size=4), "< 8"),
         (
             "kv_lens_exceed_table",
@@ -749,18 +787,8 @@ def test_tc09_zero_kv_row():
         lse_mode="base2",
     )
     out, lse = run(attn, p0)
-    keep = torch.cat([torch.arange(0, 4), torch.arange(12, 14)]).to(DEVICE)
+    keep, q2 = _without_request_1(p)
     assert torch.isfinite(out[keep]).all()  # padding rows may be left unwritten
-    q2 = dict(
-        p,
-        q=p["q"][keep],
-        qo_indptr_cpu=torch.tensor([0, 4, 6], dtype=torch.int32),
-        qo_indptr=torch.tensor([0, 4, 6], dtype=torch.int32, device=DEVICE),
-        kv_seq_lens_cpu=p["kv_seq_lens_cpu"][[0, 2]],
-        kv_seq_lens=p["kv_seq_lens"][[0, 2]],
-        block_tables=p["block_tables"][[0, 2]],
-        max_q_len=4,
-    )
     ref_out, ref_lse = reference(q2, causal=False)
     torch.testing.assert_close(out[keep].float(), ref_out, **OUT_TOL)
     torch.testing.assert_close(lse[keep], ref_lse, **LSE_TOL)
@@ -814,7 +842,8 @@ def test_tc09_zero_q_row(backend, kv_zero):
     (``kv_zero``: and no KV either, vLLM's padded query_start_loc tail).  The
     remaining rows equal the same batch without request 1.  Measured
     natively on B200 for fa2, cuDNN, trtllm-gen and cake before the contract
-    was relaxed; cake declines the kv_len 0 batch (M19) and auto moves on."""
+    was relaxed; cake declines the kv_len 0 batch (M19), which is a
+    ValueError for the pin by name here (``auto`` does not list cake)."""
     p0, compact = _drop_query_rows(_legal(seed=903), 1, kv_zero=kv_zero)
     assert int(p0["qo_indptr_cpu"][1]) == int(p0["qo_indptr_cpu"][2])
     _resolve_or_skip(p0, backend)
@@ -839,10 +868,15 @@ def test_tc09_zero_q_row(backend, kv_zero):
     torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
 
 
-def test_tc09_zero_kv_row_cake_declines():
+def test_tc09_zero_kv_row_cake_declines(monkeypatch):
     """ledger M19: the cake kernel hangs on a kv_len == 0 request, so cake
-    declines padding rows with the typed signal — auto never lands on it and
-    an explicit pin gets a ValueError instead of a hung device."""
+    declines padding rows with the typed signal.  Pinned by name that is a
+    ValueError instead of a hung device; in a walk the batch goes on to the
+    next member.  ``backend="auto"`` does not list cake, so the walk here is
+    over a caller's own Resolution that does, with cake leading (the policy
+    puts a member it does not rank last, where its decline is never met)."""
+    from .test_paged_attention_workspace import _lead_with
+
     p = _legal(seed=902)
     kv0 = p["kv_seq_lens_cpu"].clone()
     kv0[1] = 0
@@ -859,15 +893,28 @@ def test_tc09_zero_kv_row_cake_declines():
     _resolve_or_skip(p0, "cake")
     with pytest.raises(ValueError, match="kv_len == 0"):
         PagedAttention(torch.device(DEVICE)).plan(md, backend="cake", **kw)
-    attn = PagedAttention(torch.device(DEVICE)).plan(md, backend="auto", **kw)
+    auto = _resolve_or_skip(p0, "auto")
+    with_cake = dataclasses.replace(
+        auto,
+        backends=("cake", *auto.backends),
+        excluded={k: v for k, v in auto.excluded.items() if k != "cake"},
+    )
+    _lead_with(monkeypatch, "cake")
+    attn = PagedAttention(torch.device(DEVICE)).plan(md, backend=with_cake, **kw)
+    trace = attn._impl.selection_trace
+    assert trace[0][:2] == ("cake", "preflight") and "kv_len == 0" in trace[0][2]
+    assert trace[-1] == (attn.backend, "preflight", "accepted")
     assert attn.backend != "cake"
-    out, _ = run(attn, p0)
-    # The padding row's output is not asserted finite here: on SM100 auto
-    # lands on trtllm-gen, which leaves a kv_len 0 row's output rows
+    out, lse = run(attn, p0)
+    # The padding row's output is not asserted finite: the member that takes
+    # the batch may be trtllm-gen, which leaves a kv_len 0 row's output rows
     # unwritten (measured on B200 with a NaN-poisoned allocation; fa2 and
-    # cuDNN write zeros), so that assertion held by allocator luck only.
-    # The live rows are pinned by test_tc09_zero_kv_row.
+    # cuDNN write zeros), so that assertion would hold by allocator luck only.
     assert out.shape[0] == int(p0["qo_indptr_cpu"][-1])
+    keep, live = _without_request_1(p)
+    ref_out, ref_lse = reference(live, causal=True)
+    torch.testing.assert_close(out[keep].float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse[keep], ref_lse, **LSE_TOL)
 
 
 _PLAN_ROWS = [
@@ -1441,9 +1488,11 @@ def _tc05_params():
                 id=f"{backend}-k_cache_on_cpu",
             )
         )
-    # backend="auto" must route a narrow table view past trtllm-gen (which
-    # declines it with the typed signal) to a backend that walks the table by
-    # its strides, and the result must be correct
+    # backend="auto" must run a narrow table view correctly, also when the
+    # walk meets trtllm-gen first: it declines the view with the typed signal
+    # and a candidate that walks the table by its strides takes the batch.
+    # The test leads the walk with trtllm-gen where it is a candidate, so its
+    # real decline is met whatever the policy ranks first for this batch.
     rows.append(
         pytest.param("auto", "page_table_narrow_view", id="auto-page_table_narrow_view")
     )
@@ -1462,13 +1511,16 @@ def _blocking_spy(attn):
 
 
 @pytest.mark.parametrize("backend,case", _tc05_params())
-def test_tc05_strided_inputs(backend, case):
-    """Strided views engines actually produce.  fa2/fa3 declare strided Q
-    support, so fused-QKV slices and head-stride gaps MUST run and be correct
-    there; other backends may reject (ValueError) but must never return wrong
-    numbers.  Storage offsets are legal everywhere.  Inner-dim stride 2, a
-    narrow page-table view, independent K/V pool strides and a K cache on the
-    wrong device must be rejected-or-correct, at plan or at run."""
+def test_tc05_strided_inputs(backend, case, monkeypatch):
+    """Strided views engines actually produce.  Every backend reads q by its
+    token and head strides (none declares ``requires_contiguous_q``), so
+    fused-QKV slices, head-stride gaps and storage offsets MUST run and be
+    correct on all of them.  Inner-dim stride 2, a narrow page-table view,
+    independent K/V pool strides and a K cache on the wrong device must be
+    rejected-or-correct, at plan or at run.  ``auto`` must run the narrow
+    table view, and here it does so after trtllm-gen's own decline."""
+    from .test_paged_attention_workspace import _lead_with
+
     p = build_problem(
         [6, 1, 19],
         [40, 9, 70],
@@ -1479,18 +1531,19 @@ def test_tc05_strided_inputs(backend, case):
         dtype=torch.bfloat16,
         seed=500,
     )
-    _resolve_or_skip(p, backend)
+    resolution = _resolve_or_skip(p, backend)
     dev = torch.device(DEVICE)
     total, h, d = p["q"].shape
     g = torch.Generator(device=dev).manual_seed(501)
     required = False  # must-be-correct (vs. reject-or-correct)
+    declines = None  # the candidate leading auto's walk that must decline
     q, k, v, bt = p["q"], p["k_cache"], p["v_cache"], p["block_tables"]
     if case == "fused_qkv_slice":
         fused = torch.randn(total, 3 * h, d, dtype=q.dtype, device=dev, generator=g)
         fused[:, :h] = q
         q = fused[:, :h]
         assert not q.is_contiguous() and q.stride(-1) == 1
-        required = backend in ("fa2", "fa3")
+        required = True
     elif case == "storage_offset":
         big = torch.randn(total + 16, h, d, dtype=q.dtype, device=dev, generator=g)
         big[8 : 8 + total] = q
@@ -1502,7 +1555,7 @@ def test_tc05_strided_inputs(backend, case):
         big[:, ::2] = q
         q = big[:, ::2]
         assert q.stride(1) == 2 * d and q.stride(-1) == 1
-        required = backend in ("fa2", "fa3")
+        required = True
     elif case == "q_last_dim_stride2":
         big = torch.randn(total, h, 2 * d, dtype=q.dtype, device=dev, generator=g)
         big[:, :, ::2] = q
@@ -1524,6 +1577,13 @@ def test_tc05_strided_inputs(backend, case):
         bt = wide[:, :w]
         assert bt.stride(0) == 2 * w
         required = backend == "auto"
+        if backend == "auto" and "trtllm-gen" in resolution.backends:
+            # Which candidate the policy ranks first for a batch this small
+            # is not the subject: trtllm-gen is the one that declines a narrow
+            # view, so it leads the walk.  Without it (not a Blackwell part)
+            # no candidate declines and auto runs in the policy's own order.
+            declines = "trtllm-gen"
+            _lead_with(monkeypatch, declines)
     elif case == "k_cache_on_cpu":
         k = k.cpu()
     else:  # pragma: no cover
@@ -1536,6 +1596,12 @@ def test_tc05_strided_inputs(backend, case):
         assert not required, f"{backend} rejected a supported strided input: {e}"
         assert str(e)
         return
+    if declines is not None:
+        trace = attn._impl.selection_trace
+        assert trace[0][:2] == (declines, "preflight")
+        assert "contiguous (batch, width) block_tables" in trace[0][2]
+        assert trace[-1] == (attn.backend, "preflight", "accepted")
+        assert attn.backend != declines
     if case == "k_cache_on_cpu":
         _blocking_spy(attn)
         with pytest.raises(ValueError):
@@ -1769,6 +1835,9 @@ def test_tc07_graph_cross_feature_replay(backend, feature):
                 plan(attn, p, backend, window_left=window_left, lse_mode=lse_mode)
             finally:
                 torch.cuda.set_sync_debug_mode("default")
+        # the warm-up (and the previous round) left a result in the buffers
+        out.fill_(float("nan"))
+        lse.fill_(float("nan"))
         g.replay()
         torch.cuda.synchronize()
         assert_matches(

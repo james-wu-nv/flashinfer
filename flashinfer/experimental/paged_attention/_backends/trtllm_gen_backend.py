@@ -7,8 +7,8 @@ from); the only derivations are cum_kv_seq_lens and the bmm scale fold
 (bmm1 = sm_scale * k_scale, bmm2 = v_scale; 1.0 for an omitted scale).
 Attention sinks are a native run-time argument.
 
-Buffers: the controller's scratch workspace (the 128 MiB per-device default
-or the caller's buffer) is ordinary softmax-stats/scratch and is the shared
+Buffers: the controller's scratch workspace (the per-device default or the
+caller's buffer) is ordinary softmax-stats/scratch and is the shared
 one every backend runs on (the legacy wrapper's trtllm-gen branch uses its
 shared float workspace the same way).  The kernel's multi-CTA KV
 *counters* are the only thing that must be zero-initialized; they live in a
@@ -77,8 +77,10 @@ class _TrtllmGenBackend:
         if self.name == "cake" and int(meta.kv_seq_lens_cpu.min()) == 0:
             # Measured on B200 (cake_fmha context, bf16, page 16): a request
             # with kv_len == 0 never returns — the device hangs (ledger M19).
-            # Padding rows are legal input, so cake declines the batch and
-            # backend="auto" moves on to trtllm-gen / cuDNN / fa2.
+            # Padding rows are legal input, so cake declines the batch
+            # (typed).  backend="auto" never lists cake, so this reaches the
+            # caller as a ValueError unless cake sits in a caller's own
+            # Resolution, whose next member is then tried.
             raise _BackendPlanUnsupportedError(
                 "cake cannot run a batch with a kv_len == 0 request (the kernel "
                 "hangs on an empty KV range); padding rows need trtllm-gen, "
@@ -102,10 +104,13 @@ class _TrtllmGenBackend:
                 "table; extra columns past max_kv_len are fine)"
             )
 
+        # Scratch the launcher would carve past the end of the workspace (the
+        # softmax stats of an LSE plan).  Typed like the checks above: another
+        # candidate may fit the same buffer.
         need = self.workspace_need(meta)
         if need > self._workspace.numel():
-            raise ValueError(
-                _workspace_too_small(self.name, need, self._workspace.numel())
+            raise _BackendPlanUnsupportedError(
+                _workspace_too_small(need, self._workspace.numel())
             )
 
     @staticmethod

@@ -21,27 +21,34 @@ from typing import Dict, Optional
 import torch
 
 
-class _BackendPlanUnsupportedError(RuntimeError):
+class _BackendPlanUnsupportedError(ValueError):
     """Typed signal for a plan-time (batch-specific) preflight rejection.
 
     Mirrors the private type of the same name in
     ``flashinfer/mla/_batch_mla/_backends/_capabilities.py`` (also a
-    ``RuntimeError`` subclass); the two are to be unified once the shared
+    ``ValueError`` subclass); the two are to be unified once the shared
     location is decided.  A backend raises it from ``preflight(meta)`` -- before
     any live-state write -- for a batch it cannot run although the static
     capability check admitted the configuration.  The controller treats it as
-    "try the next pinned candidate"; every other exception (invalid input, OOM,
-    JIT/compile failure) propagates unchanged, and ``run()`` never falls back.
+    "try the next pinned candidate" and, when the backend was named or no
+    candidate is left, raises a plain ``ValueError`` carrying the reason.  Its
+    handler names this type, so every other exception (invalid input -- a plain
+    ``ValueError`` included --, OOM, JIT/compile failure) propagates unchanged,
+    and ``run()`` never falls back.
     """
 
 
-def _workspace_too_small(backend: str, need: int, available: int) -> str:
-    """Message for a plan-time rejection of a scratch workspace the backend's
-    planner would overflow (raised as ``ValueError`` from ``preflight()``, so
-    it surfaces before the kernel-side allocator error)."""
+def _workspace_too_small(need: int, available: int) -> str:
+    """Reason for a plan-time rejection of a scratch workspace the backend's
+    planner would overflow.  Raised as the typed signal from ``preflight()``,
+    before the kernel-side allocator error: ``auto`` moves on to the next
+    candidate (the bytes stay in the selection trace), and a named backend, or
+    a set in which no candidate fits, surfaces it as a ``ValueError`` with
+    this text after the backend's name (the controller adds the name, as it
+    does for every preflight reason)."""
     return (
-        f"backend {backend!r} needs {need} bytes of scratch workspace for this "
-        f"batch but the workspace buffer holds {available} bytes; size a "
+        f"needs {need} bytes of scratch workspace for this batch but the "
+        f"workspace buffer holds {available} bytes; size a "
         "caller-owned buffer with PagedAttention.workspace_requirements(...) "
         "and pass it as PagedAttention(workspace_buffer=...)"
     )
@@ -74,10 +81,14 @@ class PagedAttentionCapabilities:
     supports_noncausal: bool
     supports_window: bool
     # True if the backend addresses q as packed THD (token stride == H*D);
-    # False if any view with q.stride(-1) == 1 is addressable (the controller
-    # requires the unit inner stride for everyone).  Measured per backend by
+    # False if every view the controller admits is addressable (unit inner
+    # stride, token-major, 16-byte aligned: required for everyone, see
+    # run()).  Measured per backend by
     # tests/experimental/paged_attention/test_paged_attention_strides.py
-    # (NATIVE_Q_OUTCOME).
+    # (NATIVE_Q_OUTCOME).  q reaches the library only at run(), after plan()
+    # ranked the auto candidates, so the rank cannot route around a True
+    # here: an auto candidate must declare False (no backend declares True
+    # today).
     requires_contiguous_q: bool
     # sliding window together with non-causal attention (trtllm-gen ships no
     # such context kernel; irrelevant where either axis is already False)
@@ -287,11 +298,25 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         supports_lse=True,
         supports_noncausal=True,  # bottom_right mask off + padding mask: verified H100
         supports_window=False,  # no sliding window in the cuDNN SDPA graph path
-        # cuDNN builds its graph from q.stride() but scales the token-unit
-        # ragged offsets by num_qo_heads*head_dim, so only packed THD is
-        # addressed correctly: a fused-QKV head slice or a padded head stride
-        # is silently wrong (native probe, B200); a storage offset is fine.
-        requires_contiguous_q=True,
+        # The cuDNN graph declares q with q's own strides and is keyed on
+        # them, and the token-unit ragged offsets are scaled by q's token
+        # stride (flashinfer/cudnn/prefill.py: the graph's ragged-offset
+        # multiplier on the direct path, ``offsets * q.stride(0)`` on the
+        # element-offset path), so the views the controller admits (unit
+        # inner stride, token-major, 16-byte aligned) are addressed
+        # correctly.  Measured on SM100 (2026-11-10/11; cuDNN 9.27 / frontend
+        # 1.32 and cuDNN 9.25 / frontend 1.29) through the unified API
+        # against the oracle: a fused-QKV head slice, a slice from the middle
+        # of a fused buffer, a padded head stride, a storage offset, token
+        # stride 2 and a padded token stride; the first four also on the
+        # functional entry and replayed from a CUDA graph across update(),
+        # with and without LSE (max out err 8.5e-3, the packed q's own).  A
+        # zero token stride (an expanded q) is not addressed -- the graph
+        # refuses it, the element-offset path misreads it -- and the
+        # controller refuses it for every backend.  Before the cuDNN graph
+        # refactor (#5350 / #5161) the offsets were scaled by
+        # num_qo_heads * head_dim and a strided view was silently wrong.
+        requires_contiguous_q=False,
         needs_dense=True,
         # the cuDNN SDPA graph path exposes none of the three
         supports_logits_soft_cap=False,

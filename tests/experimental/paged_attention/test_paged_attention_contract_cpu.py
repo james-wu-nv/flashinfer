@@ -17,11 +17,13 @@ Known gaps recorded as strict xfails (they flip to XPASS when fixed):
 
 import dataclasses
 import inspect
+import itertools
 import os
 import subprocess
 import sys
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -36,6 +38,12 @@ from flashinfer.experimental.paged_attention import (
     _selection,
     heuristic_order,
     resolve_paged_attention,
+)
+from flashinfer.experimental.paged_attention._auto_policy import (
+    _AUTO_BACKEND_CANDIDATES,
+)
+from flashinfer.experimental.paged_attention._backends import (
+    _BackendPlanUnsupportedError,
 )
 from flashinfer.experimental.paged_attention._contracts import (
     LSE_MODES,
@@ -474,9 +482,16 @@ def test_probes_run_only_for_capability_admitted_backends(monkeypatch):
         (dict(num_qo_heads=7), "divisible"),
         (dict(num_qo_heads=0), "positive"),
         (dict(num_kv_heads=0), "positive"),
+        (dict(num_qo_heads=8.0), "num_qo_heads must be a positive host int"),
+        (dict(num_kv_heads=np.int64(2)), "num_kv_heads must be a positive host int"),
+        (dict(num_qo_heads=True, num_kv_heads=True), "positive host int"),
+        (dict(head_dim_qk=128.0), "head_dim_qk must be a positive host int"),
+        (dict(head_dim_vo=np.int64(128)), "head_dim_vo must be a positive host int"),
+        (dict(head_dim_qk=0), "head_dim_qk must be a positive host int"),
         (dict(kv_input_form="csr"), "kv_input_form"),
         (dict(window_left=-2), "window_left"),
         (dict(page_size=0), "page_size"),
+        (dict(page_size=True), "page_size must be a positive host int"),
         (dict(page_size=4), f"< {MIN_DENSE_PAGE_SIZE}"),
     ],
 )
@@ -816,6 +831,123 @@ def test_controller_rejects_calls_before_plan_without_cuda():
             head_dim_qk=128,
             q_dtype=torch.bfloat16,
         )
+
+
+class _HostMetadata(PagedAttentionMetadata):
+    """A batch on the host.  The real class requires CUDA tensors and derives
+    device forms; plan()'s argument checks and candidate walk need neither,
+    so this one skips the construction-time validation and derives nothing."""
+
+    def __post_init__(self):
+        pass
+
+    @property
+    def total_q_tokens(self):
+        return int(self.qo_indptr_cpu[-1])
+
+    def validate_causal_envelope(self):
+        pass
+
+    def derived(self, *, needs, max_kv_len=None):
+        return Derived(needs=frozenset())
+
+
+def _host_metadata(q_lens, kv_lens, *, page_size=16):
+    qo_indptr = torch.tensor([0, *itertools.accumulate(q_lens)], dtype=torch.int32)
+    kv = torch.tensor(kv_lens, dtype=torch.int32)
+    return _HostMetadata(
+        qo_indptr=qo_indptr.clone(),
+        kv_seq_lens=kv.clone(),
+        page_size=page_size,
+        max_q_len=max(q_lens),
+        max_kv_len=max(kv_lens),
+        block_tables=torch.zeros(
+            len(q_lens), -(-max(kv_lens) // page_size), dtype=torch.int32
+        ),
+        qo_indptr_cpu=qo_indptr,
+        kv_seq_lens_cpu=kv,
+    )
+
+
+_HEADS = dict(num_qo_heads=16, num_kv_heads=4)
+# (id, plan() overrides, message): values a Resolution's config key, which
+# compares with ``==``, takes for 16 / 4, and plainly wrong ones
+_BAD_HEADS = [
+    (
+        "float",
+        dict(num_qo_heads=16.0),
+        "num_qo_heads must be a positive host int, got 16.0",
+    ),
+    (
+        "numpy-int",
+        dict(num_qo_heads=np.int64(16)),
+        "num_qo_heads must be a positive host int",
+    ),
+    (
+        "bool",
+        dict(num_qo_heads=True, num_kv_heads=True),
+        "num_qo_heads must be a positive host int, got True",
+    ),
+    ("zero", dict(num_kv_heads=0), "num_kv_heads must be a positive host int, got 0"),
+    (
+        "kv-float",
+        dict(num_kv_heads=4.0),
+        "num_kv_heads must be a positive host int, got 4.0",
+    ),
+    ("indivisible", dict(num_kv_heads=3), r"num_qo_heads \(16\) must be divisible"),
+    # head dims go through the same door: 128.0 equals 128 in a capability
+    # table and used to reach the FA backends' JIT module name
+    (
+        "dim-float",
+        dict(head_dim_qk=128.0),
+        "head_dim_qk must be a positive host int, got 128.0",
+    ),
+    (
+        "dim-vo-numpy-int",
+        dict(head_dim_vo=np.int64(128)),
+        "head_dim_vo must be a positive host int",
+    ),
+    ("dim-bool", dict(head_dim_qk=True), "head_dim_qk must be a positive host int"),
+]
+
+
+@pytest.mark.parametrize("path", ["auto", "named", "pinned"])
+@pytest.mark.parametrize(
+    "heads,match", [row[1:] for row in _BAD_HEADS], ids=[row[0] for row in _BAD_HEADS]
+)
+def test_plan_checks_head_counts_alike_on_every_backend_path(
+    no_probes, path, heads, match
+):
+    """One check, whatever the ``backend`` argument: a head count or head
+    dim that is not a positive host int, or head counts that do not divide,
+    are refused by plan() itself, with
+    the same message for auto, a named backend and a pinned Resolution -- not
+    by the auto policy on the plans that happen to rank -- and before
+    anything is resolved or published."""
+    backend = {"auto": "auto", "named": "fa2", "pinned": _resolve(10, **_HEADS)}[path]
+    ctl = PagedAttentionController(torch.device("cpu"))
+    kwargs = dict(_HEADS, head_dim_qk=128, q_dtype=torch.bfloat16, lse_mode="base2")
+    kwargs.update(heads)
+    with pytest.raises(ValueError, match=match) as error:
+        ctl.plan(_host_metadata([4, 4], [64, 64]), backend=backend, **kwargs)
+    assert "auto policy" not in str(error.value)
+    assert ctl.backend is None and ctl.resolution is None
+
+
+def test_typed_rejection_is_a_value_error():
+    """The typed preflight signal has the base class of the MLA type it
+    mirrors.  (The controller's handler names the subclass, so a plain
+    ValueError from a backend stays invalid input and is never a decline;
+    the selection and auto-policy suites inject one to check that.)"""
+    assert issubclass(_BackendPlanUnsupportedError, ValueError)
+
+
+def test_auto_candidates_take_any_unit_inner_stride_query():
+    """q's storage layout reaches the library only at run(), after plan() has
+    ranked the auto candidates, so the rank cannot route around a candidate
+    that needs packed q: none may declare it."""
+    for name in _AUTO_BACKEND_CANDIDATES:
+        assert not CAPABILITIES[name].requires_contiguous_q, name
 
 
 def test_public_class_validates_workspace_buffer_without_cuda():

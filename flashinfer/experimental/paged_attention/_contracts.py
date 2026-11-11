@@ -43,6 +43,34 @@ def _expect_window_left(window_left: int) -> None:
     )
 
 
+def _expect_heads(num_qo_heads: int, num_kv_heads: int) -> None:
+    # One check for resolve_paged_attention() and plan(), whatever the
+    # backend argument: the auto policy divides by these, the backends size
+    # launch grids and buffers from them, and a Resolution's config key
+    # compares them with ``==`` (which numpy ints, floats and bools pass).
+    for name, value in (("num_qo_heads", num_qo_heads), ("num_kv_heads", num_kv_heads)):
+        _expect(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 1,
+            f"{name} must be a positive host int, got {value!r}",
+        )
+    _expect(
+        num_qo_heads % num_kv_heads == 0,
+        f"num_qo_heads ({num_qo_heads}) must be divisible by "
+        f"num_kv_heads ({num_kv_heads}) for GQA/MQA",
+    )
+
+
+def _expect_head_dims(head_dim_qk: int, head_dim_vo: int) -> None:
+    # Checked with the head counts, for the same callers: the capability
+    # tables compare these with ``==`` (which 128.0 passes), and the FA
+    # backends put them into a JIT module name.
+    for name, value in (("head_dim_qk", head_dim_qk), ("head_dim_vo", head_dim_vo)):
+        _expect(
+            isinstance(value, int) and not isinstance(value, bool) and value >= 1,
+            f"{name} must be a positive host int, got {value!r}",
+        )
+
+
 def _normalize_logits_soft_cap(logits_soft_cap: Optional[float]) -> Optional[float]:
     """``None`` / ``0`` mean "no soft cap" (the legacy convention); anything
     else must be a positive finite host float and is returned as ``float``."""
@@ -91,7 +119,9 @@ def _expect_custom_mask(
 
 def _expect_page_size(page_size: int, kv_input_form: str) -> None:
     _expect(
-        isinstance(page_size, int) and page_size >= 1,
+        isinstance(page_size, int)
+        and not isinstance(page_size, bool)
+        and page_size >= 1,
         f"page_size must be a positive host int, got {page_size!r}",
     )
     if kv_input_form == "block_tables":

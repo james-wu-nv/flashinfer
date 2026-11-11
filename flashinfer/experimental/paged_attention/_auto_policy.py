@@ -158,12 +158,33 @@ def ordered_sm12x_backends(facts: _PlanFacts) -> Tuple[str, ...]:
 
 
 def _in_sm100_cudnn_region(facts: _PlanFacts) -> bool:
-    """The legacy wrapper's qualified cuDNN domain, condition for condition.
+    """Whether cuDNN leads on SM100: the legacy wrapper's qualified domain.
 
     Duplicates ``flashinfer.prefill._blackwell_paged_auto_cudnn`` and the
     feature conditions around its call in
     ``BatchPrefillWithPagedKVCacheWrapper.plan()`` that have a counterpart
-    here; tests pin the two against each other.
+    here.  On eager facts the two are equal, and a test pins them against
+    each other.
+
+    CUDA-graph facts mix two sources, and the answer follows both:
+
+    * ``max_q_len`` / ``max_kv_len`` / ``total_q_tokens`` are the graph
+      capacity's.  The prefix and full-prefill bound tests and the cheap work
+      bound read those.  A capacity cannot show ``max_q == max_kv`` for a
+      full prefill whose length is not a page multiple, so the full-prefill
+      bound test is ``1024 <= max_q <= max_kv <= 8192`` there.  That is wider
+      than the legacy predicate, which is given the batch's own maxima; the
+      same test checks that graph facts admit everything the legacy predicate
+      admits and differ only by this widening.
+    * ``qo_indptr`` / ``kv_seq_lens`` are the lengths of the batch being
+      planned.  The exact work (``>= 8 Mi``) and the ``q_i == kv_i`` proof of
+      full prefill read those.  A graph-mode instance ranks once, on its
+      first plan, so they are the first batch's: two instances with one
+      capacity can freeze different backends, and later batches are not
+      checked against the region.
+
+    Without host lengths only the prefix bounds can admit; full prefill is
+    never assumed from the bounds.
     """
     if not (
         facts.causal

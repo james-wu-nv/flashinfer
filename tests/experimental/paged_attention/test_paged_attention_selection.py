@@ -15,6 +15,7 @@ from flashinfer.experimental.paged_attention import (
     HEURISTIC_ORDER,
     GraphCapacity,
     Resolution,
+    _controller,
     heuristic_order,
 )
 from flashinfer.experimental.paged_attention._backends import (
@@ -264,6 +265,68 @@ def test_explicit_backend_never_falls_back(monkeypatch):
     with pytest.raises(ValueError, match="no pinned candidate.*fa2: declined"):
         attn.plan(make_metadata(p), backend=res, **_plan_kw(p))
     assert attn.backend is None
+
+
+@needs_cuda
+def test_graph_replan_publishes_the_frozen_backend_alone(monkeypatch):
+    """A graph-mode instance ranks once.  A re-plan, through plan() as well
+    as update(), can only choose the captured backend: that is what
+    ``selection_order``, the trace and explain() then report, identically on
+    both paths, and the policy is not consulted."""
+    p = make_problem(seed=101, **_SHAPE)
+    res = _resolve_or_skip(p, "auto")
+    if len(res.backends) < 2:
+        pytest.skip("needs two runnable candidates")
+    attn = PagedAttention(torch.device(p["device"]), use_cuda_graph=True)
+    attn.plan(make_metadata(p), **_plan_kw(p))
+    impl, frozen = attn._impl, attn.backend
+    # the first plan could choose from the whole set
+    assert sorted(impl.selection_order) == sorted(res.backends)
+
+    def forbidden_ranking(*args, **kwargs):
+        pytest.fail("a graph-mode re-plan must not rank the candidates")
+
+    monkeypatch.setattr(_controller, "plan_order", forbidden_ranking)
+    attn.plan(make_metadata(p), **_plan_kw(p))
+    assert attn.backend == frozen and impl.selection_order == (frozen,)
+    assert impl.selection_trace == ((frozen, "preflight", "accepted"),)
+    replanned = attn.explain()
+    assert f"plan-time order: ['{frozen}']" in replanned
+    attn.update(make_metadata(p))
+    assert attn.backend == frozen and impl.selection_order == (frozen,)
+    assert impl.selection_trace == ((frozen, "preflight", "accepted"),)
+    assert attn.explain() == replanned
+
+
+def test_graph_replan_publishes_the_frozen_backend_alone_on_the_host(monkeypatch):
+    """The same without a device, on the workspace suite's host controller
+    (the real walk over fa2 / trtllm-gen / cudnn with fa2 leading, no
+    kernel), where the first plan's order is known."""
+    from .test_paged_attention_contract_cpu import _host_metadata
+    from .test_paged_attention_workspace import MB, _M14_PLAN, _host_controller
+
+    attn = _host_controller(monkeypatch, 64 * MB, first="fa2")
+    attn.plan(_host_metadata([2048], [2048]), **_M14_PLAN)
+    assert attn.backend == "fa2"
+    assert attn.selection_order == ("fa2", "trtllm-gen", "cudnn")
+
+    def forbidden_ranking(*args, **kwargs):
+        pytest.fail("a graph-mode re-plan must not rank the candidates")
+
+    monkeypatch.setattr(_controller, "plan_order", forbidden_ranking)
+    # plan() re-resolves the whole set, in which fa2 is not the first member,
+    # and narrows it to the frozen backend before the walk ...
+    attn.plan(_host_metadata([2048], [2048]), **_M14_PLAN)
+    assert attn.backend == "fa2" and attn.selection_order == ("fa2",)
+    assert attn.selection_trace == (("fa2", "preflight", "accepted"),)
+    replanned = attn.explain()
+    assert "plan-time order: ['fa2']" in replanned
+    assert "not the backend the first graph-mode plan froze" in replanned
+    # ... which is the Resolution update() re-plans within: same report
+    attn.update(_host_metadata([2048], [2048]))
+    assert attn.backend == "fa2" and attn.selection_order == ("fa2",)
+    assert attn.selection_trace == (("fa2", "preflight", "accepted"),)
+    assert attn.explain() == replanned
 
 
 @needs_cuda

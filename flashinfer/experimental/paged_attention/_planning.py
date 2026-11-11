@@ -235,7 +235,7 @@ def validate_structure(
     _expect_page_size(page_size, kv_input_form)
     for nm, v in (("max_q_len", max_q_len), ("max_kv_len", max_kv_len)):
         _expect(
-            isinstance(v, int) and v >= 1,
+            isinstance(v, int) and not isinstance(v, bool) and v >= 1,
             f"{nm} must be a positive host int (required; it kills the "
             f"hidden device sync), got {v!r}",
         )

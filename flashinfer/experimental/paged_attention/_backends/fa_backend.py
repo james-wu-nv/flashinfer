@@ -283,7 +283,9 @@ class _FaBackend:
         )
 
     def preflight(self, meta: PlanMetadata) -> None:
-        """Batch-specific checks; typed unsupported only, no allocation."""
+        """Batch-specific checks, no allocation: typed unsupported for what
+        another candidate may still serve (the workspace check included); the
+        one plain ValueError at the end is not a fallback case."""
         if self.name == "fa3":
             from ....utils import is_sm90a_supported
 
@@ -436,10 +438,13 @@ class _FaBackend:
         return need
 
     def _check_workspace(self, meta: PlanMetadata) -> None:
-        """Reject a batch whose planner allocation cannot fit the workspace
-        before the planner itself overflows (kernel-side RuntimeError).  The
-        O(1) bound settles almost every plan; the per-batch replay runs only
-        when the bound exceeds the buffer."""
+        """Decline (typed) a batch whose planner allocation cannot fit the
+        workspace, before the planner itself overflows (kernel-side
+        RuntimeError): auto moves on to a candidate that fits, a named fa2
+        surfaces it as a ValueError naming the bytes.  ``workspace_need`` is a
+        lower bound on the planner's allocation, so the decline is never
+        spurious.  The O(1) bound settles almost every plan; the per-batch
+        replay runs only when the bound exceeds the buffer."""
         avail = self._workspace.numel()
         cap = self._graph_capacity
         bound = self.workspace_bound(
@@ -461,7 +466,7 @@ class _FaBackend:
             return
         need = self.workspace_need(meta)
         if need > avail:
-            raise ValueError(_workspace_too_small(self.name, need, avail))
+            raise _BackendPlanUnsupportedError(_workspace_too_small(need, avail))
 
     # --------------------------- direct launch ---------------------------
 
