@@ -402,8 +402,9 @@ def test_trtllm_gen_noncausal_is_declared_but_not_with_a_window():
     excluded at resolve rather than failing at plan."""
     res = resolve_paged_attention(cc_major=10, **dict(_CFG, causal=False))
     assert "trtllm-gen" in res.backends
-    # no backend is left: trtllm-gen / cake have no kernel, cuDNN no window,
-    # and the fa2 kernel computes it wrong (M20) so it is declared unsupported
+    # no backend is left: trtllm-gen / cake have no kernel, this API's cuDNN
+    # backend declares no window, and the fa2 kernel computes it wrong (M20)
+    # so it is declared unsupported
     with pytest.raises(ValueError, match="no runnable backend") as ei:
         resolve_paged_attention(cc_major=10, **dict(_CFG, causal=False, window_left=16))
     detail = str(ei.value)
@@ -411,7 +412,7 @@ def test_trtllm_gen_noncausal_is_declared_but_not_with_a_window():
         "trtllm-gen: sliding window with non-causal attention not supported" in detail
     )
     assert "fa2: sliding window with non-causal attention not supported" in detail
-    assert "cudnn" in detail  # no window at all
+    assert "cudnn" in detail  # its row declares no window at all
 
 
 # --------------------------------------------------------------------------

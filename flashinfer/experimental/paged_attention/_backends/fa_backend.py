@@ -21,9 +21,10 @@ Features: ``logits_soft_cap`` and ``custom_mask`` go to the wrapper's plan()
 per-request layout, ANDed here with the causal / sliding-window envelope
 because MaskMode.CUSTOM replaces the kernel's causal mask).  Attention sinks
 are the ``AttentionSink`` JIT variant (``BatchAttentionWithAttentionSinkWrapper``):
-the default wrapper's ``run(sinks=)`` is forwarded to the kernel only on the
-trtllm-gen path, so a sink plan selects the variant wrapper here and passes
-the sink tensor as the variant's additional run() argument.
+the default wrapper's ``run(sinks=)`` reaches the kernel only on the
+trtllm-gen path, and its standard fa2 / fa3 adapter refuses a sink tensor
+(``NotImplementedError``), so a sink plan selects the variant wrapper here and
+passes the sink tensor as the variant's additional run() argument.
 """
 
 from __future__ import annotations
@@ -569,7 +570,7 @@ class _FaBackend:
             w._batch_size,
             w._qo_indptr_buf,
             w._paged_kv_indptr_buf,
-            None,  # sinks (the default wrapper forwards them on trtllm-gen only)
+            None,  # sinks (paged_run refuses one on fa2 / fa3; trtllm-gen only)
             None,  # NVFP4 key block scales
             None,  # NVFP4 value block scales
             None,  # skip_softmax_threshold_scale_factor
@@ -756,7 +757,8 @@ class _FaBackend:
             args[_ARG_LSE] = lse_v
             args[_ARG_SM_SCALE] = sm_scale
             module.paged_run(*args)
-            r = (out_v, lse_v) if need_lse else out_v  # as the wrapper's run() returns
+            # as the wrapper's run() returns
+            r: Any = (out_v, lse_v) if need_lse else out_v
         elif self._use_sinks:
             # AttentionSink variant: the sink tensor and sm_scale are the
             # module's additional run() arguments (positional, in that order);

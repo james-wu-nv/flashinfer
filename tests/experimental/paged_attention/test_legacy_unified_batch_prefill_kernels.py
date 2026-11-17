@@ -26,7 +26,8 @@ tolerance; the fp32 oracle is added only where the legacy check is relative
 The legacy ``use_cuda_graph=True`` rows were an unconditional xfail (the
 wrapper's workspace overflowed); here they run the unified graph lifecycle
 with a workspace sized by ``workspace_requirements``.  Ragged, single-prefill
-and torch.compile functions of the legacy file are out of scope.
+and torch.compile functions of the legacy file are out of scope, and so is its
+test of the wrapper's private ``_kv_lens_buffer`` staging.
 """
 
 import pytest
@@ -216,6 +217,15 @@ LEGACY_MAP = [
         ["test_paged_prefill_split_kv_empty_chunk"],
         "equivalent",
         "same fixture on fa2, legacy 1e-2 vs ref_single_prefill on output and LSE",
+    ),
+    (
+        "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_fa2_plan_skips_kv_lens_buffer",
+        [],
+        "out-of-scope",
+        "the legacy wrapper's private _kv_lens_buffer (its plan() skips the host "
+        "length copy on fa2 and keeps it for a retained cuDNN capture): wrapper "
+        "staging, not paged-prefill behaviour; the unified fa backend forwards that "
+        "buffer to the kernel call unread",
     ),
 ]
 

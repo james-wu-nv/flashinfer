@@ -18,8 +18,7 @@ builds) and run() goes through a prepared ``CudnnPrefillGraph`` with
 call.  The staged declaration is the one ``cudnn_batch_prefill_with_kv_cache``
 resolves from the same arguments, so both reach the same cached cuDNN graph.
 That functional entry remains the fallback where no plan can be staged (a
-cuDNN / frontend without the direct token-offset path) and the packed-LSE
-probe.
+cuDNN without the direct token-offset path) and the packed-LSE probe.
 
 Declared shape: an eager plan declares a shape class rather than the batch's
 exact maxes, so the plans of a serving loop share one cuDNN graph
@@ -122,8 +121,17 @@ def _packed_lse_supported(device: torch.device, workspace: torch.Tensor) -> bool
     from ....cudnn.prefill import _cudnn_supports_direct_seqlens
 
     ok = False
-    # the ragged-offset multipliers this relies on belong to the direct
-    # (cu_seq_len) path the library gates by version; probe only there
+    # The ragged-offset multipliers this relies on belong to the direct
+    # token-offset path the library gates by version; probe only there.
+    # This is the mixed-form gate (cuDNN 9.25), one version above the gate a
+    # plan is staged under (_stage_cudnn_plan: 9.24 for explicit lengths).
+    # On 9.24 the entry would take the direct path for the toy problem too,
+    # but this backend's ragged stats offset has not been run on that
+    # version: an error other than the one caught below would fail every
+    # LSE plan that reaches the probe, and a probe that returned would
+    # select packed stats no test of this package has compared with the
+    # reference there.  Unprobed, a 9.24 plan keeps the padded stats and the
+    # gather.
     if _cudnn_supports_direct_seqlens(torch.bfloat16, mixed=True):
         import cudnn
 
@@ -169,7 +177,7 @@ class _CudnnBackend:
         self._device = device
         # Prepared path.  plan() stages the plan-owned cuDNN metadata, graph
         # descriptor keys and static bindings (None: no plan can be staged on
-        # this cuDNN / frontend and run() takes the functional entry).  The
+        # this cuDNN and run() takes the functional entry).  The
         # cuDNN graph is also keyed on the q / K / V layouts and the scale
         # float, which only run() sees, so run() fetches it once per
         # signature and keeps it in the short most-recent-first history
@@ -233,7 +241,10 @@ class _CudnnBackend:
         of 1 to 16) both declare the same shapes, except through a caller
         table narrower than the KV class, where that path keeps both bounds
         exact.  For a shorter query its formula would declare 64, where the
-        bound stays exact here.
+        bound stays exact here.  That path applies them on compute capability
+        (10, 0) and (10, 3) only and declares the plan's own maxes elsewhere,
+        as it does for an explicit cuDNN backend; this backend applies them
+        on every architecture.
 
         CUDA-graph mode keeps the capacity's values: a captured graph serves
         every later batch of its bucket and cannot follow one batch's class.
@@ -336,13 +347,17 @@ class _CudnnBackend:
         """
         from ....cudnn import prefill as cudnn_prefill
 
-        # The library's own gate (cuDNN 9.25 / frontend 1.27: per-request KV
-        # lengths next to token-unit Q offsets), read as a module attribute on
-        # every plan because tests steer it.  Below it the entry converts the
-        # offsets to element units on each call; a plan staged once would
-        # freeze that copy while the offsets keep changing in place (graph
-        # mode), so run() keeps calling the entry there.
-        if not cudnn_prefill._cudnn_supports_direct_seqlens(meta.q_dtype, mixed=True):
+        # The library's own gate for the form staged here, token-unit offsets
+        # next to explicit per-request Q and KV lengths (cuDNN 9.24 for f16 /
+        # bf16; the helper the legacy wrapper's plan() and the entry's own
+        # resolution ask), read as a module attribute on every plan because
+        # tests steer it.  Below it the entry converts the offsets to element
+        # units on each call; a plan staged once would freeze that copy while
+        # the offsets keep changing in place (graph mode), so run() keeps
+        # calling the entry there.
+        if not cudnn_prefill._cudnn_supports_paged_token_offsets(
+            meta.q_dtype, explicit_q=True, explicit_kv=True
+        ):
             return None
         b = meta.batch_size
         metadata = cudnn_prefill._PrefillMetadata(

@@ -855,7 +855,7 @@ class PagedAttentionController:
         #    (zero-stride) dim, where its launcher falls back to the packed
         #    stride (max abs error 1.0 to 1.2); cuDNN raises from its graph
         #    on a zero token stride, or misreads it on the element-offset
-        #    path of a cuDNN below 9.25.
+        #    path of a cuDNN below 9.24.
         # 3. 16-byte alignment of the first element and of both strides: the
         #    TMA descriptor and the cuDNN graph refuse anything else at
         #    launch, and FA2's vector loads fault on the device

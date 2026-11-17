@@ -61,7 +61,9 @@ from tests.attention.test_trtllm_gen_attention_prefill import (
     _SPCOMPRESS_TILE_GEOMETRY,
 )
 from tests.attention.test_helpers.sink_attention_reference import sink_attention_unified
-from tests.attention.test_helpers.test_helpers import assert_close_with_mismatch_tolerance
+from tests.attention.test_helpers.test_helpers import (
+    assert_close_with_mismatch_tolerance,
+)
 
 # Read by the legacy <-> unified parity report:
 # (legacy nodeid, [unified test functions], status, note)

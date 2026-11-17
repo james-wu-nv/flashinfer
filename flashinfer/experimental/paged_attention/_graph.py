@@ -17,7 +17,7 @@ plan that fails midway restores every buffer.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -186,7 +186,7 @@ class GraphCapacity:
         may claim a longer query bound than it uses (a decode bucket declared
         for speculative drafts), and a later batch may spend it on one request.
         """
-        common = dict(
+        common: Dict[str, Any] = dict(
             batch_size=metadata.batch_size,
             total_q_tokens=max(metadata.total_q_tokens, metadata.max_q_len),
             max_q_len=metadata.max_q_len,

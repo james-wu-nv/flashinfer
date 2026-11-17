@@ -56,9 +56,10 @@ Prototype simplifications (documented, not hidden):
   planned batch's lengths until the first successful plan freezes the
   backend.  Exact sm_100 has a rule fitted to GB200 measurements; the
   other architectures have fixed orders, of which sm_90 (the legacy
-  wrapper's rule) and the other sm_10x parts put fa2 first for short
-  queries.  cake is never an auto candidate.  Autotune hook (§5.4) is not
-  wired: ``auto`` never times anything.
+  wrapper's short-query rule, without its H100 cuDNN admission) and the
+  other sm_10x parts put fa2 first for short queries.  cake is never an
+  auto candidate.  Autotune hook (§5.4) is not wired: ``auto`` never times
+  anything.
 - ``logits_soft_cap`` / ``custom_mask`` / ``use_sinks`` are explicit
   capability axes (fa2: all three; fa3: soft cap + sinks; trtllm-gen and
   cake: sinks; cuDNN: none) — a backend lacking a requested feature is excluded, never

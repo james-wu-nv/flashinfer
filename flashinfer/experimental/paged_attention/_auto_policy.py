@@ -104,22 +104,27 @@ class _PlanFacts:
             return None
         bounds, kv_lens = qo.flatten().tolist(), kv.flatten().tolist()
         q_lens = [end - start for start, end in zip(bounds, bounds[1:], strict=False)]
-        _expect(
-            len(q_lens) == len(kv_lens) == self.batch_size,
-            f"auto policy: {len(q_lens)} query spans and {len(kv_lens)} KV lengths "
-            f"for a batch of {self.batch_size}",
-        )
-        _expect(
+        # Plans read their lengths through here, so a message (it formats both
+        # lists) is built only when its check fails.
+        if not len(q_lens) == len(kv_lens) == self.batch_size:
+            raise ValueError(
+                f"auto policy: {len(q_lens)} query spans and {len(kv_lens)} KV "
+                f"lengths for a batch of {self.batch_size}"
+            )
+        if not (
             min(q_lens) >= 0
             and max(q_lens) <= self.max_q_len
-            and sum(q_lens) <= self.total_q_tokens,
-            f"auto policy: query lengths {q_lens} do not fit max_q_len "
-            f"{self.max_q_len} / total_q_tokens {self.total_q_tokens}",
-        )
-        _expect(
-            min(kv_lens) >= 0 and max(kv_lens) <= self.max_kv_len,
-            f"auto policy: KV lengths {kv_lens} do not fit max_kv_len {self.max_kv_len}",
-        )
+            and sum(q_lens) <= self.total_q_tokens
+        ):
+            raise ValueError(
+                f"auto policy: query lengths {q_lens} do not fit max_q_len "
+                f"{self.max_q_len} / total_q_tokens {self.total_q_tokens}"
+            )
+        if not (min(kv_lens) >= 0 and max(kv_lens) <= self.max_kv_len):
+            raise ValueError(
+                f"auto policy: KV lengths {kv_lens} do not fit max_kv_len "
+                f"{self.max_kv_len}"
+            )
         return q_lens, kv_lens
 
 
@@ -132,7 +137,9 @@ def ordered_sm90_backends(facts: _PlanFacts) -> Tuple[str, ...]:
     """Prefer FA3 on SM90, except FA2 for short non-FP8 queries.
 
     FA3 uses a fixed query tile; the legacy wrapper measured FA2 faster on H20
-    when the longest query has at most 64 tokens.
+    when the longest query has at most 64 tokens.  The legacy wrapper's cuDNN
+    admission on H100 (head dim 256, where cuDNN is not a candidate of this
+    API) is not copied.
     """
     if facts.max_q_len <= 64 and facts.q_dtype not in _FP8:
         return _prefer("fa2", "fa3", "cudnn")
@@ -159,33 +166,85 @@ def ordered_sm12x_backends(facts: _PlanFacts) -> Tuple[str, ...]:
 
 
 def _in_sm100_cudnn_region(facts: _PlanFacts) -> bool:
-    """Whether cuDNN leads on SM100: the legacy wrapper's qualified domain.
+    """Whether cuDNN leads on SM100: the legacy wrapper's head-dim-128 domain.
 
-    Duplicates ``flashinfer.prefill._blackwell_paged_auto_cudnn`` and the
-    feature conditions around its call in
+    Duplicates the head-dim-128 part of
+    ``flashinfer.prefill._blackwell_paged_auto_cudnn`` and the feature
+    conditions around its call in
     ``BatchPrefillWithPagedKVCacheWrapper.plan()`` that have a counterpart
-    here.  On eager facts the two are equal, and a test pins them against
-    each other.
+    here.  On eager facts the two are equal at head dim 128, and a test pins
+    them against each other.  (The legacy predicate also tests that
+    ``qo_indptr`` starts at 0; the metadata guarantees it, so the copy has
+    no such clause.)  The legacy predicate also admits a head-dim-256 GQA
+    domain; that part is not copied (cuDNN is not a candidate of this API at
+    head dim 256), so head dim 256 is outside the region.
+
+    Every admission needs a causal plan without window, soft cap, custom mask
+    or sinks; HND bf16 Q and KV at head dim 128 and page size 16; 8 to 64
+    query heads in groups of 1, 2, 4, 8 or 16; and the cuDNN version gate,
+    which is the one the legacy wrapper asks (a FROST runtime with the paged
+    packed-split selector on cuDNN 9.24 or newer).  With Mi for 2^20 and
+    ``work`` for ``num_qo_heads * sum(q_i * kv_i)`` over the requests, two
+    parts admit:
+
+    * The bounded domain, which is the original one: at most four requests
+      whose bounds pass the prefix test (``64 <= max_q <= 1024``,
+      ``2048 <= max_kv <= 32768``, ``max_kv >= 4 * max_q``) or the
+      full-prefill test (``1024 <= max_q == max_kv <= 8192``), with
+      ``work >= 8 Mi``.  Equal bounds do not prove full prefill, so that test
+      also needs every ``q_i == kv_i > 0`` and a longest query of at least
+      1024 tokens.
+    * The extension, for any number of requests: ``work >= 16 Mi`` and every
+      ``0 < q_i <= kv_i``; then either every ``q_i == kv_i`` with the longest
+      query in 1024..16384, or every ``q_i > 128`` with the longest query at
+      most 8192 and the longest KV in 2048..32768.  A request of at most 128
+      query tokens keeps a batch that is not all full prefill out of the
+      extension, whatever work the other requests carry.
+
+    The two bound tests and a cheap work bound
+    (``total_q_tokens * num_qo_heads * max_kv_len >= 8 Mi``, tested before
+    the gate) read the declared bounds ``max_q_len`` / ``max_kv_len``.  The
+    work, the ``q_i == kv_i`` proof and every test of the extension read the
+    per-request host lengths; "longest" there is the batch's own, so a batch
+    that qualifies for the extension is admitted under any bounds declared
+    above its lengths.  Two host values rule the extension out before a
+    length is read: a ``max_q_len`` of at most 128, and a ``total_q_tokens``
+    that allows neither more than 128 tokens for every request nor a
+    1024-token request next to non-empty ones
+    (``total_q_tokens <= 128 * batch_size`` and
+    ``total_q_tokens < 1023 + batch_size``).  A plan outside the bounded
+    domain is then refused on them, so a decode batch does not read its
+    lengths under any ``max_q_len``.
+
+    Without host lengths only the prefix test can admit, for at most four
+    requests and with the cheap bound as its only work test; full prefill
+    and the extension are never assumed from the bounds.
 
     CUDA-graph facts mix two sources, and the answer follows both:
 
     * ``max_q_len`` / ``max_kv_len`` / ``total_q_tokens`` are the graph
-      capacity's.  The prefix and full-prefill bound tests and the cheap work
-      bound read those.  A capacity cannot show ``max_q == max_kv`` for a
-      full prefill whose length is not a page multiple, so the full-prefill
-      bound test is ``1024 <= max_q <= max_kv <= 8192`` there.  That is wider
-      than the legacy predicate, which is given the batch's own maxima; the
-      same test checks that graph facts admit everything the legacy predicate
-      admits and differ only by this widening.
+      capacity's.  The bound tests and the cheap work bound read those.  A
+      capacity cannot show ``max_q == max_kv`` for a full prefill whose
+      length is not a page multiple, so the full-prefill bound test is
+      ``1024 <= max_q <= max_kv <= 8192`` there.
     * ``qo_indptr`` / ``kv_seq_lens`` are the lengths of the batch being
-      planned.  The exact work (``>= 8 Mi``) and the ``q_i == kv_i`` proof of
-      full prefill read those.  A graph-mode instance ranks until a plan
-      succeeds, so they are the first planned batch's: two instances with one
-      capacity can freeze different backends, and later batches are not
-      checked against the region.
+      planned.  A graph-mode instance ranks until a plan succeeds, so they
+      are the first planned batch's, and that batch alone decides the work,
+      the full-prefill proof and the extension.  The capacity does not limit
+      the extension: a first batch that qualifies freezes cuDNN, planned
+      with the capacity's bounds, however far those are above it.  Two
+      instances with one capacity can freeze different backends, and later
+      batches are not checked against the region.  The legacy predicate
+      also requires the query lengths to sum to its declared total; a
+      capacity's total is an upper bound, so graph facts drop that clause.
 
-    Without host lengths only the prefix bounds can admit; full prefill is
-    never assumed from the bounds.
+    Given the same bounds and lengths, graph facts admit everything the
+    legacy predicate admits (the same test checks it).  Apart from the
+    dropped total clause they admit more only through the wider full-prefill
+    bound test: at most four requests of full prefill with
+    ``8 Mi <= work < 16 Mi`` under a capacity whose ``max_kv`` is above its
+    ``max_q``.  From 16 Mi the extension admits such a batch under any
+    bounds.
     """
     if not (
         facts.causal
@@ -205,13 +264,32 @@ def _in_sm100_cudnn_region(facts: _PlanFacts) -> bool:
         # cannot identify full prefill there.  Accept a KV bound up to the
         # same limit; the host lengths below still have to prove q_i == kv_i.
         full = 1024 <= max_q <= max_kv <= 8192
-    if not (prefix or full):
+    # The original domain: at most four requests inside one of the bound tests.
+    bounded = facts.batch_size <= 4 and (prefix or full)
+    # The extension reads per-request lengths only, so it needs them on the
+    # host.  It also needs every query above 128 tokens, or a longest one of
+    # 1024 with no empty request beside it.  Two host values rule both out
+    # before a length is read: a max_q_len of at most 128, and a query total
+    # of at most 128 per request that is also below 1023 + batch (a graph
+    # capacity's total is an upper bound of the batch's, so this holds there
+    # too).  A decode batch therefore never reads its lengths for the
+    # extension, whatever max_q_len it is planned with.
+    qo, kv = facts.qo_indptr, facts.kv_seq_lens
+    total_q, batch = facts.total_q_tokens, facts.batch_size
+    can_extend = (
+        max_q > 128
+        and (total_q > 128 * batch or total_q >= 1023 + batch)
+        and qo is not None
+        and kv is not None
+        and qo.device.type == "cpu"
+        and kv.device.type == "cpu"
+    )
+    if not (bounded or can_extend):
         return False
     if not (
         facts.kv_layout == "HND"
         and facts.q_dtype == facts.kv_dtype == torch.bfloat16
         and facts.head_dim_qk == facts.head_dim_vo == 128
-        and 1 <= facts.batch_size <= 4
         and 8 <= hq <= 64
         and hq % hk == 0
         and hq // hk in (1, 2, 4, 8, 16)
@@ -222,20 +300,37 @@ def _in_sm100_cudnn_region(facts: _PlanFacts) -> bool:
     ):
         return False
     # Pair each query with its own KV length when the lengths are on the host;
-    # with device-only lengths keep the bound-based answer.
+    # with device-only lengths keep the bound-based answer of the prefix test.
     lengths = facts.host_lengths()
     if lengths is None:
         return prefix
     q_lens, kv_lens = lengths
-    # Maxima alone cannot distinguish full prefill from a mixed-prefix batch.
-    # (A graph bucket can satisfy both bound tests; the prefix one needs no proof.)
-    if not prefix and not (
-        max(q_lens) >= 1024
-        and all(q == kv and q > 0 for q, kv in zip(q_lens, kv_lens, strict=True))
+    work = hq * sum(q * kv for q, kv in zip(q_lens, kv_lens, strict=True))
+    each_full = q_lens == kv_lens
+    if bounded:
+        # Maxima alone cannot distinguish full prefill from a mixed-prefix
+        # batch.  (A graph bucket can satisfy both bound tests; the prefix
+        # one needs no proof.)
+        proven_full = full and each_full and min(q_lens) > 0 and max(q_lens) >= 1024
+        if (prefix or proven_full) and work >= 8 * 1024 * 1024:
+            return True
+    if not can_extend:
+        return False
+    # The extension: any batch size, the batch's own lengths, twice the work.
+    if not (
+        work >= 16 * 1024 * 1024
+        and all(0 < q <= kv for q, kv in zip(q_lens, kv_lens, strict=True))
+        # The legacy predicate requires the lengths to sum to its declared
+        # total.  A graph capacity's total is an upper bound, which
+        # host_lengths() has checked.
+        and (facts.use_cuda_graph or sum(q_lens) == facts.total_q_tokens)
     ):
         return False
-    work = hq * sum(q * kv for q, kv in zip(q_lens, kv_lens, strict=True))
-    return work >= 8 * 1024 * 1024
+    if each_full:
+        return 1024 <= max(q_lens) <= 16384
+    # A short request needs its own qualification even when a longer one
+    # carries the work.
+    return min(q_lens) > 128 and max(q_lens) <= 8192 and 2048 <= max(kv_lens) <= 32768
 
 
 # SM100 rule.  The thresholds are fitted on GB200 (cuDNN 9.27, cudnn-frontend
@@ -341,8 +436,12 @@ def _attended_kv(facts: _PlanFacts) -> int:
 def ordered_sm100_backends(facts: _PlanFacts) -> Tuple[str, ...]:
     """Order every candidate for SM100 from the plan facts, without deciding support.
 
-    1. cuDNN first inside ``_in_sm100_cudnn_region`` (the cuDNN version gate
-       is one of its conditions).
+    1. cuDNN first inside ``_in_sm100_cudnn_region``, the legacy wrapper's
+       head-dim-128 admission, copied and not fitted here: at most four
+       requests inside its prefix / full-prefill bounds from 8 Mi of work
+       (``num_qo_heads * sum(q_i * kv_i)``), and from 16 Mi a batch of any
+       size whose own lengths qualify.  The cuDNN version gate is one of its
+       conditions.
     2. Otherwise trtllm-gen ahead of fa2 when ``rows`` reaches 64 (96 below
        head dim 128) at a ``fill`` of 0.375 in CUDA-graph mode, 0.75 eager.
        Eager and above 148 rows it also needs 1024 keys per query row

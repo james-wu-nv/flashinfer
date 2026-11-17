@@ -11,9 +11,13 @@ workspace; each case checks the legacy reference (the fa2 wrapper on the
 combined pool) at the legacy tolerance.  A GPU where cudnn cannot run is
 skipped with the resolver's reason.
 
-``test_cudnn_prefill_fp8`` keeps the legacy gates and the legacy xfail on
-SM10x; ``PagedAttention`` could not express it anyway (fp8 q, a q scale and a
-bf16 output for an fp8 q are not in the API), and the xfail says so.
+``test_cudnn_prefill_fp8`` keeps the legacy skips.  The legacy test runs from
+cuDNN 9.24 (its Blackwell xfail is limited to older versions); here every row
+that reaches the call is an expected failure for one reason, an API limit:
+this API's cuDNN backend takes no fp8 query (its capability row declares fp16
+/ bf16 q), so there is no q scale and no bf16 output for an fp8 q either.
+The xfail carries the resolver's refusal, and the test fails once the
+resolver accepts an fp8 q on cudnn.
 """
 
 import cudnn
@@ -44,9 +48,9 @@ LEGACY_MAP = [
         "tests/attention/test_cudnn_prefill.py::test_cudnn_prefill_fp8",
         ["test_cudnn_prefill_fp8"],
         "unsupported-by-design",
-        "legacy gates and the legacy SM10x xfail kept; fp8 q, a q scale and a bf16 "
-        "output for an fp8 q are not in PagedAttention (API limit, named in the "
-        "xfail)",
+        "legacy skips kept; xfail: this API's cuDNN backend takes no fp8 q (no q "
+        "scale, no bf16 output for an fp8 q), an API limit, with the resolver's "
+        "refusal as the reason; the legacy test runs from cuDNN 9.24",
     ),
 ]
 
@@ -248,8 +252,23 @@ def test_cudnn_prefill_fp8(
             f"cuDNN FP8 prefill is not supported on compute capability {major}, skipping test"
         )
 
+    # The legacy call (fp8 q, K and V with their scales, a bf16 output) has
+    # no counterpart: the cudnn capability row declares no fp8 q.  The
+    # resolver is asked, so a row that starts to accept one fails here.
+    with pytest.raises(ValueError, match="cudnn: unsupported q dtype") as refusal:
+        resolve_paged_attention(
+            device=torch.device(device),
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=128,
+            q_dtype=torch.float8_e4m3fn,
+            page_size=page_size,
+            kv_layout="NHD",
+            causal=causal,
+            need_lse=return_lse,
+            backend="cudnn",
+        )
     pytest.xfail(
-        "cuDNN FP8 prefill has known issues on Blackwell (the legacy xfail); and "
-        "API limit: PagedAttention has no fp8 q, no q scale and no bf16 output for "
-        "an fp8 q on cudnn"
+        "API limit: this API's cuDNN backend takes no fp8 q, so PagedAttention has "
+        f"no q scale and no bf16 output for an fp8 q on cudnn ({refusal.value})"
     )

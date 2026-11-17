@@ -612,11 +612,12 @@ def test_fuzz_reject_or_correct(backend, mutation):
 @pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
 def test_noncausal_sliding_window_is_excluded_everywhere(kv_layout, input_form):
     """Non-causal + sliding window has no runnable backend: trtllm-gen and
-    cake declare no kernel, cuDNN has no window, and the fa2 kernel computes
-    it wrong for requests longer than 128 tokens with a history (ledger M20;
-    see the strict xfail in test_paged_attention_features.py), so fa2/fa3
-    declare it unsupported until the kernel is fixed.  The fuzzer's sampler
-    must therefore never draw it as a runnable row."""
+    cake declare no kernel, this API's cuDNN backend declares no window, and
+    the fa2 kernel computes it wrong for requests longer than 128 tokens with
+    a history (ledger M20; see the strict xfail in
+    test_paged_attention_features.py), so fa2/fa3 declare it unsupported
+    until the kernel is fixed.  The fuzzer's sampler must therefore never
+    draw it as a runnable row."""
     cfg = dict(
         batch_size=4,
         max_q=33,

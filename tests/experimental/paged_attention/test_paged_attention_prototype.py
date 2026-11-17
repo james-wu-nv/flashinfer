@@ -1060,8 +1060,10 @@ def _cudnn_probe_module_or_skip():
     from flashinfer.cudnn.prefill import _cudnn_supports_direct_seqlens
     from flashinfer.experimental.paged_attention._backends import cudnn_backend
 
+    # The probe's own gate: the mixed-form helper (cuDNN 9.25), not the
+    # explicit-lengths helper a plan is staged under (9.24).
     if not _cudnn_supports_direct_seqlens(torch.bfloat16, mixed=True):
-        pytest.skip("this cuDNN / frontend has no direct paged seq-lens path")
+        pytest.skip("this cuDNN is below the gate of the packed-LSE probe")
     return cudnn_backend
 
 

@@ -297,7 +297,11 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         ),  # NHD = permuted view, stride-driven graph
         supports_lse=True,
         supports_noncausal=True,  # bottom_right mask off + padding mask: verified H100
-        supports_window=False,  # no sliding window in the cuDNN SDPA graph path
+        # Not declared by this API's cuDNN backend, whose plan() and run()
+        # pass no window.  The cuDNN graph path has one (``window_left`` in
+        # flashinfer/cudnn/prefill.py), and the legacy wrapper's explicit
+        # cuDNN backend passes it.
+        supports_window=False,
         # The cuDNN graph declares q with q's own strides and is keyed on
         # them, and the token-unit ragged offsets are scaled by q's token
         # stride (flashinfer/cudnn/prefill.py: the graph's ragged-offset
@@ -318,7 +322,9 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         # num_qo_heads * head_dim and a strided view was silently wrong.
         requires_contiguous_q=False,
         needs_dense=True,
-        # the cuDNN SDPA graph path exposes none of the three
+        # None of the three is declared.  The cuDNN graph path has no soft
+        # cap and no custom mask; it has a sink token, which this backend
+        # does not pass and the legacy paged wrapper refuses on cuDNN.
         supports_logits_soft_cap=False,
         supports_custom_mask=False,
         supports_sinks=False,

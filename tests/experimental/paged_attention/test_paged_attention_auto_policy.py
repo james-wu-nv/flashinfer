@@ -3,8 +3,10 @@
 Three layers, mirroring ``tests/attention/test_mla_auto_backend.py``:
 
 1. Policy (no GPU): ``_auto_policy`` orders every candidate from host facts;
-   the SM100 table sits on both sides of each threshold and the ported cuDNN
-   region is pinned against the legacy wrapper's predicate.
+   the SM100 table sits on both sides of each threshold and the copied cuDNN
+   region is pinned against the legacy wrapper's predicate.  The parts of the
+   legacy admission that are not copied (head dim 256 on SM100 and on SM90)
+   are pinned as known differences.
 2. Planning (no GPU, fake backends): the controller hands the policy the
    plan's facts, walks the order it returns, moves on only after a typed
    rejection, and freezes the choice in graph mode.
@@ -102,10 +104,10 @@ def cudnn_qualified(monkeypatch):
 
 
 # (id, q_lens, kv_lens, facts overrides, first preference).  Heads are 32/8
-# unless overridden.  Shapes marked [m] are measured cases of the GB200 fit
-# (reports/prefill-auto-design-20261109, results/gb200-*-f2* and, for the
-# short-KV rows, results/gb200-auto5-f4*); the others step one unit across a
-# threshold from one.
+# unless overridden.  Shapes marked [m] are measured cases of the GB200 fit;
+# the others step one unit across a threshold from one.  The rows of the
+# cuDNN region's extension carry no mark: that part is copied from the legacy
+# predicate, not fitted.
 _SM100_TABLE = [
     # ---- rows >= 64 at head_dim 128 (fill 1.0; KV outside the cuDNN region)
     ("rows64-graph [m]", [256], [131072], dict(graph=True), "trtllm-gen"),
@@ -152,7 +154,7 @@ _SM100_TABLE = [
     # decode / speculative lengths never fill a tile
     ("decode [m]", [2] * 256, [2048] * 256, dict(hq=64, graph=True), "fa2"),
     # ---- eager, fewer than 1024 keys per query row: fa2 between 148 rows and
-    # rows * keys = 2^19 (results/gb200-auto5-f4*; graph mode has no such rule)
+    # rows * keys = 2^19 (graph mode has no such rule)
     ("short-kv-rows256 [m]", [256] * 4, [256] * 4, {}, "fa2"),
     (
         "short-kv-rows256-graph [m]",
@@ -199,18 +201,34 @@ _SM100_TABLE = [
     ),
     ("short-kv-rows1536-kv256 [m]", [128] * 48, [256] * 48, {}, "fa2"),
     ("short-kv-rows2048-kv256 [m]", [256] * 32, [256] * 32, {}, "trtllm-gen"),
-    # ---- cuDNN region, prefix: 64 <= max_q <= 1024, 2048 <= max_kv <= 32768
+    # ---- cuDNN region, the bounded domain (at most four requests from 8 Mi
+    # of work), prefix: 64 <= max_q <= 1024, 2048 <= max_kv <= 32768,
+    # max_kv >= 4 * max_q
     ("prefix-q128-kv16384 [m]", [128], [16384], {}, "cudnn"),
     ("prefix-q64 [m]", [64], [16384], {}, "cudnn"),
     ("prefix-q63", [63], [16384], {}, "fa2"),
     ("prefix-q1024 [m]", [1024], [32768], dict(hq=8, hk=1), "cudnn"),
-    ("prefix-q1025", [1025], [32768], dict(hq=8, hk=1), "trtllm-gen"),
+    # one more query token leaves the prefix test, and at 256 Mi the
+    # extension admits the batch from its lengths: with those on the host only
+    ("prefix-q1025", [1025], [32768], dict(hq=8, hk=1), "cudnn"),
+    (
+        "prefix-q1025-device-lengths",
+        [1025],
+        [32768],
+        dict(hq=8, hk=1, host=False),
+        "trtllm-gen",
+    ),
     ("prefix-kv2048 [m]", [128], [2048], {}, "cudnn"),
     ("prefix-kv2047 [m]", [128], [2047], {}, "fa2"),
     ("prefix-kv32768 [m]", [128] * 3, [32768] * 3, dict(hq=16, hk=4), "cudnn"),
     ("prefix-kv32769", [128] * 3, [32769] * 3, dict(hq=16, hk=4), "fa2"),
+    # max_kv >= 4 * max_q decides below 16 Mi (8 heads: 8.0 Mi); the
+    # extension has no such ratio (32 heads: 32 Mi)
+    ("prefix-kv=4q-8Mi", [512], [2048], dict(hq=8, hk=2), "cudnn"),
+    ("prefix-kv<4q-8Mi", [513], [2048], dict(hq=8, hk=2), "fa2"),
+    ("prefix-kv=4q-1", [513], [2051], dict(hq=8, hk=2), "fa2"),
     ("prefix-kv=4q", [512], [2048], {}, "cudnn"),
-    ("prefix-kv<4q", [513], [2048], {}, "trtllm-gen"),
+    ("prefix-kv<4q-32Mi", [513], [2048], {}, "cudnn"),
     # exact work = heads * sum(q_i * kv_i) >= 8 Mi
     ("work-8Mi", [256], [2048], dict(hq=16, hk=4), "cudnn"),
     ("work-below-8Mi", [255], [2048], dict(hq=16, hk=4), "fa2"),
@@ -229,6 +247,8 @@ _SM100_TABLE = [
         dict(hq=8, hk=2, host=False),
         "cudnn",
     ),
+    # more than four requests of at most 128 query tokens are outside (above
+    # 128 the extension below admits them)
     ("batch4 [m]", [64] * 4, [8192] * 4, {}, "cudnn"),
     ("batch5", [64] * 5, [8192] * 5, {}, "fa2"),
     ("batch6-rows96 [m]", [128] * 6, [8192] * 6, dict(hq=16, hk=4), "trtllm-gen"),
@@ -242,16 +262,74 @@ _SM100_TABLE = [
     ("group16 [m]", [128], [8192], dict(hq=32, hk=2), "cudnn"),
     ("group32", [128], [8192], dict(hq=32, hk=1), "fa2"),
     ("group3", [256], [4096], dict(hq=24, hk=8), "fa2"),
-    # ---- cuDNN region, full prefill: 1024 <= max_q == max_kv <= 8192
+    # ---- cuDNN region, the bounded domain, full prefill:
+    # 1024 <= max_q == max_kv <= 8192 with every q_i == kv_i
     ("full-1024 [m]", [1024], [1024], dict(hq=8, hk=1), "cudnn"),
     ("full-1023", [1023], [1023], dict(hq=8, hk=1), "fa2"),
     ("full-8192 [m]", [8192], [8192], dict(hq=64, hk=8), "cudnn"),
-    ("full-8193", [8193], [8193], dict(hq=64, hk=8), "trtllm-gen"),
     ("full-ragged [m]", [4921], [4921], dict(hq=16, hk=4), "cudnn"),
     ("full-each-q=kv", [2048, 1024], [2048, 1024], {}, "cudnn"),
-    ("full-mixed-prefix", [2048, 1024], [2048, 2048], {}, "trtllm-gen"),
+    # the q_i == kv_i proof decides below 16 Mi (8 heads: 9.5 and 10.9 Mi);
+    # from 16 Mi a batch that fails it can enter the extension as a mixed
+    # batch (32 heads: 192 Mi)
+    ("full-each-q=kv-10Mi", [1100, 200], [1100, 200], dict(hq=8, hk=1), "cudnn"),
+    ("full-mixed-prefix-11Mi", [1100, 200], [1100, 1100], dict(hq=8, hk=1), "fa2"),
+    ("full-mixed-prefix", [2048, 1024], [2048, 2048], {}, "cudnn"),
     # equal maxima alone do not prove full prefill
     ("full-device-lengths", [2048], [2048], dict(host=False), "trtllm-gen"),
+    # ---- cuDNN region, the extension: any number of requests from 16 Mi of
+    # work, on the batch's own lengths.  Every q_i == kv_i: the longest query
+    # in 1024..16384, the other requests of any length
+    ("ext-full-8193", [8193], [8193], dict(hq=64, hk=8), "cudnn"),
+    ("ext-full-16384", [16384], [16384], dict(hq=64, hk=8), "cudnn"),
+    ("ext-full-16385", [16385], [16385], dict(hq=64, hk=8), "trtllm-gen"),
+    ("ext-full-batch16", [1024] * 16, [1024] * 16, {}, "cudnn"),
+    ("ext-full-batch16-q1023", [1023] * 16, [1023] * 16, {}, "trtllm-gen"),
+    ("ext-full-one-short", [1] + [4096] * 4, [1] + [4096] * 4, {}, "cudnn"),
+    # (the smallest query total of such a batch, 1023 + batch: 16.0 Mi at 16
+    # heads)
+    (
+        "ext-full-total-1023+batch",
+        [1024] + [1] * 8,
+        [1024] + [1] * 8,
+        dict(hq=16, hk=4),
+        "cudnn",
+    ),
+    # ... otherwise every q_i > 128, the longest query at most 8192 and the
+    # longest KV in 2048..32768
+    ("ext-batch5-q129", [129] * 5, [8192] * 5, {}, "cudnn"),
+    ("ext-batch5-q128", [128] * 5, [8192] * 5, {}, "trtllm-gen"),
+    ("ext-batch32", [256] * 32, [4096] * 32, {}, "cudnn"),
+    ("ext-batch256", [256] * 256, [4096] * 256, {}, "cudnn"),
+    (
+        "ext-ragged",
+        [300, 200, 500, 150, 1000, 129],
+        [4096, 2048, 8192, 3000, 16384, 2048],
+        {},
+        "cudnn",
+    ),
+    # one request of 128 tokens keeps the batch out, whatever the others carry
+    ("ext-all-q129", [129] * 5, [2048] * 5, dict(hq=16, hk=1), "cudnn"),
+    ("ext-one-q128", [128] + [129] * 4, [2048] * 5, dict(hq=16, hk=1), "fa2"),
+    ("ext-q8192", [8192], [16384], {}, "cudnn"),
+    ("ext-q8193", [8193], [16384], {}, "trtllm-gen"),
+    ("ext-kv2048", [256] * 5, [2048] * 5, {}, "cudnn"),
+    ("ext-kv2047", [256] * 5, [2047] * 5, {}, "trtllm-gen"),
+    ("ext-kv32768", [256] * 5, [32768] * 5, {}, "cudnn"),
+    ("ext-kv32769", [256] * 5, [32769] * 5, {}, "trtllm-gen"),
+    # exact work >= 16 Mi: 8 heads * 6 * 129 * 2710 = 16.003 Mi, 15.997 Mi at 2709
+    ("ext-work-16Mi", [129] * 6, [2710] * 6, dict(hq=8, hk=2), "cudnn"),
+    ("ext-work-below-16Mi", [129] * 6, [2709] * 6, dict(hq=8, hk=2), "fa2"),
+    # the lengths decide, under any bounds declared above them ...
+    (
+        "ext-loose-bounds",
+        [256] * 6,
+        [4096] * 6,
+        dict(max_q_len=2048, max_kv_len=131072),
+        "cudnn",
+    ),
+    # ... and only when they are on the host
+    ("ext-device-lengths", [256] * 6, [4096] * 6, dict(host=False), "trtllm-gen"),
     # ---- the feature conditions around the legacy call
     ("window", [128], [16384], dict(window_left=127), "fa2"),
     ("window-rows256 [m]", [128] * 8, [8192] * 8, dict(window_left=1023), "trtllm-gen"),
@@ -272,7 +350,7 @@ _SM100_TABLE = [
     ("d64", [128], [16384], dict(head_dim_qk=64, head_dim_vo=64), "fa2"),
     ("d192-128", [128], [16384], dict(head_dim_qk=192), "fa2"),
     # ---- graph mode: the bounds are the capacity's, the per-request lengths
-    # (exact work, q == kv) the first batch's
+    # (exact work, q == kv, every test of the extension) the first batch's
     (
         "graph-capacity-bounds",
         [4, 4],
@@ -312,19 +390,52 @@ _SM100_TABLE = [
         dict(graph=True, max_kv_len=8192),
         "cudnn",
     ),
+    # that batch carries 739 Mi: its lengths admit it under any capacity
     (
-        "graph-full-capacity-above-limit",
+        "graph-full-any-capacity",
         [4921],
         [4921],
-        dict(graph=True, max_kv_len=8193),
-        "trtllm-gen",
+        dict(graph=True, max_kv_len=131072),
+        "cudnn",
     ),
+    # (a query above its KV: no part of the region admits the batch)
     (
         "graph-wider-capacity-not-full",
         [4921],
         [4920],
         dict(graph=True, max_kv_len=8192),
         "trtllm-gen",
+    ),
+    # below 16 Mi (8 heads, q = kv = 1100: 9.2 Mi) the capacity decides:
+    # 1024 <= max_q <= max_kv <= 8192, with every q_i == kv_i on the host
+    (
+        "graph-full-wider-capacity-9Mi",
+        [1100],
+        [1100],
+        dict(hq=8, hk=2, graph=True, max_kv_len=8192),
+        "cudnn",
+    ),
+    (
+        "graph-full-capacity-above-limit-9Mi",
+        [1100],
+        [1100],
+        dict(hq=8, hk=2, graph=True, max_kv_len=8193),
+        "trtllm-gen",
+    ),
+    (
+        "graph-wider-capacity-not-full-9Mi",
+        [1100],
+        [1101],
+        dict(hq=8, hk=2, graph=True, max_kv_len=8192),
+        "trtllm-gen",
+    ),
+    # the lower limit of that capacity test (8 heads, q = kv = 1024: 8.0 Mi)
+    (
+        "graph-full-wider-capacity-q1024",
+        [1024],
+        [1024],
+        dict(hq=8, hk=1, graph=True, max_kv_len=2048),
+        "cudnn",
     ),
     # a prefix batch whose graph bounds also fit the widened full-prefill test
     # (GB200 graph: B2 64/8 q1024 kv4096: cudnn 196, trtllm-gen 209)
@@ -335,7 +446,43 @@ _SM100_TABLE = [
         dict(hq=64, graph=True),
         "cudnn",
     ),
-    ("eager-bounds-must-match", [4921], [4921], dict(max_kv_len=8192), "trtllm-gen"),
+    # eager, the same two full prefills under a KV bound above the query: the
+    # bound test needs max_q == max_kv, so below 16 Mi the batch is outside;
+    # from 16 Mi its lengths admit it
+    (
+        "eager-bounds-must-match-9Mi",
+        [1100],
+        [1100],
+        dict(hq=8, hk=2, max_kv_len=8192),
+        "trtllm-gen",
+    ),
+    ("eager-full-loose-bound", [4921], [4921], dict(max_kv_len=8192), "cudnn"),
+    # the extension under a capacity: the first batch's lengths alone, with
+    # the capacity's bounds and total far above them
+    (
+        "graph-ext-loose-capacity",
+        [256] * 6,
+        [4096] * 6,
+        dict(graph=True, total_q_tokens=12288, max_q_len=2048, max_kv_len=131072),
+        "cudnn",
+    ),
+    (
+        "graph-ext-loose-capacity-one-q128",
+        [256] * 5 + [128],
+        [4096] * 6,
+        dict(graph=True, total_q_tokens=12288, max_q_len=2048, max_kv_len=131072),
+        "trtllm-gen",
+    ),
+    # a padding request (q = kv = 0) keeps a first batch out of the extension
+    # and of the full-prefill proof
+    ("graph-full-batch2", [4096] * 2, [4096] * 2, dict(graph=True), "cudnn"),
+    (
+        "graph-full-batch2-padded",
+        [4096, 4096, 0],
+        [4096, 4096, 0],
+        dict(graph=True),
+        "trtllm-gen",
+    ),
 ]
 
 
@@ -380,17 +527,48 @@ def test_sm100_region_needs_the_cudnn_version_gate(monkeypatch):
     assert ordered_sm100_backends(facts)[0] == "cudnn"
 
 
+class _DeviceOnly:
+    """Stands in for a CUDA tensor, so the device-only paths run anywhere:
+    any use of it other than asking for its device fails the test."""
+
+    device = torch.device("cuda", 0)
+
+    def __getattr__(self, name):
+        raise AssertionError(f"device tensor touched: .{name}")
+
+
+class _HostUnread:
+    """Stands in for a host mirror the policy must not read: any use of it
+    other than asking for its device fails the test."""
+
+    device = torch.device("cpu")
+
+    def __getattr__(self, name):
+        raise AssertionError(f"host lengths read: .{name}")
+
+
 def test_sm100_cudnn_region_against_the_legacy_predicate(monkeypatch):
-    """The policy duplicates ``_blackwell_paged_auto_cudnn``; this pins the
-    copy to the original over shapes, heads, dtypes and both length paths.
-    Eager facts: the two are equal.  CUDA-graph facts: the copy admits
-    everything the original admits, and more only where its full-prefill
-    bound test is wider (``max_q <= max_kv`` for a capacity instead of
-    ``max_q == max_kv``) with every request's q equal to its KV on the host."""
+    """The policy duplicates the head-dim-128 part of
+    ``_blackwell_paged_auto_cudnn``; this pins the copy to the original over
+    batches, heads, the static conditions, bounds declared above the lengths
+    and every length path (host, absent, device-only, one mirror on a
+    device).
+
+    Eager facts: the two are equal.  CUDA-graph facts carry a capacity; the
+    original is handed the capacity as its declared maxima and, with host
+    lengths, the batch's own query total (the legacy wrapper has no capacity
+    and passes that).  The copy then admits everything the original admits,
+    and more only where its full-prefill bound test is wider
+    (``max_q <= max_kv`` for a capacity instead of ``max_q == max_kv``): at
+    most four requests with every q equal to its KV on the host and
+    8 Mi <= work < 16 Mi.  From 16 Mi the original admits such a batch from
+    its lengths under any bounds."""
     monkeypatch.setattr(_auto_policy, "_cudnn_supports_paged_auto", lambda: True)
     monkeypatch.setattr(legacy_prefill, "_cudnn_supports_paged_auto", lambda: True)
     monkeypatch.setattr(legacy_prefill, "get_compute_capability", lambda dev: (10, 0))
+    mi = 1 << 20
     batches = [
+        # ---- the bounded domain: at most four requests inside a bound test
         ([128], [2048]),
         ([64], [2048]),
         ([63], [2048]),
@@ -411,83 +589,192 @@ def test_sm100_cudnn_region_against_the_legacy_predicate(monkeypatch):
         ([128, 100], [4096, 3000]),
         ([64, 1, 1, 1], [8192, 16, 16, 16]),
         ([64] * 4, [8192, 64, 64, 64]),
+        ([128, 257], [32768, 16385]),
         ([256] * 4, [8192] * 4),
         ([256] * 5, [8192] * 5),
-        # full prefill whose length is not a power of two: under a looser KV
-        # bound these reach the widened graph-mode test
+        # full prefill whose length is not a power of two, as a bucket with a
+        # looser KV bound sees it
         ([4921], [4921]),
         ([3000, 1500], [3000, 1500]),
         ([4921], [4920]),
+        # ... with 8 Mi <= work < 16 Mi at 8 heads (9.2 Mi at 1100 tokens,
+        # 15.997 Mi at 1448, 16.02 Mi at 1449): the band in which only the
+        # wider graph-mode bound test admits it, for at most four requests
+        ([1100], [1100]),
+        ([1100], [1101]),
+        ([1100, 200], [1100, 200]),
+        ([1100, 200], [1100, 1100]),
+        ([1448], [1448]),
+        ([1449], [1449]),
+        ([1100, 8, 8, 8], [1100, 8, 8, 8]),
+        ([1100, 8, 8, 8, 8], [1100, 8, 8, 8, 8]),
+        # ---- the extension: more than four requests, every q above 128
+        ([64] * 5, [8192] * 5),
+        ([128] * 5, [8192] * 5),
+        ([129] * 5, [8192] * 5),
+        ([128] * 6, [6145] * 6),
+        ([129] * 6, [6145] * 6),
+        ([256] * 6, [4096] * 6),
+        ([256] * 16, [4096] * 16),
+        ([256] * 32, [4096] * 32),
+        # a short request next to long ones
+        ([128, 129, 129, 129, 129], [2048] * 5),
+        ([129] * 5, [2048] * 5),
+        ([17, 17, 17, 17, 3072], [32768, 32768, 32768, 32768, 3104]),
+        ([1, 4096, 4096, 4096, 4096], [1, 4096, 4096, 4096, 4096]),
+        # one 1024-token request next to one-token ones: the smallest query
+        # total of an admitted batch of nine, 1023 + batch
+        ([1024] + [1] * 8, [1024] + [1] * 8),
+        ([1023] + [1] * 8, [1023] + [1] * 8),
+        # 16 Mi of work at 8 heads: 8 * 6 * 129 * 2710 = 16.003 Mi, 15.997 Mi
+        # at 2709; the two-request batch carries 10.0 Mi
+        ([129] * 6, [2709] * 6),
+        ([129] * 6, [2710] * 6),
+        ([1024, 129], [1024, 2048]),
+        # the longest query of a batch that is not all full prefill
+        ([8192], [16384]),
+        ([8193], [16384]),
+        ([8192, 300, 300, 300, 300], [16384, 4096, 4096, 4096, 4096]),
+        ([8193, 300, 300, 300, 300], [16384, 4096, 4096, 4096, 4096]),
+        # ... and its longest KV
+        ([256] * 5, [2047] * 5),
+        ([256] * 5, [2048] * 5),
+        ([256] * 5, [32768] * 5),
+        ([256] * 5, [32769] * 5),
+        ([256, 512, 1024, 2048, 3072], [4096, 8192, 6144, 12288, 8192]),
+        # every q equal to its KV: the longest query in 1024..16384
+        ([1024] * 16, [1024] * 16),
+        ([1023] * 16, [1023] * 16),
+        ([1000] * 5, [1000] * 5),
+        ([513] * 6, [513] * 6),
+        ([16384], [16384]),
+        ([16385], [16385]),
+        ([16384] * 5, [16384] * 5),
+        # a query above its KV, a request without tokens
+        ([300, 300, 300, 300, 3000], [4096, 4096, 4096, 4096, 2000]),
+        ([512, 0, 512, 512, 512], [4096] * 5),
+        ([2048, 2048, 2048, 2048, 0], [2048, 2048, 2048, 2048, 0]),
+        # (equal sums of Q and KV are not full prefill)
+        ([2048, 1024], [1024, 2048]),
     ]
     heads = [(4, 4), (8, 8), (8, 1), (12, 4), (16, 4), (32, 8), (32, 2), (32, 1)]
-    heads += [(64, 8), (128, 8)]
+    heads += [(64, 8), (128, 8), (12, 8)]
+    heads += [(7, 7), (65, 65)]  # one query head outside 8..64 on either side
     bf16, fp16, fp8 = torch.bfloat16, torch.float16, torch.float8_e4m3fn
-    admitted = 0
-    widened = 0
-    total = 0
-    for (q_lens, kv_lens), (hq, hk), head_dim, page, layout, (
-        qd,
-        kd,
-    ), host, loose, graph in itertools.product(
-        batches,
-        heads,
-        (128, 64),
-        (16, 32),
-        ("HND", "NHD"),
-        ((bf16, bf16), (fp16, fp16), (bf16, fp8)),
-        (True, False),
-        (False, True),
-        (False, True),
-    ):
-        max_q, max_kv = max(q_lens), max(kv_lens)
-        if loose:  # a declared KV bound above the batch's own
-            max_kv = 1 << (max_kv - 1).bit_length()
+    qualified = ((128, 128), 16, "HND", (bf16, bf16))
+    statics = list(
+        itertools.product(
+            ((128, 128), (64, 64)),
+            (16, 32),
+            ("HND", "NHD"),
+            ((bf16, bf16), (fp16, fp16), (bf16, fp8)),
+        )
+    )
+    # the QK and VO head dims differ, or the Q and KV dtypes, with one of each
+    # at the qualified value (no capability row declares these pairs)
+    unpaired = [
+        ((128, 64), 16, "HND", (bf16, bf16)),
+        ((128, 128), 16, "HND", (fp16, bf16)),
+    ]
+    # (static conditions, length paths, declared bounds, CUDA graph, a total
+    # above the batch's)
+    grids = [
+        # every static condition on and off, lengths on the host or absent,
+        # the batch's own bounds or a looser KV bound
+        (statics, ("host", None), ("exact", "kv"), (False, True), (False,)),
+        (unpaired, ("host", None), ("exact",), (False, True), (False,)),
+        # the qualified configuration: device-only lengths, a looser query
+        # bound, and a declared total above the batch's as a capacity has it
+        (
+            [qualified],
+            ("host", None, "device", "kv-device", "qo-device"),
+            ("exact", "kv", "q", "q+kv", "q=kv"),
+            (False, True),
+            (False, True),
+        ),
+    ]
+    admitted = widened = extended = relaxed = total = 0
+    for (q_lens, kv_lens), (hq, hk), grid in itertools.product(batches, heads, grids):
         qo_indptr = _indptr(q_lens)
         kv = torch.tensor(kv_lens, dtype=torch.int32)
-        want = legacy_prefill._blackwell_paged_auto_cudnn(
-            None,
-            layout,
-            qd,
-            kd,
-            qd,
-            head_dim,
-            head_dim,
-            len(q_lens),
-            hq,
-            hk,
-            max_q,
-            max_kv,
-            page,
-            sum(q_lens),
-            qo_indptr,
-            kv if host else None,
-        )
-        facts = _facts(
-            q_lens,
-            kv_lens,
-            hq=hq,
-            hk=hk,
-            host=host,
-            graph=graph,
-            max_kv_len=max_kv,
-            head_dim_qk=head_dim,
-            head_dim_vo=head_dim,
-            page_size=page,
-            kv_layout=layout,
-            q_dtype=qd,
-            kv_dtype=kd,
-        )
-        got = _in_sm100_cudnn_region(facts)
-        case = (q_lens, kv_lens, hq, hk, head_dim, page, layout, kd, host, loose, graph)
-        if got != want:
-            assert got and not want, case
-            assert graph and host and q_lens == kv_lens, case
-            assert 1024 <= max_q < max_kv <= 8192, case
-            widened += 1
-        admitted += got
-        total += 1
-    assert 100 < admitted < total - 100  # the grid exercises both answers
-    assert widened > 0  # ... and the graph-only branch
+        tile = (max(q_lens) // 128 + 1) * 128  # a query bound above the batch's
+        pow2 = 1 << (max(kv_lens) - 1).bit_length()
+        bounds = {
+            "exact": (max(q_lens), max(kv_lens)),
+            "kv": (max(q_lens), pow2),
+            "q": (tile, max(kv_lens)),
+            "q+kv": (tile, 8 * pow2),  # a table sized for a longer context
+            "q=kv": (max(tile, pow2),) * 2,  # equal bounds above the lengths
+        }
+        work = hq * sum(q * k for q, k in zip(q_lens, kv_lens, strict=True))
+        for static, host, loose, graph, spare in itertools.product(*grid):
+            (head_dim_qk, head_dim_vo), page, layout, (qd, kd) = static
+            max_q, max_kv = bounds[loose]
+            total_q = sum(q_lens) + (max_q if spare else 0)
+            on_host = host == "host"
+            # A mirror that is not on the host is absent or a device tensor.
+            # The original's device-only state is a host qo_indptr with
+            # device KV lengths; the copy takes either mirror on a device
+            # ("kv-device", "qo-device") as both ("device").
+            away = None if host is None else _DeviceOnly()
+            want = legacy_prefill._blackwell_paged_auto_cudnn(
+                None,
+                layout,
+                qd,
+                kd,
+                qd,
+                head_dim_qk,
+                head_dim_vo,
+                len(q_lens),
+                hq,
+                hk,
+                max_q,
+                max_kv,
+                page,
+                # The original requires the query lengths to sum to this
+                # total; graph facts carry the capacity's total and drop that
+                # clause.  Without host lengths the total is only a bound.
+                sum(q_lens) if graph and on_host else total_q,
+                qo_indptr,
+                kv if on_host else away,
+            )
+            facts = _facts(
+                q_lens,
+                kv_lens,
+                hq=hq,
+                hk=hk,
+                host=False,
+                graph=graph,
+                total_q_tokens=total_q,
+                max_q_len=max_q,
+                max_kv_len=max_kv,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                page_size=page,
+                kv_layout=layout,
+                q_dtype=qd,
+                kv_dtype=kd,
+                qo_indptr=qo_indptr if host in ("host", "kv-device") else away,
+                kv_seq_lens=kv if host in ("host", "qo-device") else away,
+            )
+            got = _in_sm100_cudnn_region(facts)
+            case = (q_lens, kv_lens, hq, hk, static, host, loose, graph, spare)
+            if got != want:
+                assert got and not want, case
+                assert graph and on_host and q_lens == kv_lens, case
+                assert len(q_lens) <= 4 and max(q_lens) >= 1024, case
+                assert 1024 <= max_q < max_kv <= 8192, case
+                assert 8 * mi <= work < 16 * mi, case
+                widened += 1
+            if got and len(q_lens) > 4:  # only the extension admits these
+                extended += 1
+                relaxed += graph and spare
+            admitted += got
+            total += 1
+    assert 100 < admitted < total - 100  # the grid exercises both answers,
+    assert extended > 100  # ... the extension,
+    assert relaxed > 0  # ... under a capacity's total above the batch's,
+    assert widened > 0  # ... and the graph-only band
 
 
 @pytest.fixture
@@ -530,6 +817,7 @@ _OUTSIDE_WITHOUT_THE_GATE = [
     dict(hq=32, hk=1),
     dict(max_q_len=2048, total_q_tokens=2048, host=False),  # neither bound test
     dict(max_kv_len=32769, host=False),
+    # more than four requests: only host lengths above 128 tokens could admit
     dict(batch_size=5, host=False),
     # the bound-based work is below 8 Mi
     dict(max_kv_len=2048, host=False, hq=16, hk=4),
@@ -554,6 +842,70 @@ def test_sm100_region_asks_the_cudnn_gate_inside(cudnn_gate):
     assert len(cudnn_gate) == 2
 
 
+def test_sm100_region_reads_no_lengths_for_short_queries(
+    monkeypatch, cudnn_gate_forbidden
+):
+    """The extension needs a query above 128 tokens.  Under a ``max_q_len``
+    of at most 128 a plan outside the bounded domain is refused on its
+    bounds: a decode or speculative plan neither reads its host lengths nor
+    asks the gate for the extension."""
+
+    unread = dict(qo_indptr=_HostUnread(), kv_seq_lens=_HostUnread())
+    # (the query total of the last two has room for a 1024-token request next
+    # to non-empty ones, so max_q_len alone keeps their lengths unread)
+    for q_len, batch in ((1, 8), (16, 8), (128, 5), (128, 9), (16, 128)):
+        facts = _facts([q_len] * batch, [8192] * batch, **unread)
+        assert not _in_sm100_cudnn_region(facts)
+    # control: one more query token, and the answer needs the lengths
+    monkeypatch.setattr(_auto_policy, "_cudnn_supports_paged_auto", lambda: True)
+    with pytest.raises(AssertionError, match="host lengths read"):
+        _in_sm100_cudnn_region(_facts([129] * 5, [8192] * 5, **unread))
+
+
+@pytest.mark.parametrize(
+    "q_lens,reads",
+    [
+        ([1] * 64, False),  # decode
+        ([16] * 64, False),  # speculative
+        # 128 tokens per request, and one more token in the total
+        ([128] * 5, False),
+        ([129] + [128] * 4, True),
+        # nine requests: a total of 1023 + 9 has room for a 1024-token one
+        ([1023] + [1] * 8, False),
+        ([1024] + [1] * 8, True),
+    ],
+    ids=["decode", "speculative", "q128", "q128+1", "one-q1023", "one-q1024"],
+)
+def test_sm100_region_reads_no_lengths_under_a_small_query_total(
+    monkeypatch, q_lens, reads
+):
+    """A plan can declare a ``max_q_len`` far above its queries (here 2048).
+    The extension needs more than 128 tokens for every request, or a
+    1024-token request next to non-empty ones; a query total that allows
+    neither refuses the plan before its host lengths are read or the gate is
+    asked, so a decode batch does not pay for the extension under any
+    declared bound."""
+
+    facts = _facts(
+        q_lens,
+        [8192] * len(q_lens),
+        max_q_len=2048,
+        qo_indptr=_HostUnread(),
+        kv_seq_lens=_HostUnread(),
+    )
+    if reads:
+        monkeypatch.setattr(_auto_policy, "_cudnn_supports_paged_auto", lambda: True)
+        with pytest.raises(AssertionError, match="host lengths read"):
+            _in_sm100_cudnn_region(facts)
+    else:
+        monkeypatch.setattr(
+            _auto_policy,
+            "_cudnn_supports_paged_auto",
+            lambda: pytest.fail("the cuDNN version gate was asked"),
+        )
+        assert not _in_sm100_cudnn_region(facts)
+
+
 def test_policy_rereads_host_lengths_on_each_call(cudnn_qualified):
     facts = _facts([256], [2048], hq=16, hk=4)  # exactly 8 Mi of work
     assert ordered_sm100_backends(facts)[0] == "cudnn"
@@ -571,6 +923,7 @@ def test_policy_rereads_host_lengths_on_each_call(cudnn_qualified):
         (dict(kv_seq_lens=torch.tensor([20000], dtype=torch.int32)), "max_kv_len"),
         (dict(qo_indptr=torch.tensor([0, 2000], dtype=torch.int32)), "max_q_len"),
         (dict(qo_indptr=torch.tensor([128, 0], dtype=torch.int32)), "query lengths"),
+        (dict(total_q_tokens=100), "total_q_tokens 100"),
         (dict(kv_seq_lens=torch.tensor([-1], dtype=torch.int32)), "KV lengths"),
     ],
 )
@@ -602,13 +955,6 @@ def test_policy_never_reads_a_device_tensor(cudnn_qualified):
     """A tensor that is not on the host is treated as absent (the bound-based
     answer), not moved: a fake stands in for a CUDA tensor so this runs
     anywhere."""
-
-    class _DeviceOnly:
-        device = torch.device("cuda", 0)
-
-        def __getattr__(self, name):
-            raise AssertionError(f"device tensor touched: .{name}")
-
     facts = _facts(
         [64] * 4,
         [8192, 64, 64, 64],
@@ -715,6 +1061,99 @@ def test_resolve_excludes_cake_from_auto_only(monkeypatch):
     assert "not an auto candidate" in auto.excluded["cake"]
     assert "backend='cake'" in auto.explain()
     assert _resolve(backend="cake", **cfg).backends == ("cake",)
+
+
+# Known differences to the legacy wrapper's ``auto``: parts of its cuDNN
+# admission that are not copied.  Each test says what closing it changes.
+
+
+def _resolve_head_dim_256(monkeypatch, cc_major, q_dtype=torch.bfloat16):
+    monkeypatch.setattr(
+        _selection, "PROBES", {name: (lambda device: None) for name in CAPABILITIES}
+    )
+    return _resolve(
+        cc_major=cc_major,
+        num_qo_heads=32,
+        num_kv_heads=8,
+        head_dim_qk=256,
+        q_dtype=q_dtype,
+        page_size=16,
+    )
+
+
+def test_sm100_head_dim_256_is_not_copied(monkeypatch, cudnn_qualified):
+    """The legacy SM100 admission has a second domain at head dim 256
+    (``_blackwell_paged_gqa_auto_cudnn``: GQA prefix batches of at most four
+    requests from 16 Mi of work) behind a gate of its own, which needs a
+    newer cudnn-frontend than the head-dim-128 gate.  Here cuDNN is not a
+    candidate at head dims (256, 256) and the region is False there, so with
+    that gate open the legacy wrapper plans cuDNN where this API plans fa2.
+
+    To close it: declare (256, 256) for cuDNN in the capability table and
+    copy that predicate with its gate into the region.  This test then goes,
+    and head dim 256 joins the grid of
+    ``test_sm100_cudnn_region_against_the_legacy_predicate``."""
+    monkeypatch.setattr(legacy_prefill, "get_compute_capability", lambda dev: (10, 0))
+    resolution = _resolve_head_dim_256(monkeypatch, 10)
+    assert resolution.backends == ("fa2",)
+    assert "(256, 256)" in resolution.excluded["cudnn"]
+    facts = _facts([128], [16384], head_dim_qk=256, head_dim_vo=256)  # 64 Mi
+    bf16 = torch.bfloat16
+    for gate in (False, True):
+        monkeypatch.setattr(
+            legacy_prefill,
+            "_cudnn_supports_paged_gqa_auto",
+            lambda head_dim, gate=gate: gate,
+        )
+        admitted = legacy_prefill._blackwell_paged_auto_cudnn(
+            None,
+            "HND",
+            bf16,
+            bf16,
+            bf16,
+            256,
+            256,
+            1,
+            32,
+            8,
+            128,
+            16384,
+            16,
+            128,
+            facts.qo_indptr,
+            facts.kv_seq_lens,
+        )
+        assert admitted is gate
+        assert not _in_sm100_cudnn_region(facts)
+    assert ordered_sm100_backends(facts)[0] == "fa2"
+    assert plan_order(resolution.backends, (10, 0), facts) == ("fa2",)
+
+
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float16])
+def test_sm90_head_dim_256_is_not_copied(monkeypatch, cudnn_gate_forbidden, q_dtype):
+    """The legacy wrapper's ``auto`` admits cuDNN at head dim 256 on one
+    Hopper part (``_hopper_paged_auto_cudnn``: H100 80GB HBM3, bf16 or fp16,
+    a longest query above 64 tokens, from 16 Mi of work).  Here cuDNN is not
+    a candidate at head dims (256, 256) on any architecture and the SM90
+    order reads no device fact: fa3 leads such a batch, fa2 one whose
+    longest query has at most 64 tokens.
+
+    To close it: declare (256, 256) for cuDNN, give the policy the device
+    facts that predicate reads and a region for SM90 pinned against it as
+    the SM100 one is.  The candidate set and the orders below then change."""
+    resolution = _resolve_head_dim_256(monkeypatch, 9, q_dtype)
+    assert resolution.backends == ("fa3", "fa2")
+    assert "(256, 256)" in resolution.excluded["cudnn"]
+    for q_len, order in ((65, ("fa3", "fa2")), (64, ("fa2", "fa3"))):
+        facts = _facts(
+            [q_len],
+            [16384],
+            head_dim_qk=256,
+            head_dim_vo=256,
+            q_dtype=q_dtype,
+            kv_dtype=q_dtype,
+        )
+        assert plan_order(resolution.backends, (9, 0), facts) == order
 
 
 # --------------------------------------------------------------------------
@@ -1224,7 +1663,7 @@ def test_graph_mode_typed_fallback_freezes_the_selection(planners):
 def test_graph_mode_ranks_on_the_capacity(planners):
     """The kernels are planned with the capacity's bounds, so the rows / fill
     rule reads those, not the first batch that happens to arrive.  (The cuDNN
-    region reads the first batch's lengths as well: next test.)"""
+    region reads the first batch's lengths as well: next two tests.)"""
     capacity = GraphCapacity(
         batch_size=2,
         total_q_tokens=1024,
@@ -1265,15 +1704,45 @@ def test_graph_mode_cudnn_admission_reads_the_first_batch(planners):
     assert frozen[0] == "cudnn" and frozen[1] != "cudnn"
 
 
+def test_graph_mode_cudnn_extension_reads_the_first_batch(planners):
+    """The extension of the region reads the first planned batch alone.  Six
+    requests of 256 tokens over 4096 keys (96 Mi of work at 16 heads) freeze
+    cuDNN under a capacity far above them: its query and KV bounds pass
+    neither bound test, and its total is above the batch's.  A first batch
+    with one request of 128 tokens does not; later batches are not
+    re-ranked."""
+    capacity = GraphCapacity(
+        batch_size=6,
+        total_q_tokens=6 * 2048,
+        max_q_len=2048,
+        max_kv_len=65536,
+        page_size=16,
+        table_width=4096,
+    )
+    batches = [[256] * 6, [256] * 5 + [128]]
+    frozen = []
+    for q_lens in batches:
+        attn = planners.controller(graph_capacity=capacity)
+        attn.plan(_host_metadata(q_lens, [4096] * 6, width=4096), **_HOST_KW)
+        frozen.append(attn.backend)
+        for later in batches:
+            attn.update(_host_metadata(later, [4096] * 6, width=4096))
+        assert attn.backend == frozen[-1]
+    assert frozen[0] == "cudnn" and frozen[1] != "cudnn"
+
+
 def test_graph_mode_full_prefill_under_the_inferred_capacity(planners):
     """Full prefill with a length that is not a page multiple: the inferred
-    capacity's KV bound is the table's (308 pages = 4928 > 4921), which only
-    the widened graph-mode bound test admits; q != kv on the host does not."""
+    capacity's KV bound is the table's (69 pages = 1104 > 1100).  At 8 heads
+    the batch carries 9.2 Mi of work, below the 16 Mi from which its lengths
+    would admit it under any bound, so only the widened graph-mode bound test
+    admits it; a request that is not full prefill is not admitted."""
+    heads = dict(_HOST_KW, num_qo_heads=8, num_kv_heads=2)
     attn = planners.controller(use_cuda_graph=True)
-    attn.plan(_host_metadata([4921], [4921]), **_HOST_KW)
+    attn.plan(_host_metadata([1100], [1100]), **heads)
     assert attn.backend == "cudnn"
     attn = planners.controller(use_cuda_graph=True)
-    attn.plan(_host_metadata([4921], [4920]), **_HOST_KW)
+    attn.plan(_host_metadata([1100], [1101]), **heads)
     assert attn.backend != "cudnn"
 
 
@@ -1470,7 +1939,8 @@ def _force_first(monkeypatch, *lead):
     """Inject the policy's order, as the MLA suite does: the ``lead``
     candidates first, in that order, then the rest.  Lifetime and numerical
     tests must not depend on what the measured rule ranks first for a shape
-    (root CLAUDE.md).  Skips where a ``lead`` candidate cannot run."""
+    (docs/development/backend_notes.md).  Skips where a ``lead`` candidate
+    cannot run."""
     runnable = _resolve(
         device=torch.device("cuda:0"),
         num_qo_heads=_HQ,

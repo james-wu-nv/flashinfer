@@ -340,6 +340,14 @@ def _capability_rows():
         ),
         ("cudnn", "csr-page8", dict(kv_input_form="page_indices", page_size=8), None),
         ("cudnn", "fp8-kv", dict(kv_dtype=torch.float8_e4m3fn), "unsupported kv dtype"),
+        # (the legacy wrapper's explicit cuDNN backend takes an fp8 q over an
+        # fp8 KV cache, and a sliding window: known differences, design doc)
+        (
+            "cudnn",
+            "fp8-q",
+            dict(q_dtype=torch.float8_e4m3fn, kv_dtype=torch.float8_e4m3fn),
+            "unsupported q dtype",
+        ),
         ("trtllm-gen", "cc9", dict(cc_major=9), "compute capability"),
         ("trtllm-gen", "page8", dict(page_size=8), "unsupported page_size"),
         ("trtllm-gen", "page32", dict(page_size=32), None),

@@ -9,7 +9,7 @@ backend knows its native dialect or LSE format.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, FrozenSet
+from typing import Callable, Dict, FrozenSet, Type, Union
 
 import torch
 
@@ -30,7 +30,9 @@ _FACTORIES: Dict[str, Callable] = {
     "trtllm-gen": lambda dev, layout, ws, cap: _TrtllmGenBackend(dev, layout, ws),
     "cake": lambda dev, layout, ws, cap: _TrtllmGenBackend(dev, layout, ws, "cake"),
 }
-_CLASSES: Dict[str, type] = {
+_CLASSES: Dict[
+    str, Union[Type[_FaBackend], Type[_CudnnBackend], Type[_TrtllmGenBackend]]
+] = {
     "fa2": _FaBackend,
     "fa3": _FaBackend,
     "cudnn": _CudnnBackend,

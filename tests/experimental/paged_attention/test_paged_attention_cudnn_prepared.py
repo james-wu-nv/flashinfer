@@ -14,7 +14,9 @@ paged-attention oracle and without timing thresholds:
    entry and repeats none of the plan-time host work (no metadata resolve,
    no plan staging, no binding map or descriptor key rebuilt; the execute is
    ``run_planned``).  The functional fallback is taken and still correct
-   without a staged plan.
+   without a staged plan.  The gate is the library's for explicit
+   per-request lengths: a plan is staged under the answers of a cuDNN that
+   has that form and not the mixed cumulative one.
 3. ``sm_scale`` / ``k_scale`` / ``v_scale`` supplied only to ``run()`` and
    changed between runs of one plan.
 4. Eager re-plans with changed lengths and changed page ids; through page
@@ -138,14 +140,17 @@ def _problem(
 
 
 def _prepared_expected():
-    """The gate the backend stages its plan under: per-request KV lengths next
-    to token-unit query offsets (cuDNN 9.25 / cudnn-frontend 1.27)."""
-    return cudnn_prefill._cudnn_supports_direct_seqlens(torch.bfloat16, mixed=True)
+    """The gate the backend stages its plan under: token-unit query offsets
+    next to explicit per-request Q and KV lengths (cuDNN 9.24 for f16 /
+    bf16)."""
+    return cudnn_prefill._cudnn_supports_paged_token_offsets(
+        torch.bfloat16, explicit_q=True, explicit_kv=True
+    )
 
 
 def _require_prepared():
     if not _prepared_expected():
-        pytest.skip("this cuDNN / frontend has no direct paged seq-lens path")
+        pytest.skip("this cuDNN has no direct paged token-offset path")
 
 
 def _plan_cudnn(p, *, causal=True, lse_mode="base2", attn=None, **attn_kwargs):
@@ -453,21 +458,71 @@ def test_functional_fallback_without_a_staged_plan(monkeypatch, kv_layout, lse_m
     assert_matches(out, lse, p, lse_mode=lse_mode)
 
 
-def test_functional_fallback_below_the_direct_seqlens_gate(monkeypatch):
-    """The library gate forced off (what an older cuDNN / frontend reports):
-    nothing is staged and the functional entry serves the call."""
+@pytest.mark.parametrize(
+    "helper", ["_cudnn_supports_paged_token_offsets", "_cudnn_supports_direct_seqlens"]
+)
+def test_functional_fallback_below_the_direct_seqlens_gate(monkeypatch, helper):
+    """The library gate forced off (what a cuDNN below 9.24 reports), at the
+    paged helper that the backend's staging gate and the entry's own
+    resolution ask and at the version helper under it: nothing is staged and
+    the functional entry serves the call on its element-offset path."""
     p = _problem(*_RAGGED, seed=103)
+    monkeypatch.setattr(cudnn_prefill, helper, lambda *args, **kwargs: False)
+    resolved = []
+    real = cudnn_prefill._PrefillMetadata.resolve_from_plan
+
+    def resolve_from_plan(self, *args, **kwargs):
+        metadata = real(self, *args, **kwargs)
+        resolved.append(metadata._token_offsets)
+        return metadata
+
     monkeypatch.setattr(
-        cudnn_prefill,
-        "_cudnn_supports_direct_seqlens",
-        lambda dtype, *, mixed=False: False,
+        cudnn_prefill._PrefillMetadata, "resolve_from_plan", resolve_from_plan
     )
     attn, backend = _plan_cudnn(p, lse_mode="none")
     assert backend._cudnn_plan is None
+    assert not resolved  # plan() stopped at the gate
     calls = _spy_functional_entry(monkeypatch)
     out, lse = run(attn, p)
     assert_matches(out, lse, p, lse_mode="none")
     assert len(calls) == 1 and backend._prepared is None
+    assert resolved and not any(resolved)  # the entry converted the offsets
+
+
+@pytest.mark.parametrize("lse_mode", ["none", "base2"])
+def test_plan_is_staged_under_the_explicit_lengths_gate(monkeypatch, lse_mode):
+    """The staging gate is the library's for explicit per-request Q and KV
+    lengths, the form this backend passes, which cuDNN serves one version
+    (9.24) before the mixed cumulative form (9.25).  With the version helper
+    answering as 9.24 does -- the installed library still runs the graph,
+    which holds no cumulative lengths -- a plan is staged with token-unit
+    offsets and run() stays off the functional entry.  The packed-LSE probe
+    keeps the mixed-form gate: it does not run there, and the LSE is gathered
+    from the padded stats."""
+    _require_prepared()
+    monkeypatch.setattr(
+        cudnn_prefill,
+        "_cudnn_supports_direct_seqlens",
+        lambda dtype, *, mixed=False: not mixed,
+    )
+    # no answer an earlier test cached, and none probed here
+    monkeypatch.setattr(cudnn_backend, "_PACKED_LSE_SUPPORTED", {})
+
+    def probe(device, workspace):
+        raise AssertionError("the packed-LSE probe ran below its gate")
+
+    monkeypatch.setattr(cudnn_backend, "_probe_packed_lse", probe)
+    p = _problem(*_RAGGED, seed=109)
+    attn, backend = _plan_cudnn(p, lse_mode=lse_mode)
+    staged = backend._cudnn_plan
+    assert staged is not None
+    assert staged.metadata._token_offsets
+    assert staged.metadata.cu_seq_lens_q is None  # explicit lengths, not mixed
+    if lse_mode != "none":
+        assert backend._lse_path == "gather"
+    _forbid_functional_entry(monkeypatch)
+    out, lse = run(attn, p)
+    assert_matches(out, lse, p, lse_mode=lse_mode)
 
 
 @pytest.mark.parametrize("first", ["functional", "prepared"])
