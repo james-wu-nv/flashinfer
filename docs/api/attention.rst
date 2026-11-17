@@ -179,11 +179,13 @@ any of these is the opt-in (an
 `#5007 <https://github.com/flashinfer-ai/flashinfer/issues/5007>`_ for the
 graduation plan.
 
-Non-causal attention with a sliding window has no runnable backend today:
-trtllm-gen and cake ship no such kernel, cuDNN has no sliding window, and
-the fa2 kernel computes it wrong for requests longer than 128 query tokens
-with a history (design doc, known limitation M20), so fa2/fa3 declare it
-unsupported and ``resolve_paged_attention`` reports the reason per backend.
+Non-causal attention with a sliding window has no runnable backend in this
+API today: trtllm-gen and cake ship no such kernel, this API's cuDNN backend
+declares no sliding window (the legacy wrapper's explicit cuDNN backend runs
+one; design doc, known limitation D3), and the fa2 kernel computes it wrong
+for requests longer than 128 query tokens with a history (design doc, known
+limitation M20), so fa2/fa3 declare it unsupported and
+``resolve_paged_attention`` reports the reason per backend.
 
 The slots of a request's last page past its ``kv_seq_lens`` entry are never
 attended but must hold finite values: the FA kernels zero that tail before
@@ -194,7 +196,9 @@ result; a KV pool allocated with ``torch.empty`` and never written past
 ``kv_len`` is not covered by that guarantee until its storage is initialised.
 
 cuDNN finalizes one execution plan per declared shape (about 5 ms), so an
-eager cuDNN plan declares a shape class instead of the batch's exact maxes:
+eager cuDNN plan declares a shape class instead of the batch's exact maxes,
+on every architecture (the legacy wrapper does so only where its ``auto``
+selects cuDNN on Blackwell; design doc, known limitation D5):
 the KV bound rounds up to the next power of two, and a query bound above 64
 tokens rounds up to whole ``128 // (num_qo_heads // num_kv_heads)``-token
 tiles, at least 128, when that GQA group divides 128. The plans of a serving
@@ -243,22 +247,55 @@ nothing is ranked, and a batch that backend cannot plan raises a
 On SM100 (compute capability 10.0) the rule is:
 
 1. cuDNN first inside the region in which the legacy wrapper's ``auto``
-   selects it: plain causal attention (no sliding window, soft cap, custom
-   mask or sinks) with bf16 Q and KV, head dimension 128, page size 16, HND
-   layout, 1 to 4 requests and 8 to 64 query heads in a GQA group of 1, 2, 4,
-   8 or 16; either a prefix, ``max_q_len`` of 64 to 1024 with ``max_kv_len``
-   of 2048 to 32768 and at least four times ``max_q_len``, or a full prefill,
-   ``max_q_len == max_kv_len`` of 1024 to 8192 (in CUDA-graph mode
-   ``1024 <= max_q_len <= max_kv_len <= 8192``) with every request's query
-   non-empty and as long as its KV on the host mirrors and the longest at
-   least 1024 tokens;
-   and at least 8 Mi ``num_qo_heads * q_len * kv_len`` of work, summed over
-   the requests. These bounds are the declared maxes: a ``max_kv_len`` above
-   32768 is outside the region whatever the lengths, and so is a full prefill
-   of more than 1024 tokens under a ``max_kv_len`` above 8192 (a table sized
-   for a longer context). cuDNN leads there only with cudnn-frontend 1.32 or
-   newer, its FROST runtime and cuDNN 9.27 or newer; with an older
-   installation it stays the last candidate.
+   selects it at head dimension 128. Every admission needs plain causal
+   attention (no sliding window, soft cap, custom mask or sinks) with bf16 Q
+   and KV, head dimension 128, page size 16, HND layout and 8 to 64 query
+   heads in a GQA group of 1, 2, 4, 8 or 16. With ``work`` for
+   ``num_qo_heads * q_len * kv_len`` summed over the requests and Mi for
+   ``2**20``, two parts admit:
+
+   - The bounded domain: at most four requests with at least 8 Mi of work,
+     under declared maxes that are either a prefix, ``max_q_len`` of 64 to
+     1024 with ``max_kv_len`` of 2048 to 32768 and at least four times
+     ``max_q_len``, or a full prefill, ``max_q_len == max_kv_len`` of 1024
+     to 8192 (in CUDA-graph mode ``1024 <= max_q_len <= max_kv_len <=
+     8192``) with every request's query non-empty and as long as its KV and
+     the longest at least 1024 tokens.
+   - The length-based extension, for any number of requests: at least 16 Mi
+     of work and every request with ``0 < q_len <= kv_len``; then either
+     every ``q_len == kv_len`` with a longest query of 1024 to 16384 tokens,
+     or every ``q_len`` above 128 with a longest query of at most 8192 and a
+     longest KV of 2048 to 32768 tokens.
+
+   The prefix and full-prefill tests read the declared maxes. The work, the
+   proof that every query is as long as its KV and every test of the
+   extension read the per-request lengths on the host mirrors, and "longest"
+   in the extension is the batch's own. A batch that qualifies for the
+   extension is therefore admitted under any maxes declared above its
+   lengths, a full prefill under a ``max_kv_len`` sized for a longer
+   context for instance. A batch the extension does not admit (less than
+   16 Mi of work, for instance, or a request of at most 128 query tokens in
+   a batch that is not all full prefill) needs the bounded domain, which
+   reads the declared maxes: under a ``max_kv_len`` above 32768 it is
+   outside the region whatever its lengths.
+
+   In CUDA-graph mode the declared maxes are the capacity's and the lengths
+   are those of the first planned batch. That batch alone decides the
+   extension: one that qualifies freezes cuDNN, planned with the capacity's
+   bounds, however far those are above it. The wider full-prefill test of
+   that mode matters only for at most four requests of full prefill with at
+   least 8 Mi and less than 16 Mi of work (8 to 15 query heads) under a
+   capacity whose ``max_kv_len`` is above its ``max_q_len``; from 16 Mi the
+   extension admits such a batch under any capacity.
+
+   cuDNN leads there only where the library's gate for this selection
+   holds, the one the legacy wrapper asks: the cudnn-frontend FROST runtime
+   with its paged packed-split selector, on cuDNN 9.24 or newer
+   (cudnn-frontend 1.32 is the package's minimum requirement). Otherwise the
+   region is empty and cuDNN stays the last candidate. The legacy wrapper's
+   head-dimension-256 domain on SM100 is not copied (design doc, known
+   limitation D1).
+
 2. Otherwise trtllm-gen first when the packed query rows fill its 128-row
    tiles. With ``rows = num_qo_heads * total_q_tokens / 128`` and ``fill =
    rows / (batch_size * num_qo_heads * ceil(max_q_len / 128))`` it needs
@@ -279,11 +316,13 @@ describes the policy under "Level 2: the auto policy".
 
 The other architectures have fixed orders, selected by the major of the
 compute capability: SM90 ``fa3, fa2, cudnn``, with fa2 first when
-``max_q_len`` is at most 64 (the legacy wrapper's rule); the other SM10x
-parts ``trtllm-gen, cudnn, fa2``, with fa2 first when ``max_q_len`` is at
-most 16; SM8x and SM12x ``fa2, cudnn``, whatever the shape. ``max_q_len`` is
-the declared bound here too (the capacity's in CUDA-graph mode). Only the
-SM100 rule is fitted to measurements of this API.
+``max_q_len`` is at most 64 (the legacy wrapper's short-query rule; its
+cuDNN admission on H100 at head dimension 256 is not copied, design doc,
+known limitation D2); the other SM10x parts ``trtllm-gen, cudnn, fa2``,
+with fa2 first when ``max_q_len`` is at most 16; SM8x and SM12x
+``fa2, cudnn``, whatever the shape. ``max_q_len`` is the declared bound
+here too (the capacity's in CUDA-graph mode). Only the SM100 rule is fitted
+to measurements of this API.
 
 The ``max_q_len`` hint of :func:`~flashinfer.prefill.resolve_paged_attention`
 is a promise about the batches planned with the Resolution: they have at most
@@ -335,9 +374,10 @@ size 16, causal, no LSE; a dense block table exactly ``kv_len / 16`` columns
 wide, so a CUDA-graph capacity equals the shape): ``run()`` medians in µs of
 each backend named through this API, and the backend ``auto`` ran. The
 benchmark routine below builds a table three columns wider; with CUDA graphs
-on and the dense form, its ``auto`` ranks on that width as the KV bound,
-which puts the last shape (a full prefill at the region's upper KV bound)
-outside the cuDNN region.
+on and the dense form, its ``auto`` ranks on that width as the KV bound. A
+wider KV bound can put a shape outside the cuDNN region only through the two
+bound tests: the last shape (a full prefill of 8192 tokens) is admitted by
+its lengths under either bound.
 
 =====  =====  ======  ==========  ====  ==========  =====  ==========
 batch  q_len  kv_len  mode        fa2   trtllm-gen  cuDNN  auto
@@ -504,7 +544,8 @@ Batch Prefill/Append Attention
     remains fully supported and receives bug fixes; new integrations should
     start from the unified API, which is the only path on which ``backend="auto"``
     can select the trtllm-gen kernel (the wrapper's own ``auto`` chooses
-    between fa2 / fa3 and, inside its SM100 region, cuDNN).
+    between fa2 / fa3 and cuDNN, the latter inside its SM100 domains and,
+    at head dimension 256, on H100 80GB).
 
 .. autoclass:: BatchPrefillWithRaggedKVCacheWrapper
     :members:

@@ -345,10 +345,10 @@ How each backend launches:
 - cuDNN stages a `_CudnnPrefillPlan` at `plan()`, and `run()` executes a
   prepared cuDNN graph through it, rebinding only Q, K, V, O and the stats.
   `cudnn_batch_prefill_with_kv_cache` remains the fallback where no plan can
-  be staged (a cuDNN / frontend below the direct token-offset path) and the
-  packed-LSE probe. What the plan declares to cuDNN and which page table it
-  binds differ between eager and CUDA-graph mode; see "Page-table ABI per
-  backend".
+  be staged (a cuDNN below the direct token-offset path, 9.24 for the
+  explicit lengths this backend passes) and the packed-LSE probe. What the
+  plan declares to cuDNN and which page table it binds differ between eager
+  and CUDA-graph mode; see "Page-table ABI per backend".
 - trtllm-gen / cake call `trtllm_batch_context_with_kv_cache` with the
   canonical tensors and the cumulative KV lengths.
 
@@ -633,43 +633,104 @@ Only exact SM100, compute capability `(10, 0)`, has a measured rule. Below,
 upper bounds, which a caller may set above the batch's longest lengths. The
 rule puts one backend first:
 
-1. cuDNN, inside the legacy wrapper's qualified cuDNN region. The region
-   duplicates `flashinfer.prefill._blackwell_paged_auto_cudnn` and the
-   feature conditions around its call; on eager facts the two are equal
-   (`tests/experimental/paged_attention/test_paged_attention_auto_policy.py::test_sm100_cudnn_region_equals_the_legacy_predicate`).
-   All of the following hold:
-   - causal, with no sliding window, soft cap, custom mask or sinks;
-   - HND layout, bf16 `q` and KV, head dim 128, page size 16, batch 1 to 4,
-     8 to 64 query heads, GQA group 1, 2, 4, 8 or 16;
-   - the bounds are a prefix, `64 <= max_q <= 1024`,
-     `2048 <= max_kv <= 32768` and `max_kv >= 4 * max_q`, or a full prefill,
-     `1024 <= max_q == max_kv <= 8192`. Equal maxima do not show that a batch
-     is a full prefill, so the full-prefill case also needs, on the host
-     mirrors, every request's Q length nonzero and equal to its KV length
-     and a longest query of at least 1024 tokens. Facts without host lengths admit the
-     prefix case only;
-   - at least 8 Mi (2^23) of `num_qo_heads x Q x KV` work: from the bounds
-     (`total_q_tokens * max_kv`) and then exactly, as the sum of
-     `q_len * kv_len` over the requests on the host mirrors;
-   - `flashinfer.cudnn.prefill._cudnn_supports_paged_auto()` holds:
-     cudnn-frontend 1.32 or newer with the FROST runtime and the paged
-     packed-split selector, on cuDNN 9.27 or newer. With an older cuDNN the
-     region is empty and cuDNN stays last.
+1. cuDNN, inside the legacy wrapper's qualified cuDNN region at head dim
+   128. The region duplicates the head-dim-128 part of
+   `flashinfer.prefill._blackwell_paged_auto_cudnn` and the feature
+   conditions around its call. On eager facts the two are equal at head dim
+   128, and a CPU test compares them over a grid of facts, which is where a
+   change of the legacy predicate shows
+   (`tests/experimental/paged_attention/test_paged_attention_auto_policy.py::test_sm100_cudnn_region_against_the_legacy_predicate`).
+   The legacy predicate's head-dim-256 domain is not copied (known
+   limitation D1).
 
-   In CUDA-graph mode the bounds are the capacity's: the upper bounds of a
-   bucket, not one batch's maxima. An inferred capacity's KV bound is the
-   table's whole width in tokens, which exceeds a full-prefill length that
-   is not a multiple of the page size, so equal bounds cannot identify full
-   prefill there. The full-prefill bound test in CUDA-graph mode is
-   `1024 <= max_q <= max_kv <= 8192`, still with the per-request proof,
-   taken from the first plan's host lengths; a capacity that also meets the
-   prefix bounds needs no proof. This is the one place where the region
-   differs from the legacy predicate on equal arguments. It admits a
-   full-prefill batch planned under a KV bound wider than its query bound,
-   which the legacy wrapper admits when it derives its bounds from the
-   batch, as long as the capacity's KV bound is at most 8192. Under a wider
-   bound (a 4096-token full prefill in a table sized for a longer context)
-   the batch is outside the region.
+   Every admission needs all of:
+   - causal, with no sliding window, soft cap, custom mask or sinks;
+   - HND layout, bf16 `q` and KV, head dim 128, page size 16, 8 to 64 query
+     heads, GQA group 1, 2, 4, 8 or 16;
+   - `flashinfer.cudnn.prefill._cudnn_supports_paged_auto()`, the gate the
+     legacy wrapper asks: the cudnn-frontend FROST runtime with the paged
+     packed-split selector, on cuDNN 9.24 or newer. cudnn-frontend 1.32 is
+     the package's minimum requirement; the helper does not compare the
+     frontend's version. Where the gate does not hold the region is empty
+     and cuDNN stays last.
+
+   With Mi for 2^20 and `work` for `num_qo_heads * sum(q_i * kv_i)` over the
+   requests, two parts admit:
+   - The bounded domain, the legacy wrapper's original one: at most four
+     requests whose bounds are a prefix, `64 <= max_q <= 1024`,
+     `2048 <= max_kv <= 32768` and `max_kv >= 4 * max_q`, or a full prefill,
+     `1024 <= max_q == max_kv <= 8192`, with `work >= 8 Mi`. Equal maxima do
+     not show that a batch is a full prefill, so the full-prefill case also
+     needs every request's Q length nonzero and equal to its KV length and a
+     longest query of at least 1024 tokens.
+   - The length-based extension, for any number of requests:
+     `work >= 16 Mi` and every `0 < q_i <= kv_i`; then either every
+     `q_i == kv_i` with the longest query in 1024..16384, or every
+     `q_i > 128` with the longest query at most 8192 and the longest KV in
+     2048..32768. One request of at most 128 query tokens keeps a batch that
+     is not all full prefill out of the extension, whatever work the other
+     requests carry.
+
+   Which values the tests read:
+   - The two bound tests of the bounded domain read the declared bounds
+     `max_q` / `max_kv`. So does a cheap work bound that every admission
+     passes before the gate is asked,
+     `total_q_tokens * num_qo_heads * max_kv >= 8 Mi`.
+   - The work, the `q_i == kv_i` proof and every test of the extension read
+     the per-request lengths of the host mirrors; "longest" in the extension
+     is the batch's own. A batch that qualifies for the extension is
+     therefore admitted under any bounds declared above its lengths: a
+     bucketed `max_kv_len`, or a table sized for a longer context, does not
+     put it outside the region. A batch the extension does not admit (less
+     than 16 Mi of work, for instance, or a request of at most 128 query
+     tokens in a batch that is not all full prefill) needs the bounded
+     domain and with it the declared bounds: under a `max_kv` above 32768 it
+     is outside the region whatever its lengths.
+   - Two host values rule the extension out before a length is read: a
+     `max_q` of at most 128, and a `total_q_tokens` that allows neither more
+     than 128 tokens for every request nor a 1024-token request next to
+     non-empty ones (`total_q_tokens <= 128 * batch_size` and
+     `total_q_tokens < 1023 + batch_size`). A plan outside the bounded
+     domain is then refused without reading its lengths, a decode batch
+     under any declared `max_q`.
+   - Facts without host lengths (a device tensor in place of a mirror; a
+     `PagedAttentionMetadata` never produces them) admit through the prefix
+     test only, for at most four requests and with the cheap bound as the
+     only work test. Full prefill and the extension are never assumed from
+     the bounds.
+
+   CUDA-graph facts mix two sources:
+   - The bounds, `total_q_tokens` included, are the capacity's: the upper
+     bounds of a bucket, not one batch's maxima. An inferred capacity's KV
+     bound is the table's whole width in tokens, which exceeds a
+     full-prefill length that is not a multiple of the page size, so equal
+     bounds cannot identify full prefill there. The full-prefill bound test
+     in CUDA-graph mode is `1024 <= max_q <= max_kv <= 8192`, still with
+     the per-request proof; a capacity that also meets the prefix bounds
+     needs no proof.
+   - The per-request lengths are those of the batch being planned. A
+     graph-mode instance ranks until a plan succeeds, so they are the first
+     planned batch's, and that batch alone decides the work, the
+     full-prefill proof and the extension. The capacity does not limit the
+     extension: a first batch that qualifies freezes cuDNN, planned with the
+     capacity's bounds, however far those are above it, and later batches
+     are not checked against the region.
+
+   Given the same bounds and lengths, CUDA-graph facts admit everything the
+   legacy predicate admits (the same test checks it) and differ from it in
+   two places. The legacy predicate requires the query lengths to sum to
+   its declared total; a capacity's total is an upper bound, so CUDA-graph
+   facts drop that clause. And the wider full-prefill bound test admits a
+   full-prefill batch planned under a KV bound above its query bound, which
+   the legacy wrapper admits when it derives its bounds from the batch.
+   That widening matters only in a band: at most four requests of full
+   prefill with `8 Mi <= work < 16 Mi` (8 to 15 query heads; for example, at
+   8 heads, a single request of 1024 to 1448 tokens) under a capacity with
+   `max_q < max_kv <= 8192`. From 16 Mi the extension admits such a batch by
+   its lengths under any capacity, so a 4096-token full prefill in a table
+   sized for a longer context is inside the region; a batch of the band
+   under a capacity whose KV bound is above 8192 is inside only if the
+   capacity meets the prefix bounds.
 2. Otherwise trtllm-gen, when the query rows fill enough of the context
    kernel's 128-row tiles: `rows >= W` and `rows / ntg >= F`, with
    `rows = num_qo_heads * total_q_tokens / 128` and
@@ -707,7 +768,7 @@ in CUDA-graph mode); SM8x and SM12x read no shape fact:
 
 | architecture | order |
 | --- | --- |
-| SM90 | fa3, fa2, cudnn; fa2 first at `max_q_len <= 64`, the legacy wrapper's rule |
+| SM90 | fa3, fa2, cudnn; fa2 first at `max_q_len <= 64`, the legacy wrapper's short-query rule. The legacy wrapper's cuDNN admission on H100 is not copied (known limitation D2) |
 | SM10x other than `(10, 0)` | trtllm-gen, cudnn, fa2; fa2 first at `max_q_len <= 16`, the `HEURISTIC_ORDER` buckets evaluated on the plan's `max_q_len` |
 | SM8x, SM12x | fa2, cudnn |
 
@@ -745,10 +806,14 @@ otherwise.
 - Fitted on GB200: the row and fill thresholds of rule 2 and the eager
   short-KV exception. The tables are next to the constants in
   `_auto_policy.py`.
-- Not refitted: the cuDNN region, which is the legacy wrapper's predicate.
-  Only its CUDA-graph bound test is this package's own.
+- Not refitted: the cuDNN region, which is a copy of the legacy wrapper's
+  head-dim-128 predicate, the bounded domain and the length-based extension
+  alike. Only its CUDA-graph form is this package's own: the wider
+  full-prefill bound test and the dropped total clause.
 - Not measured through this API: the SM90, other SM10x, SM8x and SM12x
-  orders. CPU tests pin them; see "Known limitations".
+  orders. CPU tests pin them; see "Known limitations", which also records
+  that the SM90 order does not take the legacy wrapper's H100 cuDNN
+  admission (D2).
 
 #### When a ranking applies
 
@@ -759,13 +824,15 @@ plan freezes its backend, and later plans and `update()` keep it without
 consulting the policy.
 
 The row and fill rule reads only the capacity. The cuDNN region also reads
-the first plan's per-request lengths (the exact work and the Q == KV proof),
-so two instances with one capacity can freeze different backends. A capacity
-of one request with 128 query tokens over 16384 keys (32 query and 8 KV
-heads) freezes cuDNN when the first batch fills it and fa2 when the first
-batch is a 4-token warm-up over 64 keys. Plan the first batch with
-representative lengths, or pin the backend: pass its name (`backend="fa2"`),
-or a `Resolution` resolved with that name.
+the first plan's per-request lengths (the exact work, the Q == KV proof and
+every test of its length-based extension), so two instances with one
+capacity can freeze different backends, and a first batch inside the
+extension puts cuDNN first under any capacity that holds it. A capacity of
+one request with 128 query tokens over 16384 keys (32 query and 8 KV heads)
+freezes cuDNN when the first batch fills it and fa2 when the first batch is
+a 4-token warm-up over 64 keys. Plan the first batch with representative
+lengths, or pin the backend: pass its name (`backend="fa2"`), or a
+`Resolution` resolved with that name.
 
 The policy ranks from `plan()` facts and cannot see what arrives at `run()`.
 The `run()` tensor requirements are those of the backend planned for the
@@ -987,9 +1054,12 @@ with the constraint named.
     with a GQA group that divides 128, rounds up to whole
     `128 // group`-token query tiles, at least 128; up to 64 tokens the Q
     bound stays exact, because the `max_q_len == 1` LSE layout and cuDNN's
-    single-token paths depend on the exact value. These are the formulas of
-    the legacy wrapper's auto path. The per-request lengths stay the actual
-    ones and mask the live tokens.
+    single-token paths depend on the exact value. These are the formulas
+    the legacy wrapper applies where its `auto` selects cuDNN on compute
+    capability `(10, 0)` or `(10, 3)`; this backend applies them on every
+    architecture and for a named cuDNN backend as well (known limitation
+    D5). The per-request lengths stay the actual ones and mask the live
+    tokens.
 
     The class reaches past the table columns the caller filled for the
     batch, and one cuDNN engine loads pages through the columns past a
@@ -1082,13 +1152,14 @@ sink logit.
 cuDNN writes the packed `(tokens, h)` stats straight into the caller's buffer
 through token-unit `batch_offsets_stats` when a one-time per-device feature
 probe (`_packed_lse_supported`, a graph build and execute on a toy problem,
-no host sync) succeeds (`lse_path == "direct"`). At `max_q_len == 1` the padded
-`(b, 1, h)` layout is byte-identical to the packed one and is used as a view
-(`"view"`), because cuDNN 9.25 writes no stats there when a ragged stats
-offset is set. Otherwise the backend gathers padded native stats with
-plan-time precomputed indices (`"gather"`); the padded buffer has the Q bound
-declared to cuDNN (a shape class in eager mode), and in graph mode the
-indices keep the capacity's row count.
+no host sync) succeeds (`lse_path == "direct"`). The probe runs from cuDNN
+9.25; on 9.24 a plan is staged and the LSE is gathered. At
+`max_q_len == 1` the padded `(b, 1, h)` layout is byte-identical to the
+packed one and is used as a view (`"view"`), because cuDNN 9.25 writes no
+stats there when a ragged stats offset is set. Otherwise the backend gathers
+padded native stats with plan-time precomputed indices (`"gather"`); the
+padded buffer has the Q bound declared to cuDNN (a shape class in eager
+mode), and in graph mode the indices keep the capacity's row count.
 
 ## Feature axes
 
@@ -1101,8 +1172,10 @@ time, and frozen by the first graph-mode plan:
   capability by measurement`).
 - `window_left` (default `-1` = unlimited; values below `-1` are rejected
   because backends disagree on their meaning): plan-time because it selects a
-  compiled kernel variant on the FA backends. cuDNN declares no window.
-  Non-causal plus window has no backend: trtllm-gen and cake ship no such
+  compiled kernel variant on the FA backends. This API's cuDNN backend
+  declares no window; the cuDNN graph path has one, and the legacy wrapper's
+  explicit cuDNN backend passes it (known limitation D3). Non-causal plus
+  window therefore has no backend here: trtllm-gen and cake ship no such
   kernel, and fa2 and fa3 declare it unsupported (ledger M20).
 - `logits_soft_cap` (`None` or `0` = off; otherwise a positive finite float):
   `cap * tanh(score / cap)` on the scaled scores. fa2 and fa3 only, through
@@ -1139,14 +1212,17 @@ time, and frozen by the first graph-mode plan:
 - `use_sinks` / `run(sinks=)`: per-head attention sinks, one extra softmax
   denominator logit per head with no value contribution. fa2 and fa3 select
   the `AttentionSink` JIT variant wrapper at plan time (the default wrapper
-  forwards `sinks` only on its trtllm-gen path); trtllm-gen and cake pass the
-  tensor natively. The pair mirrors the MLA wrapper's `use_sinks` / `sinks`.
+  forwards `sinks` only on its trtllm-gen path, and its standard fa2 / fa3
+  adapter refuses a sink tensor with `NotImplementedError`); trtllm-gen and
+  cake pass the tensor natively. The pair mirrors the MLA wrapper's
+  `use_sinks` / `sinks`.
 - fp8 KV cache: `kv_dtype=torch.float8_e4m3fn` or `torch.float8_e5m2` with
   an f16/bf16 q, declared for fa2 only (e5m2 measured on B200 against the
   oracle on the dequantized cache, same error magnitude as e4m3; see the
   `_capabilities.py` comment). `k_scale` / `v_scale` are per-tensor host
   floats (`dequant = fp8_value * scale`); omitted scales mean no scaling.
-  fp8 q and nvfp4 are undeclared axes.
+  fp8 q and nvfp4 are undeclared axes (the legacy wrapper's cuDNN backend
+  takes an fp8 q; known limitation D4).
 - K / V scales on a fp16 / bf16 cache: the same `run(k_scale=, v_scale=)`
   multiply K and V of a float cache too (the legacy wrapper's
   `test_kv_scale_forwarding_*` semantics), on every backend and with one
@@ -1321,6 +1397,12 @@ wrapper exposes neither.
 
 ## Known limitations
 
+Rows `M` are ledger items. Rows `D1` to `D5` are the known differences
+between this API and the legacy wrapper
+(`BatchPrefillWithPagedKVCacheWrapper`) around cuDNN: where `auto` selects
+it, and what the cuDNN backend takes and declares. They are stated here once
+and referred to by id elsewhere.
+
 | id | limitation | state |
 | --- | --- | --- |
 | M14 | The fa2 split-KV planner carves scratch that grows with the geometry (heads, head dim, SM count, and in graph mode the capacity's query tokens), so a bucket can need more than the buffer in use, the shared 512 MiB default included. | `PagedAttention.workspace_requirements()` bounds the need for sizing a caller-owned buffer. fa2 declines a batch that does not fit at `plan()` with the typed signal: `auto` moves on to the next candidate, a named backend raises `ValueError` naming the bytes. |
@@ -1331,11 +1413,16 @@ wrapper exposes neither.
 | M21 | The fa2 attention-sink kernel variant is wrong at head_dim 512 (B200: max abs err 1.4–1.75, LSE off by ~3; D64/128/256 sinks and D512 without sinks are exact; the legacy `BatchAttentionWithAttentionSinkWrapper` shows the same). Found by the XQA legacy grid once WP-T declared D512. | fa2 declares `sinks_head_dims = {64, 128, 256}`, so `use_sinks=True` at (512, 512) is excluded at resolve with the reason; `tests/experimental/paged_attention/test_paged_attention_features.py::test_fa2_kernel_sinks_head_dim_512_defect` is a strict xfail on the kernel through the legacy sink wrapper — a kernel fix turns it into XPASS and asks for the capability flip; the XQA conversion's D512 + sink rows skip with the resolve reason. |
 | M22 | `_FaBackend.preflight` declined `use_sinks=True` with an fp8 KV cache as "not verified" although the capability table admits both; the XQA legacy suite runs the pair natively. Measured on B200 (e4m3 / e5m2, D128 / D256): the sink variant with `sm_scale * k_scale` and `out * v_scale` matches the sink-aware oracle to 4e-3. | Decline removed; `tests/experimental/paged_attention/test_paged_attention_features.py::test_attention_sinks_with_fp8_kv` pins the pair against the oracle. |
 | M23 | trtllm-gen, cake and cuDNN read the slots of a request's last page past `kv_len` (the masked probabilities are 0, but `0 * NaN` reaches the output); fa2 zeroes the tail before the PV product. The TensorSpeed and modular legacy suites poison exactly that tail and expect it ignored. | Input contract (`PagedAttentionMetadata` docstring, "In-page tail"): the tail must be finite, any finite content is exact. Not a backend defect — the legacy TensorSpeed kernel masks it, the shared native kernels do not. Measured on B200 with a NaN tail: fa2 is exact, trtllm-gen, cake and cuDNN are not; the contract therefore requires finite tails (no test pins the per-backend outcome). |
-| — | Only exact SM100 `(10, 0)` has a measured `auto` rule, fitted on GB200 with cudnn-frontend 1.32 / cuDNN 9.27. SM90 and the other SM10x parts take fixed orders keyed on `max_q_len`, SM8x and SM12x one fixed order; those orders are pinned by CPU tests and not measured through this API. | Needs a measured run per architecture; `explain()` shows the order a plan walked. |
+| — | Only exact SM100 `(10, 0)` has a measured `auto` rule, fitted on GB200 with cudnn-frontend 1.32 / cuDNN 9.27. Its cuDNN region follows the library's gate, which holds from cuDNN 9.24, so cuDNN also leads there on cuDNN 9.24 to 9.26, for which this API has no timings. SM90 and the other SM10x parts take fixed orders keyed on `max_q_len`, SM8x and SM12x one fixed order; those orders are pinned by CPU tests and not measured through this API. On H100 the SM90 order differs from the legacy wrapper's `auto` (D2). | Needs a measured run per architecture; `explain()` shows the order a plan walked. |
 | — | The GB200 comparison flags a few CUDA-graph shapes that run the same backend under both APIs as confirmed regressions in each run (5 of the 219 main-list shapes, at most 6.1% and 2.2 us). The comparison flags as many when both measured slots run the legacy wrapper (about 3% of same-backend shapes per run; per-shape slot ratio 0.967 to 1.025 over 24 processes), so the flags measure the harness, not the API. | Read same-backend CUDA-graph rows against that A/A floor; see "Measurement basis". |
 | — | `custom_mask` with graph mode raises `ValueError`: the FA wrapper's packed-mask storage is not part of `GraphCapacity`. | Follow-up. |
 | — | The generated-FA backend re-plans its wrapper in place; a failure inside that plan can leave backend-internal state ahead of the published metadata. | Same caveat as the MLA generated backends. |
 | — | fa3 rows are compiled-checked only; the verification pool has no SM90 device. fa3 shares fa2's staged launch list, which has not been executed on SM90 either. | Needs one H100 run. |
 | — | The trace definition constrains `min(kv_seq_lens) >= 1`, older than the zero-row contract; a batch with padding rows refuses to trace rather than export a self-violating workload. | Give the reference a padding-row convention, relax the constraint and regenerate the fixture. |
-| — | Capacity substitution plans kernels for the capacity maxes, and a graph-mode instance ranks `auto` on those bounds and the host lengths of the first batch it plans successfully, and keeps that backend. A short batch replayed in a prefill-sized capacity stays on the capacity's choice; the performance effect on short batches is unmeasured. | Benchmark item. Plan the first batch with representative lengths, or pin the backend. |
+| — | Capacity substitution plans kernels for the capacity maxes, and a graph-mode instance ranks `auto` on those bounds and the host lengths of the first batch it plans successfully, and keeps that backend. A short batch replayed in a prefill-sized capacity stays on the capacity's choice; the performance effect on short batches is unmeasured. So is cuDNN frozen by a first batch inside the length-based extension of its SM100 region under a capacity far above that batch: the cuDNN plan declares the capacity's bounds, not a shape class of the batch. | Benchmark item. Plan the first batch with representative lengths, or pin the backend. |
 | — | cuDNN in CUDA-graph mode binds the controller's reserved table, the caller's columns included. One cuDNN engine loads pages through the columns past a request's own pages, up to the end of the request's last 128-token KV tile, and, where the capacity's KV bound is not a whole number of 128-token tiles, pool page 0 for the rest of the last tile; a NaN or Inf in such a page reaches the output as `0 * NaN`. An eager plan binds a table that names only each request's own pages, so no page the batch does not own reaches the result (`tests/experimental/paged_attention/test_paged_attention_cudnn_bounds.py::test_pages_the_batch_does_not_own_do_not_reach_the_result`). | In graph mode keep the pages those columns name finite, and either choose a capacity KV bound of whole 128-token tiles or keep pool page 0 finite. |
+| D1 | Head dim 256 on SM100. The legacy wrapper's `auto` also selects cuDNN in a head-dim-256 GQA prefix domain (`flashinfer.prefill._blackwell_paged_gqa_auto_cudnn`: bf16, HND, page size 16, at most four requests of 64 to 1024 query tokens, each over 2048 to 32768 keys and at least four times its query length, GQA groups of 2, 4, 8 or 16, from 16 Mi of work), behind `_cudnn_supports_paged_gqa_auto(256)`, which needs cudnn-frontend 1.33. This API has no cuDNN candidate at head dim 256 (the capability table declares 128 and (192, 128) for cuDNN), so `auto` plans fa2 there. | Not copied: the gate is False on cudnn-frontend 1.32, the stack this API is measured on, and cuDNN at head dim 256 is not verified through this API. `_in_sm100_cudnn_region` answers False at head dim 256. Pinned by `tests/experimental/paged_attention/test_paged_attention_auto_policy.py::test_sm100_head_dim_256_is_not_copied`. |
+| D2 | H100 at head dim 256 (SM90). On "NVIDIA H100 80GB HBM3" (compute capability `(9, 0)`, 132 SMs) the legacy wrapper's `auto` selects cuDNN where its native planner selects fa3 (`flashinfer.prefill._hopper_paged_auto_cudnn`): head dim 256, HND, page size 16, fp16 or bf16 with one dtype for Q, KV and output, causal or non-causal, 1 to 32 requests, 16 to 48 query heads, a longest query of 65 to 16384 tokens and a longest KV of at most 32768 that equal the declared maxes, and at least 2^24 query-key pairs across the query heads. This API keeps the fixed SM90 order (fa3 first, fa2 first up to 64 query tokens) and has no cuDNN candidate at head dim 256. | Not copied: the verification pool has no SM90 device. The legacy admission is tied to that device name and SM count; it selects cuDNN on no other Hopper device. Pinned by `tests/experimental/paged_attention/test_paged_attention_auto_policy.py::test_sm90_head_dim_256_is_not_copied` (candidate set and order only). |
+| D3 | Sliding windows on cuDNN. The cuDNN graph path has a sliding window, and the legacy wrapper's explicit `backend="cudnn"` passes it, non-causal plans included. This API's cuDNN backend declares none (`supports_window=False`): a windowed plan excludes cuDNN at resolve, and non-causal with a window has no backend (M20). `auto` is unaffected: the legacy wrapper's `auto` selects cuDNN only without a window as well. | Not declared: this backend's `plan()` and `run()` pass no window, and windowed cuDNN is not measured through this API. The exclusion is pinned by `tests/experimental/paged_attention/test_paged_attention_contract_cpu.py::test_capability_rejection_reason_matrix` (row `cudnn-window0`). |
+| D4 | fp8 query on cuDNN. The legacy wrapper's explicit `backend="cudnn"` takes an fp8 e4m3 `q` with an fp8 KV cache, a `q_scale` and a bf16 output; its test runs on compute-capability major 10 from cuDNN 9.24. This API declares fp16 / bf16 `q` for every backend, an fp8 KV cache for fa2 only, no `q_scale`, and an output in q's dtype. | Undeclared axis; `tests/experimental/paged_attention/test_legacy_unified_cudnn_prefill.py::test_cudnn_prefill_fp8` records the legacy test as outside the API and fails once the resolver accepts an fp8 `q` on cudnn; `tests/experimental/paged_attention/test_paged_attention_contract_cpu.py::test_capability_rejection_reason_matrix` (row `cudnn-fp8-q`) pins the capability row. |
+| D5 | Bucketed cuDNN declarations. An eager cuDNN plan of this API declares a shape class (`_CudnnBackend._declared_bounds`) on every architecture, also when cuDNN is named. The legacy wrapper buckets only where its `auto` selects cuDNN on compute capability `(10, 0)` or `(10, 3)`, and declares the plan's own maxes on Hopper and for an explicit `backend="cudnn"`. | The classes are measured on SM100 only; on the other architectures they are unmeasured. |

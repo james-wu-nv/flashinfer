@@ -20,7 +20,7 @@ shape the oracle cannot hold, and the rows then say so) — and every
     A warmed ``PagedAttention.run`` with preallocated ``out``/``lse``, GPU
     time, cold L2.  By default one ``run()`` on the case's own buffers is
     captured in a CUDA graph and its replay is timed with CUDA events, an L2
-    flush (a 2x-L2 memset) before every timed replay; with ``--no_cuda_graph``
+    flush (a 2x-L2 read) before every timed replay; with ``--no_cuda_graph``
     the eager call is timed the same way; with CUPTI the helper's CUPTI timer
     does the flushing.  All three keep the q/k/v bindings fixed: cake binds
     q/k/v through TMA descriptors it creates only eagerly (design doc known
@@ -62,14 +62,16 @@ autotuning: with CUDA graphs on, the instance ranks once on the capacity
 inferred from the case and keeps that backend for the ``plan`` / ``run`` /
 ``step`` rows; with ``--no_cuda_graph`` it ranks on every plan.  In the
 dense form the inferred capacity's KV bound is the table's full width, spare
-columns included, and that is the bound the SM100 cuDNN region tests under
-CUDA graphs.  The second instance behind the ``update`` rows ranks on its
-own explicit capacity (the table's full width as the KV bound).  In the
-dense form that is the capacity the first instance infers, so both run the
-same backend; with ``--kv_input_form csr`` the first instance keeps the
-case's ``max_kv_len``, so the second one's choice, which is not recorded,
-can differ from ``resolved_backend`` where a KV bound of the SM100 cuDNN
-region lies between the two.
+columns included, and that is the bound the two bound tests of the SM100
+cuDNN region read under CUDA graphs; the region's length-based extension
+reads the case's per-request lengths, whatever the bound.  The second
+instance behind the ``update`` rows ranks on its own explicit capacity (the
+table's full width as the KV bound).  In the dense form that is the capacity
+the first instance infers, so both run the same backend; with
+``--kv_input_form csr`` the first instance keeps the case's ``max_kv_len``,
+so the second one's choice, which is not recorded, can differ from
+``resolved_backend`` where a KV limit of those bound tests lies between the
+two.
 
 ``--pa_legacy`` adds ``api_variant=legacy`` rows: the SAME inputs through the
 legacy public API of the same kernel, with the same phases, so
