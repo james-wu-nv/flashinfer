@@ -760,6 +760,21 @@ trtllm-gen and fa2 next, and cuDNN last when the batch is outside its
 region. Inside the region the order is cuDNN, then the choice of rules 2 and
 3, then the other one.
 
+One exception inside the region is fitted here, for eager plans only:
+trtllm-gen goes ahead of cuDNN (the order is then trtllm-gen, cuDNN, fa2)
+for a small kernel, which is `kv_eff <= 4096`, at most 256 rows in the
+longest request (`num_qo_heads * its query length / 128`, the batch's own
+lengths when they are on the host) and `rows * kv_eff <= 2^22`. Among the
+291 eager shapes of the comparison lists inside the region, the 83 of that
+kind are the only cell where trtllm-gen is consistently ahead: its `run()`
+takes 0.70 to 1.00 of cuDNN's named through this API (geometric mean 0.86),
+and `plan()` costs about 0.05 ms against 0.3 to 0.6 ms. With longer KV
+cuDNN's split wins by up to 2.6x; with a longer request or more work the two
+are within about 10% either way and cuDNN, the legacy wrapper's choice,
+keeps the batch. In CUDA-graph mode the same cell is 0.70 to 1.48 (mean
+0.95, 17 of 83 more than 1% slower), so graph plans keep cuDNN first in the
+whole region.
+
 #### Other architectures
 
 The other orders are fixed per compute-capability major. SM90 and the other
@@ -775,7 +790,8 @@ in CUDA-graph mode); SM8x and SM12x read no shape fact:
 #### Measurement basis
 
 The SM100 rule is fitted and checked on GB200 only (cudnn-frontend 1.32,
-cuDNN 9.27, 2026-11-10). The check compares unified `backend="auto"` with
+cuDNN 9.27; the fit of rule 2 on 2026-11-10, the check below on
+2026-11-18, after the legacy wrapper widened its cuDNN admission). The check compares unified `backend="auto"` with
 `BatchPrefillWithPagedKVCacheWrapper(backend="auto")` on identical inputs.
 The timed unit is one eager `run()`, or one replay of a graph that captured
 one `run()`; `plan()` is outside the timed region. Timing is in paired
@@ -785,27 +801,32 @@ otherwise.
 
 | shapes | mode | geomean speedup | pass | inconclusive | confirmed regression |
 | --- | --- | --- | --- | --- | --- |
-| main list, 219 | CUDA graph | 1.67x | 184 | 30 | 5 |
-| main list, 219 | eager | 1.49x | 214 | 5 | 0 |
-| all six lists, 431 | CUDA graph | 1.73x | 383 | 41 | 7 |
-| all six lists, 431 | eager | 1.33x | 418 | 12 | 1 |
+| main list, 219 | CUDA graph | 1.49x | 163 | 47 | 9 |
+| main list, 219 | eager | 1.41x | 205 | 14 | 0 |
+| all eight lists, 661 | CUDA graph | 1.39x | 494 | 151 | 16 |
+| all eight lists, 661 | eager | 1.20x | 575 | 85 | 1 |
 
-- The CUDA-graph regressions all run the same backend under both APIs, so
-  the order is not their cause; they take at most 6.1% longer (speedup
-  0.942) and at most 2.2 us longer, on the main list and over all lists.
-  They are an effect of the measurement, not of the API: with the legacy
-  wrapper in both measured slots (34 same-backend shapes, 24 independent
-  processes each) the second slot is between 0.967 and 1.025 of the first
+- The CUDA-graph regressions all run cuDNN under both APIs, so the order is
+  not their cause; they take at most 6.8% and at most 21 us longer. They
+  are an effect of the measurement, not of the API: with the legacy wrapper
+  in both measured slots (34 same-backend shapes, 24 independent processes
+  each, 2026-11-10) the second slot is between 0.967 and 1.025 of the first
   per shape and about 3% of the shapes of a run are flagged the same way;
-  legacy against unified gives 0.975 to 1.017, mean 1.002, and 2%. The
-  eager regression is one head-dim-64 shape on which the rule picks
-  trtllm-gen, which takes 1.7% longer than the legacy wrapper's fa2.
-- Five of the six lists sit on the rule's thresholds on purpose (the
-  sliding-window, short-KV, row-bound, 128-to-160-row and threshold-fit
-  lists), so the main list is the representative one.
-- Fitted on GB200: the row and fill thresholds of rule 2 and the eager
-  short-KV exception. The tables are next to the constants in
-  `_auto_policy.py`.
+  legacy against unified gave 0.975 to 1.017, mean 1.002, and 2%. The
+  eager regression is one head-dim-64 shape (B3, q 128, kv 2048, 64/8) on
+  which the rule picks trtllm-gen and the legacy wrapper fa2: 10% longer in
+  this run, 4% shorter in the run before.
+- Five lists sit on the rule's thresholds on purpose (the sliding-window,
+  short-KV, row-bound, 128-to-160-row and threshold-fit lists, 212 shapes).
+  One holds 176 shapes inside the legacy wrapper's widened cuDNN admission
+  (1.07x eager, 1.05x CUDA graph: cuDNN under both APIs except the eager
+  small kernels, whose 83 shapes over all lists take 0.67 to 0.97 of the
+  legacy time, geometric mean 0.83, and all pass) and one 54 shapes at head
+  dim 256 (fa2 under both APIs, 1.00x). The main list is the representative
+  one.
+- Fitted on GB200: the row and fill thresholds of rule 2, the eager
+  short-KV exception and the eager small-kernel exception inside the cuDNN
+  region. The tables are next to the constants in `_auto_policy.py`.
 - Not refitted: the cuDNN region, which is a copy of the legacy wrapper's
   head-dim-128 predicate, the bounded domain and the length-based extension
   alike. Only its CUDA-graph form is this package's own: the wider
@@ -1414,7 +1435,7 @@ and referred to by id elsewhere.
 | M22 | `_FaBackend.preflight` declined `use_sinks=True` with an fp8 KV cache as "not verified" although the capability table admits both; the XQA legacy suite runs the pair natively. Measured on B200 (e4m3 / e5m2, D128 / D256): the sink variant with `sm_scale * k_scale` and `out * v_scale` matches the sink-aware oracle to 4e-3. | Decline removed; `tests/experimental/paged_attention/test_paged_attention_features.py::test_attention_sinks_with_fp8_kv` pins the pair against the oracle. |
 | M23 | trtllm-gen, cake and cuDNN read the slots of a request's last page past `kv_len` (the masked probabilities are 0, but `0 * NaN` reaches the output); fa2 zeroes the tail before the PV product. The TensorSpeed and modular legacy suites poison exactly that tail and expect it ignored. | Input contract (`PagedAttentionMetadata` docstring, "In-page tail"): the tail must be finite, any finite content is exact. Not a backend defect — the legacy TensorSpeed kernel masks it, the shared native kernels do not. Measured on B200 with a NaN tail: fa2 is exact, trtllm-gen, cake and cuDNN are not; the contract therefore requires finite tails (no test pins the per-backend outcome). |
 | — | Only exact SM100 `(10, 0)` has a measured `auto` rule, fitted on GB200 with cudnn-frontend 1.32 / cuDNN 9.27. Its cuDNN region follows the library's gate, which holds from cuDNN 9.24, so cuDNN also leads there on cuDNN 9.24 to 9.26, for which this API has no timings. SM90 and the other SM10x parts take fixed orders keyed on `max_q_len`, SM8x and SM12x one fixed order; those orders are pinned by CPU tests and not measured through this API. On H100 the SM90 order differs from the legacy wrapper's `auto` (D2). | Needs a measured run per architecture; `explain()` shows the order a plan walked. |
-| — | The GB200 comparison flags a few CUDA-graph shapes that run the same backend under both APIs as confirmed regressions in each run (5 of the 219 main-list shapes, at most 6.1% and 2.2 us). The comparison flags as many when both measured slots run the legacy wrapper (about 3% of same-backend shapes per run; per-shape slot ratio 0.967 to 1.025 over 24 processes), so the flags measure the harness, not the API. | Read same-backend CUDA-graph rows against that A/A floor; see "Measurement basis". |
+| — | The GB200 comparison flags a few CUDA-graph shapes that run the same backend under both APIs as confirmed regressions in each run (9 of the 219 main-list shapes, at most 6.8% and 21 us). The comparison flags as many when both measured slots run the legacy wrapper (about 3% of same-backend shapes per run; per-shape slot ratio 0.967 to 1.025 over 24 processes), so the flags measure the harness, not the API. | Read same-backend CUDA-graph rows against that A/A floor; see "Measurement basis". |
 | — | `custom_mask` with graph mode raises `ValueError`: the FA wrapper's packed-mask storage is not part of `GraphCapacity`. | Follow-up. |
 | — | The generated-FA backend re-plans its wrapper in place; a failure inside that plan can leave backend-internal state ahead of the published metadata. | Same caveat as the MLA generated backends. |
 | — | fa3 rows are compiled-checked only; the verification pool has no SM90 device. fa3 shares fa2's staged launch list, which has not been executed on SM90 either. | Needs one H100 run. |

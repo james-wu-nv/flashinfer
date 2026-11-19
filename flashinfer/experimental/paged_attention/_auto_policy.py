@@ -166,7 +166,7 @@ def ordered_sm12x_backends(facts: _PlanFacts) -> Tuple[str, ...]:
 
 
 def _in_sm100_cudnn_region(facts: _PlanFacts) -> bool:
-    """Whether cuDNN leads on SM100: the legacy wrapper's head-dim-128 domain.
+    """Whether a plan is in the SM100 cuDNN region, the legacy head-dim-128 domain.
 
     Duplicates the head-dim-128 part of
     ``flashinfer.prefill._blackwell_paged_auto_cudnn`` and the feature
@@ -334,33 +334,39 @@ def _in_sm100_cudnn_region(facts: _PlanFacts) -> bool:
 
 
 # SM100 rule.  The thresholds are fitted on GB200 (cuDNN 9.27, cudnn-frontend
-# 1.32) and measured there against the legacy wrapper's auto over 862 cases
-# (431 shapes, eager and CUDA graph; 2026-11-10).  A case passes when no
-# paired measurement block is more than 1% slower than the legacy time and is
-# a regression when every block is more than 1% slower:
+# 1.32) and measured there against the legacy wrapper's auto over 1322 cases
+# (661 shapes, eager and CUDA graph; 2026-11-18, with the legacy wrapper's
+# widened cuDNN admission).  A case passes when no paired measurement block
+# is more than 1% slower than the legacy time and is a regression when every
+# block is more than 1% slower:
 #
 #   shapes           mode   geomean speedup  pass  inconclusive  regression
-#   219, main list   graph  1.67x             184            30           5
-#                    eager  1.49x             214             5           0
-#   431, all lists   graph  1.73x             383            41           7
-#                    eager  1.33x             418            12           1
+#   219, main list   graph  1.49x             163            47           9
+#                    eager  1.41x             205            14           0
+#   661, all lists   graph  1.39x             494           151          16
+#                    eager  1.20x             575            85           1
 #
-# The graph regressions run the same backend under both APIs (at most 6.1%
-# and 2.2 us longer, speedup 0.942) and are an effect of the measurement: the
-# legacy wrapper compared with itself is flagged as often (about 3% of such
-# shapes per run), and over 24 processes per shape the unified time is 0.975
-# to 1.017 of the legacy time (mean 1.002).  The eager one takes 1.7% longer.  The
-# main list holds engine benchmark and CI configurations, the shapes the
-# legacy wrapper's cuDNN region was admitted on and length-regime probes; the
-# other 212 shapes are placed on the thresholds below, so the main list is
-# the representative one.
+# The graph regressions run cuDNN under both APIs (at most 6.8% and 21 us
+# longer) and are an effect of the measurement: the legacy wrapper compared
+# with itself is flagged as often (about 3% of such shapes per run, measured
+# 2026-11-10), and over 24 processes per shape the unified time was 0.975 to
+# 1.017 of the legacy time (mean 1.002).  The eager one (head dim 64, B3
+# q128 kv2048 64/8, fa2 under the legacy wrapper and trtllm-gen here) takes
+# 10% longer in this run and 4% less in the one before.  The main list holds
+# engine benchmark and CI configurations, the shapes the legacy wrapper's
+# first cuDNN region was admitted on and length-regime probes.  Of the other
+# 442 shapes, 212 are placed on the thresholds below, 176 inside the widened
+# cuDNN admission (geomean 1.07x eager, 1.05x graph: cuDNN under both APIs
+# except the eager small kernels below) and 54 at head dim 256 (fa2 under
+# both, 1.00x), so the main list is the representative one.
 #
 #   rows = num_qo_heads * total_q / 128              query rows, in 128-row tiles
 #   ntg  = batch * num_qo_heads * ceil(max_q / 128)  the context kernel's CTA grid
 #   fill = rows / ntg                                how full those tiles are
 #
-# run() medians in us of each backend named through this API, from that
-# measurement; bf16, causal, page 16, GQA 32/8 unless noted:
+# run() medians in us of each backend named through this API, from the
+# measurement the thresholds were fitted on (2026-11-10); bf16, causal, page
+# 16, GQA 32/8 unless noted:
 #
 #   mode   shape                         rows  fill   fa2  trtllm-gen  cudnn  first
 #   graph  B1 q128  kv16384                32  1.00   115         193     52  cudnn (region)
@@ -414,6 +420,34 @@ _SM100_MIN_FILL_EAGER = 0.75
 _SM100_EAGER_SHORT_KV = 1024
 _SM100_EAGER_SHORT_KV_SPLIT_ROWS = 148
 _SM100_EAGER_SHORT_KV_MIN_WORK = 1 << 19
+# Eager only, inside the cuDNN region: a small kernel goes to trtllm-gen ahead
+# of cuDNN.  Measured on GB200 (2026-11-17, cuDNN 9.27, each backend named
+# through this API, the 291 eager shapes of the comparison lists that fall in
+# the region), trtllm-gen run() time / cuDNN run() time, range and geometric
+# mean, by kv_eff, rows * kv_eff and the longest request's rows
+# (num_qo_heads * its query length / 128):
+#
+#   kv_eff       rows * kv_eff   request rows <= 256   257..512         > 512
+#   <= 4096      <= 2^22         0.70-1.00  0.86 (83)  0.79-1.10  0.96  0.98-1.15  1.04
+#   <= 4096      2^22..2^23      0.92-1.01  0.97  (8)  0.88-1.07  0.99  1.02
+#   <= 4096      > 2^23          0.96-1.11  1.04  (3)  0.94-1.09  1.02  0.99-1.21  1.09
+#   4097..8192   <= 2^22         0.91-1.87  1.31 (22)  0.86-1.25  1.05  1.04
+#   > 8192       <= 2^22         1.01-2.62  1.71 (22)
+#
+# - Only the first cell is a consistent gain: none of its 83 shapes is more
+#   than 1% slower on trtllm-gen, and against the legacy wrapper's auto (cuDNN
+#   on all of them) run() takes 0.83 of the time.  plan() is cheaper as well
+#   (about 0.05 ms against 0.3-0.6 ms), which no other cell has to offer
+#   either: one plan() and 32 run() calls take 0.84 of the legacy time there.
+# - With longer KV the context kernel loses to cuDNN's split, up to 2.6x at
+#   16384 keys, and with a longer request or more work the two are within
+#   about 10% either way; cuDNN, the legacy wrapper's choice, keeps those.
+# - In CUDA-graph mode the same cell is 0.70-1.48 (mean 0.95, 17 of 83 more
+#   than 1% slower, the shapes of at most 64 rows), so graph plans keep cuDNN
+#   first in the whole region.
+_SM100_REGION_EAGER_MAX_KV = 4096
+_SM100_REGION_EAGER_MAX_REQUEST_ROWS = 256
+_SM100_REGION_EAGER_MAX_WORK = 1 << 22
 
 
 def _attended_kv(facts: _PlanFacts) -> int:
@@ -441,7 +475,11 @@ def ordered_sm100_backends(facts: _PlanFacts) -> Tuple[str, ...]:
        requests inside its prefix / full-prefill bounds from 8 Mi of work
        (``num_qo_heads * sum(q_i * kv_i)``), and from 16 Mi a batch of any
        size whose own lengths qualify.  The cuDNN version gate is one of its
-       conditions.
+       conditions.  One exception, fitted here and eager only: trtllm-gen
+       goes ahead of cuDNN for a small kernel, which is at most 4096 keys per
+       query row (``_attended_kv``), at most 256 rows in the longest request
+       (``num_qo_heads * its query length / 128``) and ``rows * keys`` of at
+       most 2^22.
     2. Otherwise trtllm-gen ahead of fa2 when ``rows`` reaches 64 (96 below
        head dim 128) at a ``fill`` of 0.375 in CUDA-graph mode, 0.75 eager.
        Eager and above 148 rows it also needs 1024 keys per query row
@@ -473,9 +511,27 @@ def ordered_sm100_backends(facts: _PlanFacts) -> Tuple[str, ...]:
         order = _prefer("fa2", "trtllm-gen")
     # cuDNN is qualified only inside the legacy region; elsewhere it stays the
     # last resort behind both measured choices.
-    if _in_sm100_cudnn_region(facts):
-        return ("cudnn",) + tuple(b for b in order if b != "cudnn")
-    return order
+    if not _in_sm100_cudnn_region(facts):
+        return order
+    if not facts.use_cuda_graph:
+        # The longest request's query: the batch's own when its lengths are on
+        # the host, as for kv_eff; max_q_len is a bound that may be declared
+        # above it.
+        longest_q = facts.max_q_len
+        lengths = facts.host_lengths()
+        if lengths is not None:
+            longest_q = max(lengths[0])
+        kv_eff = _attended_kv(facts)
+        if (
+            kv_eff <= _SM100_REGION_EAGER_MAX_KV
+            and facts.num_qo_heads * longest_q
+            <= 128 * _SM100_REGION_EAGER_MAX_REQUEST_ROWS
+            and rows * kv_eff <= _SM100_REGION_EAGER_MAX_WORK
+        ):
+            return ("trtllm-gen", "cudnn") + tuple(
+                b for b in order if b not in ("trtllm-gen", "cudnn")
+            )
+    return ("cudnn",) + tuple(b for b in order if b != "cudnn")
 
 
 def ordered_backends(

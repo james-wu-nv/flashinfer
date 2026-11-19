@@ -296,6 +296,16 @@ On SM100 (compute capability 10.0) the rule is:
    head-dimension-256 domain on SM100 is not copied (design doc, known
    limitation D1).
 
+   One exception is this API's own, in eager mode only: inside the region
+   trtllm-gen goes ahead of cuDNN for a small kernel, which is a batch whose
+   longest KV has at most 4096 tokens, whose longest request has at most
+   256 rows (``num_qo_heads * its query length / 128``) and whose ``rows *
+   longest KV`` (``rows`` as in rule 2) is at most ``2**22``. On the 83
+   measured shapes of that kind trtllm-gen's ``run()`` takes 0.67 to 0.97
+   of the legacy wrapper's cuDNN time (geometric mean 0.83), and its
+   ``plan()`` is cheaper too. CUDA-graph plans keep cuDNN first in the whole
+   region.
+
 2. Otherwise trtllm-gen first when the packed query rows fill its 128-row
    tiles. With ``rows = num_qo_heads * total_q_tokens / 128`` and ``fill =
    rows / (batch_size * num_qo_heads * ceil(max_q_len / 128))`` it needs
@@ -344,7 +354,7 @@ configuration with different hints have different ``config`` keys).
 
 The SM100 rule is measured against
 ``BatchPrefillWithPagedKVCacheWrapper(backend="auto")`` on GB200
-(cudnn-frontend 1.32 / cuDNN 9.27, 2026-11-10; bf16, ``run()`` medians, every
+(cudnn-frontend 1.32 / cuDNN 9.27, 2026-11-18; bf16, ``run()`` medians, every
 shape eager and as a CUDA-graph replay). A shape passes when no paired
 measurement block is more than 1% slower than the legacy time and is a
 regression when every block is more than 1% slower:
@@ -352,24 +362,29 @@ regression when every block is more than 1% slower:
 ================  ==========  ===============  ====  ============  ==========
 shapes            mode        geomean speedup  pass  inconclusive  regression
 ================  ==========  ===============  ====  ============  ==========
-219 (main list)   CUDA graph  1.67x            184   30            5
-219 (main list)   eager       1.49x            214   5             0
-431 (all lists)   CUDA graph  1.73x            383   41            7
-431 (all lists)   eager       1.33x            418   12            1
+219 (main list)   CUDA graph  1.49x            163   47            9
+219 (main list)   eager       1.41x            205   14            0
+661 (all lists)   CUDA graph  1.39x            494   151           16
+661 (all lists)   eager       1.20x            575   85            1
 ================  ==========  ===============  ====  ============  ==========
 
-The CUDA-graph regressions run the same backend under both APIs and take at
-most 6.1% (speedup 0.942) and 2.2 µs longer in that run. They are an effect
-of the measurement: comparing the legacy wrapper with itself flags as many
-same-backend shapes (about 3% per run), and over 24 independent processes per
-shape the unified time is 0.975 to 1.017 of the legacy time (mean 1.002).
-The eager one takes 1.7% longer.
+The CUDA-graph regressions run cuDNN under both APIs and take at most 6.8%
+and 21 µs longer in that run. They are an effect of the measurement:
+comparing the legacy wrapper with itself flags as many same-backend shapes
+(about 3% per run, measured 2026-11-10), and over 24 independent processes
+per shape the unified time was 0.975 to 1.017 of the legacy time (mean
+1.002). The eager one is a head-dimension-64 shape on which the legacy
+wrapper runs fa2 and the rule trtllm-gen; it takes 10% longer in this run
+and 4% less in the run before.
 The main list holds engine benchmark and CI configurations, the shapes the
-legacy wrapper's cuDNN region was admitted on and length-regime probes; the
-other 212 shapes are placed on the thresholds of the rule, so the main list
-is the representative one.
+legacy wrapper's first cuDNN region was admitted on and length-regime
+probes. Of the other 442 shapes, 212 are placed on the thresholds of the
+rule, 176 inside the legacy wrapper's widened cuDNN admission (1.07x eager,
+1.05x CUDA graph: cuDNN under both APIs except the eager small kernels) and
+54 at head dimension 256 (fa2 under both APIs, 1.00x), so the main list is
+the representative one.
 
-Examples from that measurement (32 query / 8 KV heads, head_dim 128, page
+Examples from the measurement the thresholds were fitted on (2026-11-10; 32 query / 8 KV heads, head_dim 128, page
 size 16, causal, no LSE; a dense block table exactly ``kv_len / 16`` columns
 wide, so a CUDA-graph capacity equals the shape): ``run()`` medians in µs of
 each backend named through this API, and the backend ``auto`` ran. The

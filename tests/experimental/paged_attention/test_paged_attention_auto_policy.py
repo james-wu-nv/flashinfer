@@ -107,7 +107,9 @@ def cudnn_qualified(monkeypatch):
 # unless overridden.  Shapes marked [m] are measured cases of the GB200 fit;
 # the others step one unit across a threshold from one.  The rows of the
 # cuDNN region's extension carry no mark: that part is copied from the legacy
-# predicate, not fitted.
+# predicate, not fitted.  A pair is the first two preferences: trtllm-gen
+# ahead of cuDNN is the eager small-kernel exception inside the region, so
+# such a row still tells which side of the region's bound its batch is on.
 _SM100_TABLE = [
     # ---- rows >= 64 at head_dim 128 (fill 1.0; KV outside the cuDNN region)
     ("rows64-graph [m]", [256], [131072], dict(graph=True), "trtllm-gen"),
@@ -218,19 +220,19 @@ _SM100_TABLE = [
         dict(hq=8, hk=1, host=False),
         "trtllm-gen",
     ),
-    ("prefix-kv2048 [m]", [128], [2048], {}, "cudnn"),
+    ("prefix-kv2048 [m]", [128], [2048], {}, ("trtllm-gen", "cudnn")),
     ("prefix-kv2047 [m]", [128], [2047], {}, "fa2"),
     ("prefix-kv32768 [m]", [128] * 3, [32768] * 3, dict(hq=16, hk=4), "cudnn"),
     ("prefix-kv32769", [128] * 3, [32769] * 3, dict(hq=16, hk=4), "fa2"),
     # max_kv >= 4 * max_q decides below 16 Mi (8 heads: 8.0 Mi); the
     # extension has no such ratio (32 heads: 32 Mi)
-    ("prefix-kv=4q-8Mi", [512], [2048], dict(hq=8, hk=2), "cudnn"),
+    ("prefix-kv=4q-8Mi", [512], [2048], dict(hq=8, hk=2), ("trtllm-gen", "cudnn")),
     ("prefix-kv<4q-8Mi", [513], [2048], dict(hq=8, hk=2), "fa2"),
     ("prefix-kv=4q-1", [513], [2051], dict(hq=8, hk=2), "fa2"),
-    ("prefix-kv=4q", [512], [2048], {}, "cudnn"),
-    ("prefix-kv<4q-32Mi", [513], [2048], {}, "cudnn"),
+    ("prefix-kv=4q", [512], [2048], {}, ("trtllm-gen", "cudnn")),
+    ("prefix-kv<4q-32Mi", [513], [2048], {}, ("trtllm-gen", "cudnn")),
     # exact work = heads * sum(q_i * kv_i) >= 8 Mi
-    ("work-8Mi", [256], [2048], dict(hq=16, hk=4), "cudnn"),
+    ("work-8Mi", [256], [2048], dict(hq=16, hk=4), ("trtllm-gen", "cudnn")),
     ("work-below-8Mi", [255], [2048], dict(hq=16, hk=4), "fa2"),
     (
         "work-exact-ragged-out",
@@ -252,7 +254,7 @@ _SM100_TABLE = [
     ("batch4 [m]", [64] * 4, [8192] * 4, {}, "cudnn"),
     ("batch5", [64] * 5, [8192] * 5, {}, "fa2"),
     ("batch6-rows96 [m]", [128] * 6, [8192] * 6, dict(hq=16, hk=4), "trtllm-gen"),
-    ("heads8", [1024], [4096], dict(hq=8, hk=2), "cudnn"),
+    ("heads8", [1024], [4096], dict(hq=8, hk=2), ("trtllm-gen", "cudnn")),
     # one shape on both sides of ``8 <= num_qo_heads`` (4/1 is the measured
     # graph case B1 q2048 kv2048)
     ("heads8-full", [2048], [2048], dict(hq=8, hk=2, graph=True), "cudnn"),
@@ -264,7 +266,7 @@ _SM100_TABLE = [
     ("group3", [256], [4096], dict(hq=24, hk=8), "fa2"),
     # ---- cuDNN region, the bounded domain, full prefill:
     # 1024 <= max_q == max_kv <= 8192 with every q_i == kv_i
-    ("full-1024 [m]", [1024], [1024], dict(hq=8, hk=1), "cudnn"),
+    ("full-1024 [m]", [1024], [1024], dict(hq=8, hk=1), ("trtllm-gen", "cudnn")),
     ("full-1023", [1023], [1023], dict(hq=8, hk=1), "fa2"),
     ("full-8192 [m]", [8192], [8192], dict(hq=64, hk=8), "cudnn"),
     ("full-ragged [m]", [4921], [4921], dict(hq=16, hk=4), "cudnn"),
@@ -272,7 +274,13 @@ _SM100_TABLE = [
     # the q_i == kv_i proof decides below 16 Mi (8 heads: 9.5 and 10.9 Mi);
     # from 16 Mi a batch that fails it can enter the extension as a mixed
     # batch (32 heads: 192 Mi)
-    ("full-each-q=kv-10Mi", [1100, 200], [1100, 200], dict(hq=8, hk=1), "cudnn"),
+    (
+        "full-each-q=kv-10Mi",
+        [1100, 200],
+        [1100, 200],
+        dict(hq=8, hk=1),
+        ("trtllm-gen", "cudnn"),
+    ),
     ("full-mixed-prefix-11Mi", [1100, 200], [1100, 1100], dict(hq=8, hk=1), "fa2"),
     ("full-mixed-prefix", [2048, 1024], [2048, 2048], {}, "cudnn"),
     # equal maxima alone do not prove full prefill
@@ -283,7 +291,7 @@ _SM100_TABLE = [
     ("ext-full-8193", [8193], [8193], dict(hq=64, hk=8), "cudnn"),
     ("ext-full-16384", [16384], [16384], dict(hq=64, hk=8), "cudnn"),
     ("ext-full-16385", [16385], [16385], dict(hq=64, hk=8), "trtllm-gen"),
-    ("ext-full-batch16", [1024] * 16, [1024] * 16, {}, "cudnn"),
+    ("ext-full-batch16", [1024] * 16, [1024] * 16, {}, ("trtllm-gen", "cudnn")),
     ("ext-full-batch16-q1023", [1023] * 16, [1023] * 16, {}, "trtllm-gen"),
     ("ext-full-one-short", [1] + [4096] * 4, [1] + [4096] * 4, {}, "cudnn"),
     # (the smallest query total of such a batch, 1023 + batch: 16.0 Mi at 16
@@ -293,7 +301,7 @@ _SM100_TABLE = [
         [1024] + [1] * 8,
         [1024] + [1] * 8,
         dict(hq=16, hk=4),
-        "cudnn",
+        ("trtllm-gen", "cudnn"),
     ),
     # ... otherwise every q_i > 128, the longest query at most 8192 and the
     # longest KV in 2048..32768
@@ -309,16 +317,16 @@ _SM100_TABLE = [
         "cudnn",
     ),
     # one request of 128 tokens keeps the batch out, whatever the others carry
-    ("ext-all-q129", [129] * 5, [2048] * 5, dict(hq=16, hk=1), "cudnn"),
+    ("ext-all-q129", [129] * 5, [2048] * 5, dict(hq=16, hk=1), ("trtllm-gen", "cudnn")),
     ("ext-one-q128", [128] + [129] * 4, [2048] * 5, dict(hq=16, hk=1), "fa2"),
     ("ext-q8192", [8192], [16384], {}, "cudnn"),
     ("ext-q8193", [8193], [16384], {}, "trtllm-gen"),
-    ("ext-kv2048", [256] * 5, [2048] * 5, {}, "cudnn"),
+    ("ext-kv2048", [256] * 5, [2048] * 5, {}, ("trtllm-gen", "cudnn")),
     ("ext-kv2047", [256] * 5, [2047] * 5, {}, "trtllm-gen"),
     ("ext-kv32768", [256] * 5, [32768] * 5, {}, "cudnn"),
     ("ext-kv32769", [256] * 5, [32769] * 5, {}, "trtllm-gen"),
     # exact work >= 16 Mi: 8 heads * 6 * 129 * 2710 = 16.003 Mi, 15.997 Mi at 2709
-    ("ext-work-16Mi", [129] * 6, [2710] * 6, dict(hq=8, hk=2), "cudnn"),
+    ("ext-work-16Mi", [129] * 6, [2710] * 6, dict(hq=8, hk=2), ("trtllm-gen", "cudnn")),
     ("ext-work-below-16Mi", [129] * 6, [2709] * 6, dict(hq=8, hk=2), "fa2"),
     # the lengths decide, under any bounds declared above them ...
     (
@@ -326,10 +334,48 @@ _SM100_TABLE = [
         [256] * 6,
         [4096] * 6,
         dict(max_q_len=2048, max_kv_len=131072),
-        "cudnn",
+        ("trtllm-gen", "cudnn"),
     ),
     # ... and only when they are on the host
     ("ext-device-lengths", [256] * 6, [4096] * 6, dict(host=False), "trtllm-gen"),
+    # ---- inside the cuDNN region, eager: trtllm-gen ahead of cuDNN for a
+    # small kernel.  At most 4096 keys per query row ...
+    ("small-kv4096 [m]", [256] * 8, [4096] * 8, {}, ("trtllm-gen", "cudnn")),
+    ("small-kv4097", [256] * 8, [4097] * 8, {}, "cudnn"),
+    # ... at most 256 rows in the longest request (32 heads: 1024 tokens) ...
+    ("small-request-rows256 [m]", [1024], [2048], {}, ("trtllm-gen", "cudnn")),
+    ("small-request-rows257", [1025], [2048], {}, "cudnn"),
+    ("small-request-rows512 [m]", [1024], [2048], dict(hq=64, hk=8), "cudnn"),
+    # ... and rows * keys of at most 2^22 (16 requests: 4096 rows of 1024 keys)
+    ("small-work-2^22 [m]", [1024] * 16, [1024] * 16, {}, ("trtllm-gen", "cudnn")),
+    ("small-work-above-2^22", [1024] * 17, [1024] * 17, {}, "cudnn"),
+    ("small-work-2^23 [m]", [256] * 32, [4096] * 32, {}, "cudnn"),
+    # graph plans keep cuDNN first (GB200 graph: B2 32/8 q128 kv2048: cudnn
+    # 31-32, trtllm-gen 33-34)
+    ("small-graph [m]", [128] * 2, [2048] * 2, dict(graph=True), "cudnn"),
+    # the batch's own lengths decide under looser bounds; device-only lengths
+    # leave the bounds
+    (
+        "small-loose-bounds",
+        [256] * 8,
+        [4096] * 8,
+        dict(max_q_len=2048, max_kv_len=8192),
+        ("trtllm-gen", "cudnn"),
+    ),
+    (
+        "small-device-lengths",
+        [128] * 2,
+        [2048] * 2,
+        dict(host=False),
+        ("trtllm-gen", "cudnn"),
+    ),
+    (
+        "small-device-lengths-kv-bound",
+        [128] * 2,
+        [2048] * 2,
+        dict(host=False, max_kv_len=8192),
+        "cudnn",
+    ),
     # ---- the feature conditions around the legacy call
     ("window", [128], [16384], dict(window_left=127), "fa2"),
     ("window-rows256 [m]", [128] * 8, [8192] * 8, dict(window_left=1023), "trtllm-gen"),
@@ -494,7 +540,12 @@ _SM100_TABLE = [
 def test_sm100_first_preference(cudnn_qualified, q_lens, kv_lens, over, first):
     facts = _facts(q_lens, kv_lens, **over)
     order = ordered_sm100_backends(facts)
-    assert order[0] == first
+    if isinstance(first, tuple):
+        assert order[: len(first)] == first
+    else:
+        assert order[0] == first
+    # cuDNN is in front of fa2 inside its region only
+    assert _in_sm100_cudnn_region(facts) == (order.index("cudnn") < order.index("fa2"))
     assert sorted(order) == sorted(_AUTO_BACKEND_CANDIDATES)
     assert ordered_sm100_backends(facts) == order
     assert ordered_backends((10, 0), facts) == order
@@ -513,6 +564,14 @@ def test_sm100_fallback_order(cudnn_qualified):
     assert ordered_sm100_backends(region_rows_large)[:3] == (
         "cudnn",
         "trtllm-gen",
+        "fa2",
+    )
+    # the eager small-kernel exception puts trtllm-gen in front and keeps
+    # cuDNN ahead of fa2
+    region_small_kernel = _facts([256] * 2, [2048] * 2, hq=64, hk=8)
+    assert ordered_sm100_backends(region_small_kernel)[:3] == (
+        "trtllm-gen",
+        "cudnn",
         "fa2",
     )
     for facts in (_facts([252], [131072]), _facts([256], [131072])):
@@ -907,11 +966,11 @@ def test_sm100_region_reads_no_lengths_under_a_small_query_total(
 
 
 def test_policy_rereads_host_lengths_on_each_call(cudnn_qualified):
-    facts = _facts([256], [2048], hq=16, hk=4)  # exactly 8 Mi of work
+    facts = _facts([128], [8192], hq=8, hk=1)  # exactly 8 Mi of work
     assert ordered_sm100_backends(facts)[0] == "cudnn"
-    facts.kv_seq_lens[0] = 2047  # the caller mutates its mirror in place
+    facts.kv_seq_lens[0] = 8191  # the caller mutates its mirror in place
     assert ordered_sm100_backends(facts)[-1] == "cudnn"
-    facts.kv_seq_lens[0] = 2048
+    facts.kv_seq_lens[0] = 8192
     assert ordered_sm100_backends(facts)[0] == "cudnn"
 
 
