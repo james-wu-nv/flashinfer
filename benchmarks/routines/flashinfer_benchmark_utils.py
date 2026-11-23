@@ -16,15 +16,6 @@ output_column_dict = {
         "resolved_backend",
     ],
     "attention": [
-        # PagedAttention rows: one per (backend, api_variant, phase)
-        "api_variant",
-        "phase",
-        "status",
-        "layers",
-        "static_backend",
-        "kv_input_form",
-        "lse_mode",
-        "window_left",
         "s_qo",
         "s_kv",
         "head_dim_qk",
@@ -254,7 +245,6 @@ full_output_columns = (
 
 benchmark_apis = {
     "attention": [
-        "PagedAttention",
         "BatchDecodeWithPagedKVCacheWrapper",
         "BatchPrefillWithPagedKVCacheWrapper",
         "BatchPrefillWithRaggedKVCacheWrapper",

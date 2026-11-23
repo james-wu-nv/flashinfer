@@ -1360,8 +1360,8 @@ controller adds the backend's name as for every preflight reason).
 
 ### Benchmark
 
-`benchmarks/flashinfer_benchmark.py --routine PagedAttention`
-(`benchmarks/routines/paged_attention.py`) times one set of inputs for every
+`benchmarks/bench_paged_attention.py` (a standalone script; the API is
+experimental, so it is not a routine of the shared benchmark CLI) times one set of inputs for every
 requested backend (`fa2`, `fa3`, `cudnn`, `trtllm-gen`, `cake`, `auto`),
 gates each on the fp32 oracle before timing, and emits one CSV row per
 (backend, `api_variant`, phase): `plan` (metadata construction plus `plan()`,

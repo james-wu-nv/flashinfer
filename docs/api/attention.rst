@@ -442,7 +442,7 @@ Examples from the measurement the thresholds were fitted on (2026-11-10; 32 quer
 size 16, causal, no LSE; a dense block table exactly ``kv_len / 16`` columns
 wide, so a CUDA-graph capacity equals the shape): ``run()`` medians in µs of
 each backend named through this API, and the backend ``auto`` ran. The
-benchmark routine below builds a table three columns wider; with CUDA graphs
+benchmark script below builds a table three columns wider; with CUDA graphs
 on and the dense form, its ``auto`` ranks on that width as the KV bound. A
 wider KV bound can put a shape outside the cuDNN region only through the two
 bound tests: the last shape (a full prefill of 8192 tokens) is admitted by
@@ -468,17 +468,18 @@ batch  q_len  kv_len  mode        fa2   trtllm-gen  cuDNN  auto
 Benchmarking the unified API
 ----------------------------
 
-The shared benchmark CLI provides a ``PagedAttention`` routine::
+``benchmarks/bench_paged_attention.py`` is a standalone script (the API is
+experimental, so it is not a routine of the shared benchmark CLI)::
 
-    python benchmarks/flashinfer_benchmark.py --routine PagedAttention \
+    python benchmarks/bench_paged_attention.py \
         --backends fa2 cudnn trtllm-gen auto --batch_size 4 --s_qo 128 \
         --s_kv 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim_qk 128 \
         --page_size 16 --causal --kv_layout HND --lse_mode basee --refcheck
 
 Every requested backend sees the same inputs (packed Q, a paged K/V pool with
 a shuffled page mapping, exact per-request lengths) and is checked against the
-fp32 oracle before it is timed (always for this routine; ``--pa_skip_refcheck``
-opts out for shapes the oracle cannot hold). The routine reports one CSV row
+fp32 oracle before it is timed (always; ``--pa_skip_refcheck``
+opts out for shapes the oracle cannot hold). The script reports one CSV row
 per phase:
 ``plan`` (metadata construction plus ``plan()``, synchronized host wall time),
 ``run`` (a warmed ``run()`` with preallocated outputs; GPU time under a CUDA

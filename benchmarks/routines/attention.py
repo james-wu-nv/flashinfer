@@ -336,10 +336,6 @@ def run_attention_test(args):
     Returns:
         dict: List of dictionaries containing performance results
     """
-    if args.routine == "PagedAttention":
-        from .paged_attention import testPagedAttention
-
-        return testPagedAttention(args)
     if args.routine == "BatchDecodeWithPagedKVCacheWrapper":
         return testBatchDecodeWithPagedKVCacheWrapper(args)
     elif args.routine == "BatchPrefillWithPagedKVCacheWrapper":
@@ -377,12 +373,10 @@ def parse_attention_args(line, parser):
             "fa2_tc",
             "fa3",
             "auto",
-            "autotune",  # PagedAttention measured selection
             "cudnn",
             "cudnn-native",
             "cutlass",
             "trtllm-gen",
-            "cake",  # PagedAttention candidate on SM100/103 (trtllm-gen dialect)
             "trtllm-native",
             "trtllm-fmha-v2",
             "trtllm-gen-native",  # Deprecated, will be removed in future
@@ -599,73 +593,7 @@ def parse_attention_args(line, parser):
         "--kv_layout",
         choices=["HND", "NHD"],
         default="HND",
-        help="KV layout for PagedAttention and DSV4 sparse MLA.",
-    )
-
-    parser.add_argument(
-        "--lse_mode",
-        choices=["none", "base2", "basee"],
-        default="none",
-        help="PagedAttention only: base of the returned LSE ('none' skips the LSE output).",
-    )
-    parser.add_argument(
-        "--kv_input_form",
-        choices=["dense", "csr"],
-        default="dense",
-        help=(
-            "PagedAttention only: 'dense' builds PagedAttentionMetadata.dense "
-            "(vLLM-style block table, page_size >= 8); 'csr' builds .csr "
-            "(sglang-style flat page ids, any page_size)."
-        ),
-    )
-    parser.add_argument(
-        "--window_left",
-        type=int,
-        default=-1,
-        help="PagedAttention only: sliding-window size; -1 disables the window.",
-    )
-    parser.add_argument(
-        "--pa_layers",
-        type=int,
-        nargs="+",
-        default=[1, 32],
-        help=(
-            "PagedAttention only: layer counts N for the step phase (one plan "
-            "followed by N run calls); one CSV row per value."
-        ),
-    )
-    parser.add_argument(
-        "--pa_skip_refcheck",
-        action="store_true",
-        default=False,
-        help=(
-            "PagedAttention only: time without the fp32 oracle gate (which is "
-            "otherwise always on for this routine); for shapes the fp32 oracle "
-            "cannot hold. Contradicts --refcheck."
-        ),
-    )
-    parser.add_argument(
-        "--pa_legacy",
-        action="store_true",
-        default=False,
-        help=(
-            "PagedAttention only: also time the same inputs through the legacy "
-            "public API of each resolved backend (fa2/fa3: "
-            "BatchPrefillWithPagedKVCacheWrapper, cudnn: "
-            "cudnn_batch_prefill_with_kv_cache, trtllm-gen: "
-            "trtllm_batch_context_with_kv_cache) as api_variant=legacy rows."
-        ),
-    )
-    parser.add_argument(
-        "--pa_max_q_len_hint",
-        type=int,
-        default=None,
-        help=(
-            "PagedAttention only: pass max_q_len=N to resolve_paged_attention() "
-            "(a bound on the query tokens per request: plan() rejects a batch "
-            "with a larger max query length. It orders only the resolve-time "
-            "candidate list, not what 'auto' plans). Default: no hint."
-        ),
+        help="DSV4 sparse MLA only: layout of both KV-cache pools.",
     )
 
     args = parser.parse_args(line)

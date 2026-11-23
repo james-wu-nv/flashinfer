@@ -1,12 +1,23 @@
-"""``PagedAttention`` routine for the shared benchmark CLI.
+"""Standalone benchmark for the experimental ``PagedAttention`` API.
+
+Usage::
+
+    python benchmarks/bench_paged_attention.py \
+        --backends fa2 cudnn trtllm-gen auto --batch_size 8 --s_qo 128 \
+        --s_kv 4096 --num_qo_heads 32 --num_kv_heads 8 --head_dim_qk 128 \
+        --page_size 16 --causal --pa_legacy --output_path pa.csv
+
+    python benchmarks/bench_paged_attention.py \
+        --testlist benchmarks/bench_paged_attention_testlist.txt \
+        --output_path pa.csv
 
 Times the experimental :class:`flashinfer.prefill.PagedAttention` facade on
 ONE set of inputs for every requested backend.  Each candidate is gated on
 the fp32 oracle
 (``tests/experimental/paged_attention/paged_attention_reference.py``) before
-it is timed — always, not only with ``--refcheck`` (the oracle is fp32 torch
-on the benchmarked shapes; ``--pa_skip_refcheck`` turns the gate off for a
-shape the oracle cannot hold, and the rows then say so) — and every
+it is timed — always (the oracle is fp32 torch on the benchmarked shapes;
+``--refcheck`` is accepted and implied; ``--pa_skip_refcheck`` turns the gate
+off for a shape the oracle cannot hold, and the rows then say so) — and every
 (backend, phase) pair yields one CSV row:
 
 ``plan``
@@ -81,11 +92,14 @@ oracle comparison normalizes outside the timed region, so with an LSE
 requested the unified/legacy ratio includes the facade's normalization.
 """
 
+import argparse
 from collections import defaultdict
+import csv
 import importlib.util
 import math
 import pathlib
 import re
+import shlex
 import time
 import traceback
 
@@ -108,12 +122,42 @@ from flashinfer.testing.utils import (
     bench_gpu_time_with_cuda_event,
 )
 
-from .attention import sample_actual_seq_lens
-from .flashinfer_benchmark_utils import (
-    dtype_str_to_torch_dtype,
-    get_device,
-    is_close_stats,
-    print_perf_metrics,
+_DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16}
+
+# CSV columns, in file order; one row per (backend, api_variant, phase)
+OUTPUT_COLUMNS = (
+    "backend",
+    "static_backend",
+    "resolved_backend",
+    "api_variant",
+    "phase",
+    "layers",
+    "status",
+    "refcheck_passed",
+    "median_time",
+    "std_time",
+    "tflops",
+    "tb_per_sec",
+    "timing_metric",
+    "cold_l2_cache",
+    "batch_size",
+    "s_qo",
+    "s_kv",
+    "avg_actual_seq_len",
+    "random_actual_seq_len",
+    "page_size",
+    "num_qo_heads",
+    "num_kv_heads",
+    "head_dim_qk",
+    "head_dim_vo",
+    "causal",
+    "q_dtype",
+    "kv_dtype",
+    "kv_layout",
+    "kv_input_form",
+    "lse_mode",
+    "window_left",
+    "case_tag",
 )
 
 PAGED_ATTENTION_BACKENDS = (
@@ -127,6 +171,21 @@ PAGED_ATTENTION_BACKENDS = (
 )
 # selection policies rather than kernels: no legacy row of their own
 _POLICIES = ("auto", "autotune")
+
+
+def _sample_lens(max_len, batch_size, random_lens):
+    """Per-request lengths: all ``max_len``, or sampled in ``[1, max_len]``."""
+    if random_lens:
+        return torch.randint(1, max_len + 1, (batch_size,), dtype=torch.int32)
+    return torch.full((batch_size,), max_len, dtype=torch.int32)
+
+
+def _is_close_stats(value, reference, rtol, atol):
+    """(mismatching elements, total elements, mismatch percentage)."""
+    close = torch.isclose(value, reference, rtol=rtol, atol=atol)
+    total = close.numel()
+    diff = total - int(close.sum().item())
+    return diff, total, diff / total * 100.0
 
 
 def _launching_backend(attn):
@@ -161,11 +220,10 @@ def _load_reference_oracle():
 
     ``benchmarks/`` is not a package that can import ``tests``; loading the
     oracle by file keeps ONE copy of the math (the one the experimental test
-    suite and fuzzer use) and keeps ``flashinfer_benchmark.py --help`` free of
-    any dependency on it.
+    suite and fuzzer use) and keeps ``--help`` free of any dependency on it.
     """
     path = (
-        pathlib.Path(__file__).resolve().parents[2]
+        pathlib.Path(__file__).resolve().parents[1]
         / "tests"
         / "experimental"
         / "paged_attention"
@@ -212,19 +270,15 @@ def _build_case(args, device, q_dtype, kv_dtype, head_dim_vo):
     num_qo_heads, num_kv_heads = args.num_qo_heads, args.num_kv_heads
     head_dim_qk = args.head_dim_qk
 
-    # Lengths follow the other attention routines: fixed at --s_qo/--s_kv, or
+    # Lengths: fixed at --s_qo/--s_kv, or
     # sampled in [1, max] with --random_actual_seq_len (kv >= q per request;
     # kv == q when s_qo == s_kv).
-    q_lens = sample_actual_seq_lens(
-        args.s_qo, batch_size, None, args.random_actual_seq_len
-    ).flatten()
+    q_lens = _sample_lens(args.s_qo, batch_size, args.random_actual_seq_len)
     if args.s_qo == args.s_kv:
         kv_lens = q_lens.clone()
     else:
         kv_lens = torch.maximum(
-            sample_actual_seq_lens(
-                args.s_kv, batch_size, None, args.random_actual_seq_len
-            ).flatten(),
+            _sample_lens(args.s_kv, batch_size, args.random_actual_seq_len),
             q_lens,
         )
     q_lens = q_lens.to(torch.int32)
@@ -336,7 +390,7 @@ def _check_against_oracle(out, lse, ref_out, ref_lse, lse_mode):
     out_f = out.float()
     if not torch.isfinite(out_f).all():
         problems.append("output has non-finite values")
-    num_diff, num_total, pct = is_close_stats(out_f, ref_out, **OUT_TOL)
+    num_diff, num_total, pct = _is_close_stats(out_f, ref_out, **OUT_TOL)
     if num_diff > 0:
         max_abs_err = (out_f - ref_out).abs().max().item()
         problems.append(
@@ -348,7 +402,7 @@ def _check_against_oracle(out, lse, ref_out, ref_lse, lse_mode):
             problems.append("lse requested but not returned")
         else:
             lse_f = lse.float()
-            num_diff, num_total, pct = is_close_stats(lse_f, ref_lse, **LSE_TOL)
+            num_diff, num_total, pct = _is_close_stats(lse_f, ref_lse, **LSE_TOL)
             if num_diff > 0:
                 max_abs_err = (lse_f - ref_lse).abs().max().item()
                 problems.append(
@@ -384,7 +438,6 @@ class _PhaseRows:
         phase_list += [("step", n) for n in args.pa_layers]
         for phase, layers in phase_list:
             row = defaultdict(str)
-            row["routine"] = args.routine
             row["backend"] = backend
             row["static_backend"] = backend
             row["resolved_backend"] = backend
@@ -405,7 +458,6 @@ class _PhaseRows:
             row["causal"] = args.causal
             row["q_dtype"] = args.q_dtype
             row["kv_dtype"] = args.kv_dtype
-            row["out_dtype"] = args.q_dtype
             row["kv_layout"] = args.kv_layout
             row["kv_input_form"] = args.kv_input_form
             row["lse_mode"] = args.lse_mode
@@ -547,8 +599,10 @@ def _time_candidate(args, phases, case, plan_once, run_once, recheck, ctx):
             )
             row["tflops"] = tflops
             row["tb_per_sec"] = tb_per_sec
-            print_perf_metrics(
-                f"{phases.label} run", median_time, std_time, tflops, tb_per_sec
+            print(
+                f"[PERF] {(phases.label + ' run').ljust(15)}:: median time "
+                f"{median_time:.3f} ms; std {std_time:.3f} ms; achieved tflops "
+                f"{tflops:.3f} TFLOPs/sec; achieved tb_per_sec {tb_per_sec:.3f} TB/sec"
             )
         else:
             name = f"{phases.label} {phase}" + (f"[{layers}]" if layers != "" else "")
@@ -991,7 +1045,7 @@ def _bench_legacy(args, case, backend, ctx):
     return phases
 
 
-def testPagedAttention(args):
+def run_paged_attention(args):
     """
     Benchmark ``flashinfer.prefill.PagedAttention`` (experimental unified paged
     attention) for the requested backends on one shared set of inputs.
@@ -1012,49 +1066,33 @@ def testPagedAttention(args):
         list: One result dictionary per (backend, phase) row
     """
     if args.verbose >= 1:
-        print("[INFO] Running testPagedAttention")
+        print("[INFO] Running the PagedAttention benchmark")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
-    device = get_device(args)
-    if args.generate_repro_command:
-        print(
-            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
-        )
+    # settle the device after a previous case, then seed this one
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    torch.manual_seed(args.random_seed)
+    torch.cuda.manual_seed_all(args.random_seed)
+    np.random.seed(args.random_seed)
+    device = torch.device("cuda")
     res = []
 
-    q_dtype = dtype_str_to_torch_dtype(args.q_dtype)
-    kv_dtype = dtype_str_to_torch_dtype(args.kv_dtype)
-    if q_dtype not in (torch.float16, torch.bfloat16) or kv_dtype != q_dtype:
+    q_dtype = _DTYPES.get(args.q_dtype)
+    kv_dtype = _DTYPES.get(args.kv_dtype)
+    if q_dtype is None or kv_dtype != q_dtype:
         print(
             "[ERROR] PagedAttention benchmark generates fp16/bf16 Q and KV of one "
             f"dtype; got q_dtype={args.q_dtype}, kv_dtype={args.kv_dtype}. Exiting."
         )
         return res
-    if (
-        args.out_dtype is not None
-        and dtype_str_to_torch_dtype(args.out_dtype) != q_dtype
-    ):
-        print("[WARNING] PagedAttention writes out in q_dtype; ignoring --out_dtype.")
-    if args.head_dim_qk is None:
-        print("[ERROR] --head_dim_qk is required for PagedAttention. Exiting.")
-        return res
     head_dim_vo = args.head_dim_vo if args.head_dim_vo is not None else args.head_dim_qk
     if args.page_size <= 0:
-        print("[ERROR] --page_size is required for PagedAttention. Exiting.")
+        print("[ERROR] --page_size must be positive. Exiting.")
         return res
     if args.s_qo > args.s_kv:
         print("[ERROR] s_qo > s_kv is not supported. Exiting.")
         return res
-    if getattr(args, "autotune", False):
-        print(
-            "[ERROR] PagedAttention tunes per backend request: pass --backends "
-            "autotune (measured choice; 'auto' ranks its candidates at plan() "
-            "with a fixed rule) instead of --autotune. Exiting."
-        )
-        return res
-    if args.enable_pdl:
-        print("[WARNING] PagedAttention does not expose PDL; ignoring --enable_pdl.")
-
     case = _build_case(args, device, q_dtype, kv_dtype, head_dim_vo)
     case["out"] = torch.empty(
         case["total_q"], args.num_qo_heads, head_dim_vo, dtype=q_dtype, device=device
@@ -1077,7 +1115,7 @@ def testPagedAttention(args):
         print(f"[VVERBOSE] kv_lens={case['kv_seq_lens_cpu'].tolist()}")
 
     use_cuda_graph = not args.no_cuda_graph
-    if args.use_cupti and _cupti_available():
+    if not args.use_cuda_events and _cupti_available():
         timing_metric = "cupti"
     elif use_cuda_graph:
         timing_metric = "cuda_graph_events"
@@ -1164,3 +1202,167 @@ def testPagedAttention(args):
         for backend in legacy_targets:
             res.extend(_bench_legacy(args, case, backend, ctx).rows)
     return res
+
+
+def parse_args(line=None):
+    """Parse one benchmark case (``line``: an argv list; default ``sys.argv``)."""
+    parser = argparse.ArgumentParser(
+        description="Benchmark flashinfer.prefill.PagedAttention (experimental)."
+    )
+    parser.add_argument(
+        "--backends",
+        nargs="+",
+        default=["auto"],
+        choices=PAGED_ATTENTION_BACKENDS,
+        help="Backends to time on the same inputs; 'auto' is the fixed plan-time "
+        "rule, 'autotune' the measured selection.",
+    )
+    parser.add_argument("--batch_size", type=int, required=True)
+    parser.add_argument(
+        "--s_qo", type=int, default=1, help="Max query length (1: decode)."
+    )
+    parser.add_argument("--s_kv", type=int, required=True, help="Max KV length.")
+    parser.add_argument("--num_qo_heads", type=int, required=True)
+    parser.add_argument("--num_kv_heads", type=int, required=True)
+    parser.add_argument("--head_dim_qk", type=int, required=True)
+    parser.add_argument(
+        "--head_dim_vo", type=int, default=None, help="Default: --head_dim_qk."
+    )
+    parser.add_argument("--page_size", type=int, required=True)
+    parser.add_argument("--q_dtype", choices=sorted(_DTYPES), default="bfloat16")
+    parser.add_argument("--kv_dtype", choices=sorted(_DTYPES), default="bfloat16")
+    parser.add_argument(
+        "--causal", action="store_true", help="Bottom-right causal masking."
+    )
+    parser.add_argument(
+        "--random_actual_seq_len",
+        action="store_true",
+        help="Sample per-request lengths in [1, max] instead of the max.",
+    )
+    parser.add_argument("--kv_layout", choices=["HND", "NHD"], default="HND")
+    parser.add_argument(
+        "--lse_mode",
+        choices=["none", "base2", "basee"],
+        default="none",
+        help="Base of the returned LSE ('none' skips the LSE output).",
+    )
+    parser.add_argument(
+        "--kv_input_form",
+        choices=["dense", "csr"],
+        default="dense",
+        help="'dense' builds PagedAttentionMetadata.dense (vLLM-style block "
+        "table, page_size >= 8); 'csr' builds .csr (sglang-style flat page "
+        "ids, any page_size).",
+    )
+    parser.add_argument(
+        "--window_left",
+        type=int,
+        default=-1,
+        help="Sliding-window size; -1 disables the window.",
+    )
+    parser.add_argument(
+        "--pa_layers",
+        type=int,
+        nargs="+",
+        default=[1, 32],
+        help="Layer counts N for the step phase (one plan followed by N run "
+        "calls); one CSV row per value.",
+    )
+    parser.add_argument(
+        "--pa_legacy",
+        action="store_true",
+        help="Also time the same inputs through the legacy public API of each "
+        "resolved backend (fa2/fa3: BatchPrefillWithPagedKVCacheWrapper, cudnn: "
+        "cudnn_batch_prefill_with_kv_cache, trtllm-gen: "
+        "trtllm_batch_context_with_kv_cache) as api_variant=legacy rows.",
+    )
+    parser.add_argument(
+        "--pa_skip_refcheck",
+        action="store_true",
+        help="Time without the fp32 oracle gate (otherwise always on); for "
+        "shapes the fp32 oracle cannot hold. Contradicts --refcheck.",
+    )
+    parser.add_argument(
+        "--pa_max_q_len_hint",
+        type=int,
+        default=None,
+        help="Pass max_q_len=N to resolve_paged_attention() (a bound on the "
+        "query tokens per request: plan() rejects a batch with a larger max "
+        "query length. It orders only the resolve-time candidate list, not "
+        "what 'auto' plans). Default: no hint.",
+    )
+    parser.add_argument(
+        "--refcheck",
+        action="store_true",
+        help="Accepted for symmetry with other benchmarks; the oracle gate is "
+        "always on unless --pa_skip_refcheck.",
+    )
+    parser.add_argument(
+        "--allow_output_mismatch",
+        action="store_true",
+        help="Time a candidate even when it mismatches the oracle.",
+    )
+    parser.add_argument(
+        "--no_cuda_graph",
+        action="store_true",
+        help="Use an eager instance and time the eager run.",
+    )
+    parser.add_argument(
+        "--use_cuda_events",
+        action="store_true",
+        help="Time GPU work with CUDA events instead of CUPTI.",
+    )
+    parser.add_argument("--num_iters", "-n", type=int, default=30)
+    parser.add_argument("--dry_run_iters", "-d", type=int, default=5)
+    parser.add_argument("--random_seed", type=int, default=42)
+    parser.add_argument("--verbose", "-v", action="count", default=0)
+    parser.add_argument("--case_tag", type=str, default=None)
+    parser.add_argument(
+        "--output_path", type=str, default=None, help="CSV file for the rows."
+    )
+    parser.add_argument(
+        "--testlist",
+        type=str,
+        default=None,
+        help="File with one case per line (same flags; '#' starts a comment).",
+    )
+    return parser.parse_args(line)
+
+
+def _write_rows(path, rows):
+    with open(path, "a", newline="") as fout:
+        writer = csv.writer(fout)
+        for row in rows:
+            writer.writerow([str(row[col]) for col in OUTPUT_COLUMNS])
+
+
+def main():
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--testlist", default=None)
+    pre.add_argument("--output_path", default=None)
+    top, _ = pre.parse_known_args()
+    if top.output_path is not None:
+        with open(top.output_path, "w", newline="") as fout:
+            csv.writer(fout).writerow(OUTPUT_COLUMNS)
+    if top.testlist is None:
+        cases = [None]
+    else:
+        with open(top.testlist) as f:
+            lines = [line.strip() for line in f]
+        cases = [
+            shlex.split(line) for line in lines if line and not line.startswith("#")
+        ]
+    for case in cases:
+        try:
+            rows = run_paged_attention(parse_args(case))
+        except Exception as exc:  # noqa: BLE001 - one bad case must not end a list
+            if top.testlist is None:
+                raise
+            print(f"[ERROR] case failed: {' '.join(case)}: {exc}")
+            continue
+        if top.output_path is not None:
+            _write_rows(top.output_path, rows)
+
+
+if __name__ == "__main__":
+    main()

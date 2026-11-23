@@ -1,5 +1,5 @@
-"""Regressions for ``benchmarks/routines/paged_attention.py`` (the PagedAttention
-benchmark routine), driven in-process through the benchmark CLI's parser.
+"""Regressions for ``benchmarks/bench_paged_attention.py`` (the standalone
+PagedAttention benchmark), driven in-process through the script's parser.
 
 Each test pins a review finding on the routine itself and fails on the
 routine as it was before the fix:
@@ -28,27 +28,24 @@ import torch
 
 BENCHMARKS_DIR = pathlib.Path(__file__).resolve().parents[3] / "benchmarks"
 if str(BENCHMARKS_DIR) not in sys.path:
-    # flashinfer_benchmark.py imports its routines as the ``routines`` package
     sys.path.insert(0, str(BENCHMARKS_DIR))
 
-flashinfer_benchmark = pytest.importorskip("flashinfer_benchmark")
-# aliased: the routine's entry point is named test* and must not be collected
-from routines.paged_attention import testPagedAttention as run_routine  # noqa: E402
+bench_paged_attention = pytest.importorskip("bench_paged_attention")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the benchmark routine needs a GPU"
 )
 
 COMMON = (
-    "--routine PagedAttention --num_qo_heads 8 --num_kv_heads 2 --head_dim_qk 128 "
+    "--num_qo_heads 8 --num_kv_heads 2 --head_dim_qk 128 "
     "--head_dim_vo 128 --page_size 16 --causal --kv_layout HND --refcheck "
     "--pa_layers 1 --num_iters 2 --dry_run_iters 1"
 )
 
 
 def _rows(line):
-    args = flashinfer_benchmark.parse_args(shlex.split(line))
-    return run_routine(args)
+    args = bench_paged_attention.parse_args(shlex.split(line))
+    return bench_paged_attention.run_paged_attention(args)
 
 
 def _select(rows, api_variant, phase=None):
@@ -136,7 +133,7 @@ def test_rows_for_the_csr_form():
     """The flat form plans, re-plans and runs under CUDA graphs; the legacy
     cuDNN rows say truthfully why they cannot."""
     rows = _rows(
-        "--routine PagedAttention --backends fa2 cudnn --batch_size 3 --s_qo 5 "
+        "--backends fa2 cudnn --batch_size 3 --s_qo 5 "
         "--s_kv 100 --num_qo_heads 8 --num_kv_heads 2 --head_dim_qk 128 "
         "--page_size 16 --causal --kv_layout NHD --kv_input_form csr "
         "--lse_mode basee --refcheck --random_actual_seq_len --pa_legacy "
