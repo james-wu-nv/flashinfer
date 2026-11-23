@@ -4,9 +4,11 @@ Owns the public lifecycle behind ``flashinfer.prefill``:
 validation, level-1 pinning against a ``Resolution``, level-2 choice within
 it (a walk in the auto policy's order for the batch, in which only the typed
 ``_BackendPlanUnsupportedError`` from a candidate's ``preflight()`` moves on to
-the next candidate), derivation, and transactional publication of the planned
-backend. It does not own any backend dialect (``_backends/``), the candidate
-set (``_selection.py``) or its ranking (``_auto_policy.py``).
+the next candidate; under ``autotune`` a measured choice among every
+candidate that accepts, settled at the first ``run()``), derivation, and
+transactional publication of the planned backend. It does not own any backend
+dialect (``_backends/``), the candidate set (``_selection.py``) or its ranking
+and measured selection (``_auto_policy.py``).
 
 Publication is transactional at this layer: ``plan()`` only swaps the
 published metadata, derived forms, and active backend after the candidate
@@ -27,7 +29,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
-from ._auto_policy import _PlanFacts, plan_order
+from ._auto_policy import (
+    _PlanFacts,
+    _RunArgs,
+    autotune_workload,
+    metadata_digest,
+    plan_order,
+    select_planned,
+)
 from ._backends import (
     CAPABILITIES,
     _BackendPlanUnsupportedError,
@@ -320,6 +329,12 @@ class PagedAttentionController:
         # and what the last plan could choose from, in the order it walked them
         self._trace: List[Tuple[str, str, str]] = []
         self._order: Tuple[str, ...] = ()
+        # autotune: the workload key and every planned candidate (name,
+        # backend, meta, derived) in the auto policy's order, until the first
+        # run() selects one
+        self._tuning: Optional[Tuple[Tuple, List[Tuple[str, Any, Any, Any]]]] = None
+        # the published plan was made under backend="autotune"
+        self._autotune = False
         self._meta: Optional[PlanMetadata] = None
         self._derived: Optional[Derived] = None
         # flat form only: the page ids the plan was made from (reserved storage
@@ -329,8 +344,12 @@ class PagedAttentionController:
 
     @property
     def backend(self) -> Optional[str]:
-        """Name of the backend chosen by the last successful plan()."""
-        return self._backend_name
+        """Name of the backend chosen by the last successful plan().
+
+        ``"autotune"`` for an autotune plan, before and after its first run()
+        selects a candidate (as the MLA wrapper reports it); explain() names
+        the selected candidate."""
+        return "autotune" if self._autotune else self._backend_name
 
     @property
     def resolution(self) -> Optional[Resolution]:
@@ -463,10 +482,10 @@ class PagedAttentionController:
         # which case the next member is tried; every other exception (invalid
         # input, OOM, JIT failure) propagates unchanged, and an explicit
         # backend string never falls back.  The walk finishes before any
-        # reserved-buffer write in graph mode.  The autotune hook (proposal
-        # §5.4) would rank the survivors here, keyed on bucketed
-        # (total_q_tokens, max_kv_len).
-        explicit = isinstance(backend, str) and backend != "auto"
+        # reserved-buffer write in graph mode.  Under autotune (proposal §5.4)
+        # every candidate that accepts is planned and the first run() selects
+        # one of them by measurement.
+        explicit = isinstance(backend, str) and backend not in ("auto", "autotune")
         gb: Optional[GraphBuffers] = None
         # no instance plans under capture: an eager plan would bake this
         # batch's uploads and a fresh backend plan into the caller's graph
@@ -515,7 +534,7 @@ class PagedAttentionController:
             )
 
         trace: List[Tuple[str, str, str]] = []
-        chosen = None
+        accepted: List[Tuple[str, Any, PlanMetadata, Derived, Derived]] = []
         frozen_backend = self._frozen["backend"] if self._frozen is not None else None
         if frozen_backend is not None and frozen_backend not in resolution.backends:
             _check_frozen_contract(
@@ -529,42 +548,52 @@ class PagedAttentionController:
             # trace, explain() text and error.
             resolution = _narrowed_to(resolution, frozen_backend)
         candidates = resolution.backends
+        # autotune: every candidate that accepts the batch is planned
+        # (prepare_all) and the first run() selects among them.  A frozen
+        # graph re-plan and a single candidate have nothing to choose.
+        facts = None
+        prepare_all = False
         if len(candidates) > 1:
             # Host values only: the bounds the kernels are planned with and
             # the batch's host mirrors, never a device readback.
-            candidates = plan_order(
-                candidates,
-                self._device_binding()[:2],
-                _PlanFacts(
-                    batch_size=metadata.batch_size,
-                    total_q_tokens=total_q_tokens,
-                    max_q_len=max_q_len,
-                    max_kv_len=max_kv_len,
-                    num_qo_heads=num_qo_heads,
-                    num_kv_heads=num_kv_heads,
-                    head_dim_qk=head_dim_qk,
-                    head_dim_vo=head_dim_vo,
-                    page_size=metadata.page_size,
-                    kv_layout=kv_layout,
-                    q_dtype=q_dtype,
-                    kv_dtype=kv_dtype,
-                    causal=causal,
-                    window_left=window_left,
-                    logits_soft_cap=logits_soft_cap,
-                    custom_mask=custom_mask is not None,
-                    use_sinks=use_sinks,
-                    use_cuda_graph=gb is not None,
-                    qo_indptr=metadata.qo_indptr_cpu,
-                    kv_seq_lens=metadata.kv_seq_lens_cpu,
-                ),
+            facts = _PlanFacts(
+                batch_size=metadata.batch_size,
+                total_q_tokens=total_q_tokens,
+                max_q_len=max_q_len,
+                max_kv_len=max_kv_len,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                page_size=metadata.page_size,
+                kv_layout=kv_layout,
+                q_dtype=q_dtype,
+                kv_dtype=kv_dtype,
+                causal=causal,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                custom_mask=custom_mask is not None,
+                use_sinks=use_sinks,
+                use_cuda_graph=gb is not None,
+                qo_indptr=metadata.qo_indptr_cpu,
+                kv_seq_lens=metadata.kv_seq_lens_cpu,
             )
+            candidates = plan_order(candidates, self._device_binding()[:2], facts)
+            prepare_all = resolution.autotune
+        # graph mode stages one set of derived forms for every planned
+        # candidate: the union of what they read
+        stage_needs = (
+            frozenset().union(*(derived_needs(n) for n in candidates))
+            if prepare_all and gb is not None
+            else None
+        )
         for name in candidates:
             # derive exactly the forms this candidate declared it reads (cached
             # on the metadata per need set and width; in graph mode the dense
             # table derived from flat page ids is sized to the reserved one)
             needs = derived_needs(name)
             fresh = metadata.derived(
-                needs=needs,
+                needs=stage_needs if stage_needs is not None else needs,
                 max_kv_len=gb.capacity.max_kv_len if gb is not None else None,
             )
             if gb is not None:
@@ -641,16 +670,42 @@ class PagedAttentionController:
                     ) from exc
                 continue
             trace.append((name, "preflight", "accepted"))
-            chosen = (name, candidate, meta, derived, fresh)
-            break
-        if chosen is None:
+            accepted.append((name, candidate, meta, derived, fresh))
+            if not prepare_all:
+                break
+        if not accepted:
             detail = "; ".join(f"{n}: {r}" for n, _, r in trace)
             raise ValueError(
                 "no pinned candidate can plan this batch "
                 f"(candidates {list(candidates)}: {detail})"
             )
-        name, candidate, meta, derived, fresh = chosen
-        key = (name, kv_layout)
+        name, candidate, meta, derived, fresh = accepted[0]
+        workload = None
+        if len(accepted) > 1:
+            assert facts is not None
+            trace.append(
+                (
+                    name,
+                    "autotune",
+                    f"planned {[a[0] for a in accepted]}; the first run() selects",
+                )
+            )
+            workspace = self._scratch_workspace()
+            workload = autotune_workload(
+                config=resolution.config[:-2] + (resolution.device_binding[:2],),
+                facts=facts,
+                digest=metadata_digest(
+                    (
+                        ("qo_indptr", metadata._host.host_view("qo_indptr")),
+                        ("kv_seq_lens", metadata._host.host_view("kv_seq_lens")),
+                        ("block_tables", metadata.block_tables),
+                        ("kv_page_indices", metadata.kv_page_indices),
+                    )
+                ),
+                workspace_bytes=workspace.numel() * workspace.element_size(),
+                device=self.device,
+                candidates=[a[0] for a in accepted],
+            )
 
         # graph mode: the frozen contract is checked before any reserved
         # buffer is written (the staging copies run inside the transaction)
@@ -663,10 +718,12 @@ class PagedAttentionController:
             # (including inside the backend's own plan) restores every buffer
             transaction = Transaction(gb.targets(metadata, fresh))
             with transaction:
-                candidate.plan(meta, derived)
+                for _, c, m, d, _ in accepted:
+                    c.plan(m, d)
                 transaction.commit()
         else:
-            candidate.plan(meta, derived)
+            for _, c, m, d, _ in accepted:
+                c.plan(m, d)
 
         # publish — nothing above mutated the published state (the backend
         # cache holds constructed objects, not plan state)
@@ -674,15 +731,16 @@ class PagedAttentionController:
             if gb.stream is None:
                 gb.stream = torch.cuda.current_stream(self.device)
             self._graph = gb
-            self._frozen = contract
-            self._frozen_plan_kwargs = {
-                k: v for k, v in contract.items() if k in _PLAN_PARAMS
-            }
-            # update() re-plans within the pinned resolution narrowed to the
-            # frozen backend: no level-1 re-resolution per step, and explain()
-            # keeps the resolve-time exclusion reasons
-            self._frozen_plan_kwargs["backend"] = _narrowed_to(resolution, name)
-        self._backends[key] = candidate
+            self._freeze(contract, resolution)
+        for n, c, _, _, _ in accepted:
+            self._backends[(n, kv_layout)] = c
+        # several planned candidates: run() settles the measured choice
+        self._tuning = (
+            (workload, [(n, c, m, d) for n, c, m, d, _ in accepted])
+            if len(accepted) > 1
+            else None
+        )
+        self._autotune = resolution.autotune
         self._active = candidate
         self._backend_name = name
         self._resolution = resolution
@@ -696,6 +754,59 @@ class PagedAttentionController:
                 gb.kv_page_indices if gb is not None else metadata.kv_page_indices
             )
         self._planned = True
+
+    def _freeze(self, contract: Dict[str, Any], resolution: Resolution) -> None:
+        """Freeze a graph-mode plan's contract (the first plan, or the
+        autotune winner that replaces its provisional head)."""
+        self._frozen = contract
+        self._frozen_plan_kwargs = {
+            k: v for k, v in contract.items() if k in _PLAN_PARAMS
+        }
+        # update() re-plans within the pinned resolution narrowed to the
+        # frozen backend: no level-1 re-resolution per step, and explain()
+        # keeps the resolve-time exclusion reasons
+        self._frozen_plan_kwargs["backend"] = _narrowed_to(
+            resolution, contract["backend"]
+        )
+
+    def _settle_autotune(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        out: torch.Tensor,
+        lse: Optional[torch.Tensor],
+        options: Dict[str, Any],
+    ) -> None:
+        """First run() after an autotune plan that planned several candidates:
+        select one (the cached result for this workload, or a measurement on
+        this run's tensors inside ``flashinfer.autotune(True)``) and keep it
+        for the rest of the plan."""
+        assert self._tuning is not None and self._meta is not None
+        workload, planned = self._tuning
+        m = self._meta
+        rows = q.shape[0]
+        assert out is not None
+        if lse is None and m.need_lse:
+            lse = torch.empty(
+                rows, m.num_qo_heads, dtype=torch.float32, device=q.device
+            )
+        name, how = select_planned(
+            [(n, c) for n, c, _, _ in planned],
+            workload,
+            self._graph is not None,
+            _RunArgs(q, k_cache, v_cache, out, lse, options),
+        )
+        _, candidate, meta, derived = next(p for p in planned if p[0] == name)
+        self._tuning = None
+        self._active = candidate
+        self._backend_name = name
+        self._meta = meta
+        self._derived = derived
+        self._trace.append((name, "autotune", how))
+        if self._graph is not None:
+            assert self._resolution is not None
+            self._freeze(_frozen_contract(name, meta), self._resolution)
 
     # ----------------------------- update -----------------------------
 
@@ -718,6 +829,12 @@ class PagedAttentionController:
             raise RuntimeError(
                 "update() called before a successful plan(): the first plan() "
                 "freezes the backend and the semantic kwargs update() reuses"
+            )
+        if self._tuning is not None:
+            raise RuntimeError(
+                "update() called while the autotune selection is open: the first "
+                "graph-mode plan prepared several candidates, and the first "
+                "run() (eager, before capture) selects the one the graph keeps"
             )
         self.plan(metadata, **self._frozen_plan_kwargs)
 
@@ -895,6 +1012,10 @@ class PagedAttentionController:
                 "is misaddressed — pass a packed copy or pin a strided-capable "
                 f"backend ({'/'.join(strided)})"
             )
+        if self._autotune and out is None:
+            raise ValueError(
+                "out must be provided for PagedAttention backend='autotune'."
+            )
         if out is not None:
             _expect(
                 tuple(out.shape) == (q.shape[0], m.num_qo_heads, m.head_dim_vo)
@@ -968,6 +1089,17 @@ class PagedAttentionController:
                 "sinks= passed but the plan did not declare use_sinks=True — "
                 "plan(use_sinks=True) selects the sink-aware kernel variant",
             )
+        if self._tuning is not None:
+            # every check above is the same for each planned candidate; only
+            # the backend that launches is still open
+            self._settle_autotune(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                lse,
+                dict(sm_scale=sm_scale, k_scale=k_scale, v_scale=v_scale, sinks=sinks),
+            )
         if self._graph is not None:
             gb = self._graph
             gb.rows = q.shape[0] if gb.rows is None else min(gb.rows, q.shape[0])
@@ -1002,8 +1134,16 @@ class PagedAttentionController:
     def explain(self) -> str:
         _expect(self._planned, "explain() called before plan() — call plan() first")
         assert self._resolution is not None
+        pending = (
+            f" (autotune selects among {[p[0] for p in self._tuning[1]]} at the "
+            "first run())"
+            if self._tuning is not None
+            else ""
+        )
+        if self._autotune and self._tuning is None:
+            pending = f" (selected {self._backend_name})"
         lines = [
-            f"chosen: {self._backend_name}",
+            f"chosen: {self.backend}{pending}",
             f"plan-time order: {list(self._order)}",
             "plan-time trace:",
         ]

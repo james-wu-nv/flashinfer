@@ -306,7 +306,9 @@ copies and the backend's plan).
 `HEURISTIC_ORDER`, the resolve-time order of the candidate set.
 `_auto_policy.py` owns the plan-time ranking of that set (`plan_order`, the
 per-architecture `ordered_*_backends` over `_PlanFacts`) and the list of auto
-candidates; it never decides support. `_backends/_capabilities.py` owns the
+candidates; it never decides support. The same module owns the measured
+selection behind `backend="autotune"` (the workload key, the tuner runners
+and `select_planned`), as the MLA package's `_auto_policy.py` does. `_backends/_capabilities.py` owns the
 declarative `PagedAttentionCapabilities` table, its pure
 `rejection_reason()` and the typed `_BackendPlanUnsupportedError`. The
 capability table only holds facts that drive selection; adapter details such
@@ -908,6 +910,60 @@ Current preflight rules:
   workspace is declined (see "Workspace"); `cake` declines a batch with a
   `kv_len == 0` request (ledger M19).
 
+### Level 2: measured selection (`autotune`)
+
+`backend="autotune"` keeps the candidate set of `auto` and replaces the
+ranking by a measurement. It follows `_BatchMLAPagedAttentionAutotuneBackend`
+of the MLA wrapper: the plan prepares every eligible candidate, the first
+`run()` selects one from the tuner cache or by profiling the current
+workload, the selection lasts until the next plan, and a workload that was
+never tuned is an error outside `flashinfer.autotune(True)`.
+`resolve_paged_attention(backend="autotune")` returns the `auto` set with
+`Resolution.autotune=True`; the flag is a selection policy, not
+configuration, so it is not part of `config`.
+
+In `plan()`, with more than one candidate and no frozen backend, the walk
+does not stop at the first acceptance: every candidate that accepts the batch
+is planned, in the auto policy's order. In graph mode they share one staging
+transaction, and the union of their derived forms is staged once into the
+reserved storage. The set is kept as the open selection, with its workload
+key. `backend` reports `autotune` for the whole plan, before and after the
+selection, and `explain()` names the selected candidate. A plan that ends with one accepted candidate has nothing to
+select and behaves as `auto`.
+
+The workload key (`autotune_workload`) identifies the planned workload; no
+dimension is bucketed. It holds the resolved configuration with the compute
+capability, the mode, the bounds the kernels are planned with (the capacity
+in graph mode), a SHA-256 digest of the batch's metadata tensors
+(`metadata_digest`: the query offsets, the KV lengths and the page ids, as
+MLA digests its metadata snapshot), the workspace size, the device and the
+names of the prepared candidates. The lengths come from the host arrays; a
+device page table is read back, so an autotune plan synchronizes.
+
+Every `run()` of an autotune plan requires `out`. The first one settles the
+selection after its argument checks (`_settle_autotune` calling
+`select_planned`):
+
+1. Under CUDA graph capture it raises `RuntimeError`: the selection must be
+   prepared before capture.
+2. The cache is searched with the workload key and the run signature (the
+   shapes, strides, dtypes, devices and alignment of q, K, V, `out`, `lse`
+   and sinks, and the host scales). A hit selects without launching anything
+   extra.
+3. On a miss outside `flashinfer.autotune(True)` it raises `RuntimeError`
+   asking for a warm-up.
+4. On a miss inside the context each candidate is launched once outside the
+   tuner, so a real failure raises instead of being scored as a slow tactic,
+   and `AutoTuner.choose_one` profiles them with one runner per candidate.
+   Profiling writes private `out` / `lse` buffers; the caller's buffers are
+   written once, by the selected backend. If the tuner recorded no result
+   (the op is in `skip_ops`, or profiling failed) it raises `RuntimeError`.
+
+The selected candidate becomes the active backend until the next plan, and
+in graph mode it replaces the provisional head in the frozen contract, so
+`update()` re-plans it alone. `update()` is refused while the selection is
+open. An error in the first `run()` leaves the selection open.
+
 ### `explain()`
 
 `PagedAttention.explain()` raises `ValueError` before the first successful
@@ -1399,7 +1455,7 @@ declines run through the wrapper's `run()` and produce its records.
 | `MLAPlanMetadata.csr()` / `.dense()` / `.dual()` | `PagedAttentionMetadata.dense()` / `.csr()` (no dual form: one truth) |
 | `MLAInputContract` | `PlanMetadata` plus the frozen contract dict in graph mode |
 | `_MLAPlanArguments` and its lazy resolver | `PlanMetadata`, `Derived`, `HostArrays` (`_planning.py`) |
-| `_auto_policy.py`: `backend="auto"` is resolved in `plan()`; per-architecture `ordered_*_backends` over the plan request; `_BatchMLAPagedAttentionAutoBackend.plan_from_wrapper` walks that order and moves on only on `_BackendPlanUnsupportedError`; a graph re-plan keeps the previous backend; the module also owns the `autotune` policy | `_auto_policy.py` only ranks (`plan_order`, per-architecture `ordered_*_backends` over `_PlanFacts`); `resolve_paged_attention()` fixes the candidate set at init (`cake` excluded under `auto`) and the controller walks it in `plan()`, moving on only on `_BackendPlanUnsupportedError`; a graph-mode instance keeps the first successful plan's backend; no autotune policy |
+| `_auto_policy.py`: `backend="auto"` is resolved in `plan()`; per-architecture `ordered_*_backends` over the plan request; `_BatchMLAPagedAttentionAutoBackend.plan_from_wrapper` walks that order and moves on only on `_BackendPlanUnsupportedError`; a graph re-plan keeps the previous backend; the module also owns the `autotune` policy | `_auto_policy.py` only ranks (`plan_order`, per-architecture `ordered_*_backends` over `_PlanFacts`); `resolve_paged_attention()` fixes the candidate set at init (`cake` excluded under `auto`) and the controller walks it in `plan()`, moving on only on `_BackendPlanUnsupportedError`; a graph-mode instance keeps the first successful plan's backend; the module also owns the measured selection of `backend="autotune"` (`select_planned`), which the controller calls at the first `run()` |
 | `_backends/_capabilities.py`, `_BackendPlanUnsupportedError` (a `ValueError` subclass that reaches the caller) | same module name, same-named private type with the same base class; the controller converts it to a plain `ValueError` that names the backend or lists every candidate's reason (to be unified) |
 | `_fa_common.py` + `fa2_backend.py` + `fa3_backend.py` | `fa_backend.py` (one class, backend name parameter) |
 | `cutlass_backend.py`, `trtllm_gen_backend.py`, ... | `cudnn_backend.py`, `trtllm_gen_backend.py` (trtllm-gen and cake) |

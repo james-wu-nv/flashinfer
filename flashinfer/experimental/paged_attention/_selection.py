@@ -1,13 +1,14 @@
 """Static backend selection (proposal §5.3, level 1).
 
-Tensor-free: callable at engine init, before the KV pool exists and before
-any CUDA graph is captured. Evaluates every declared capability so the
-returned ``Resolution`` carries a reason for each excluded backend — the
+Level 1 is tensor-free: callable at engine init, before the KV pool exists
+and before any CUDA graph is captured. Evaluates every declared capability so
+the returned ``Resolution`` carries a reason for each excluded backend — the
 "explain" answer consumer-side tables cannot give.
 
 This level fixes the candidate SET.  Its order is only the estimate available
 without a batch; ``plan()`` reorders the set for each batch through
-``_auto_policy.py``.
+``_auto_policy.py``, or, under ``backend="autotune"``, selects within it by
+measurement (same module).
 """
 
 from __future__ import annotations
@@ -227,7 +228,9 @@ def resolve_paged_attention(
     batch at hand the auto policy ranks the set from the batch's own facts.
 
     ``backend="auto"`` considers the auto candidates only; ``cake`` runs when
-    named.
+    named.  ``backend="autotune"`` resolves the same set as ``"auto"`` and
+    marks the Resolution (``Resolution.autotune``): plan() / run() then choose
+    within it by measurement instead of by the auto policy.
     """
     if head_dim_vo is None:
         head_dim_vo = head_dim_qk
@@ -248,10 +251,14 @@ def resolve_paged_attention(
     custom_mask, sinks = bool(custom_mask), bool(sinks)
 
     order = heuristic_order(cc_major, max_q_len)
+    autotune = backend == "autotune"
+    if autotune:
+        backend = "auto"
     if backend != "auto":
         if backend not in CAPABILITIES:
             raise ValueError(
-                f"unknown backend {backend!r}; known: {sorted(CAPABILITIES)} or 'auto'"
+                f"unknown backend {backend!r}; known: {sorted(CAPABILITIES)}, "
+                "'auto' or 'autotune'"
             )
         evaluate: Tuple[str, ...] = (backend,)
     else:
@@ -319,6 +326,7 @@ def resolve_paged_attention(
             cc_minor,
             device_index,
         ),
+        autotune=autotune,
     )
 
 

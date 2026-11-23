@@ -377,6 +377,7 @@ def parse_attention_args(line, parser):
             "fa2_tc",
             "fa3",
             "auto",
+            "autotune",  # PagedAttention measured selection
             "cudnn",
             "cudnn-native",
             "cutlass",

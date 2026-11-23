@@ -57,7 +57,11 @@ the first candidate in resolve-time order
 backend the plan ran (``attn.backend`` after ``plan()``).  Under ``auto``
 the two differ when the plan-time policy ranks another candidate first for
 the batch, or when a candidate declines the batch at plan time and the walk
-moves on.  ``auto`` is a fixed rule over host-side facts of the batch, not
+moves on.  ``autotune`` rows warm each instance up inside
+``flashinfer.autotune(True)`` (one plan and one eager run, which profile the
+candidates) and then time the selected backend; an eager ``plan`` row
+includes preparing every candidate.  ``auto`` is a fixed rule over
+host-side facts of the batch, not
 autotuning: with CUDA graphs on, the instance ranks once on the capacity
 inferred from the case and keeps that backend for the ``plan`` / ``run`` /
 ``step`` rows; with ``--no_cuda_graph`` it ranks on every plan.  In the
@@ -111,6 +115,7 @@ from collections import defaultdict
 import importlib.util
 import math
 import pathlib
+import re
 import time
 import traceback
 
@@ -142,7 +147,29 @@ from .flashinfer_benchmark_utils import (
     print_perf_metrics,
 )
 
-PAGED_ATTENTION_BACKENDS = ("fa2", "fa3", "cudnn", "trtllm-gen", "cake", "auto")
+PAGED_ATTENTION_BACKENDS = (
+    "fa2",
+    "fa3",
+    "cudnn",
+    "trtllm-gen",
+    "cake",
+    "auto",
+    "autotune",
+)
+# selection policies rather than kernels: no legacy row of their own
+_POLICIES = ("auto", "autotune")
+
+
+def _launching_backend(attn):
+    """The backend the plan launches.  ``attn.backend`` stays ``"autotune"``
+    for an autotune plan; explain() names the candidate its run() selected."""
+    name = attn.backend
+    if name == "autotune":
+        selected = re.match(r"chosen: autotune \(selected (\S+)\)", attn.explain())
+        return selected.group(1) if selected else name
+    return name
+
+
 LN2 = math.log(2.0)
 # Same tolerances as tests/experimental/paged_attention/test_paged_attention_prototype.py.
 OUT_TOL = dict(rtol=2e-2, atol=2e-2)
@@ -683,8 +710,12 @@ def _bench_unified(args, case, backend, ctx):
     # that ran is read from the instance after plan().
     phases.set_static(resolution.chosen)
     phases.set_resolved(resolution.chosen)
-    if args.verbose >= 1 and backend == "auto":
-        print(f"[INFO] auto resolution:\n{resolution.explain()}")
+    if args.verbose >= 1 and backend in _POLICIES:
+        print(f"[INFO] {backend} resolution:\n{resolution.explain()}")
+    # autotune: the first plan and run of each instance are its warm-up,
+    # measured inside flashinfer.autotune(True); the timed phases then select
+    # from the cache, as a tuned engine does at steady state
+    tune = flashinfer.autotune if backend == "autotune" else None
 
     attn = PagedAttention(
         ctx["device"],
@@ -717,9 +748,24 @@ def _bench_unified(args, case, backend, ctx):
             graph_capacity=_graph_capacity(case, args.kv_input_form),
             workspace_buffer=ctx["workspace"],
         )
-        bucket["attn"].plan(
-            _make_metadata(case, args.kv_input_form), backend=resolution, **plan_kwargs
-        )
+        if tune is None:
+            bucket["attn"].plan(
+                _make_metadata(case, args.kv_input_form),
+                backend=resolution,
+                **plan_kwargs,
+            )
+            return
+        # graph mode keys its own workload (the capacity): an eager warm-up
+        # run settles the choice before capture
+        with tune(True):
+            bucket["attn"].plan(
+                _make_metadata(case, args.kv_input_form),
+                backend=resolution,
+                **plan_kwargs,
+            )
+            run_bucket(
+                case["q"], case["k_cache"], case["v_cache"], case["out"], case["lse"]
+            )
 
     def update_once():
         bucket["attn"].update(_make_metadata(case, args.kv_input_form))
@@ -736,13 +782,27 @@ def _bench_unified(args, case, backend, ctx):
 
     try:
         ctx["workspace"].zero_()
+        if tune is not None:
+            with tune(True):
+                plan_once()
+                run_once(
+                    case["q"],
+                    case["k_cache"],
+                    case["v_cache"],
+                    case["out"],
+                    case["lse"],
+                )
         plan_once()
-        resolved = attn.backend  # the candidate that accepted the batch
+        resolved = _launching_backend(attn)  # the candidate that accepted the batch
         phases.set_resolved(resolved)
         got_out, got_lse = run_once(
             case["q"], case["k_cache"], case["v_cache"], case["out"], case["lse"]
         )
         torch.cuda.synchronize()
+        if tune is not None:
+            # an autotune plan names its backend at the first run()
+            resolved = _launching_backend(attn)
+            phases.set_resolved(resolved)
     except Exception as exc:  # noqa: BLE001 - every failure becomes a row
         phases.set_all(_error_status(exc))
         if args.verbose >= 2:
@@ -751,7 +811,11 @@ def _bench_unified(args, case, backend, ctx):
         # planned (run failed), or the explicitly requested backend (its plan
         # failed; the legacy row shows whether the public API fails on the
         # same inputs too).  A failed `auto` plan names no kernel.
-        resolved = attn.backend or (backend if backend != "auto" else None)
+        resolved = _launching_backend(attn) or (
+            backend if backend not in _POLICIES else None
+        )
+        if resolved in _POLICIES:  # an open autotune selection names no kernel
+            resolved = None
         if resolved is not None:
             phases.set_resolved(resolved)
         return phases, resolved
@@ -1146,8 +1210,9 @@ def testPagedAttention(args):
         return res
     if getattr(args, "autotune", False):
         print(
-            "[ERROR] PagedAttention has no autotuner; 'auto' ranks its candidates "
-            "at plan() with a fixed rule. Drop --autotune. Exiting."
+            "[ERROR] PagedAttention tunes per backend request: pass --backends "
+            "autotune (measured choice; 'auto' ranks its candidates at plan() "
+            "with a fixed rule) instead of --autotune. Exiting."
         )
         return res
     if args.enable_pdl:

@@ -217,7 +217,8 @@ Backend selection and the ``max_q_len`` hint
 --------------------------------------------
 
 ``backend="auto"`` is a fixed rule over host-side facts of the batch, not
-autotuning: nothing is timed. It works on two levels.
+autotuning: nothing is timed (``backend="autotune"``, below, measures
+instead). It works on two levels.
 
 :func:`~flashinfer.prefill.resolve_paged_attention` fixes the candidate
 *set*: those of fa2, fa3, trtllm-gen and cuDNN that the capability table and
@@ -352,6 +353,59 @@ the same backend. It never changes the candidate set or the exclusions. It is
 pinned in the Resolution (``explain()`` prints it; Resolutions of one model
 configuration with different hints have different ``config`` keys).
 
+Measured selection: ``backend="autotune"``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``backend="autotune"`` selects within the same candidate set as ``"auto"``
+by measurement. It follows ``backend="autotune"`` of
+``BatchMLAPagedAttentionWrapper``: tune the planned workload inside
+``flashinfer.autotune(True)``, serve the cached result outside it.
+:func:`~flashinfer.prefill.resolve_paged_attention` with
+``backend="autotune"`` returns the ``"auto"`` set with
+``Resolution.autotune`` set, so ``plan(backend=resolution)`` carries the mode.
+
+.. code-block:: python
+
+    attn = flashinfer.prefill.PagedAttention(device)
+    with flashinfer.autotune(True, cache="paged_attention.json"):
+        attn.plan(metadata, backend="autotune", **config)  # prepares every candidate
+        attn.run(q, (k_cache, v_cache), out=out)           # profiles, keeps the winner
+
+    attn.plan(metadata, backend="autotune", **config)
+    attn.run(q, (k_cache, v_cache), out=out)               # cached result, no profiling
+
+``plan()`` prepares every candidate that accepts the batch.
+:attr:`~flashinfer.prefill.PagedAttention.backend` is ``"autotune"`` for the
+whole plan; ``explain()`` lists the candidates and, after the first
+``run()``, the selected one (``chosen: autotune (selected <name>)``).
+``run()`` requires
+``out=`` under this mode. The first ``run()`` selects one candidate and keeps
+it until the next plan:
+
+- A result cached for the planned workload and this call's tensor layouts
+  and options is used (this process, or a file loaded with
+  ``flashinfer.autotune(cache=...)``).
+- Otherwise, inside ``flashinfer.autotune(True)``, each candidate is
+  launched once and profiled by the autotuner on the caller's q and KV cache
+  with private output buffers; the winner is cached.
+- Otherwise it raises ``RuntimeError``: warm up inside the context first.
+  A context that skips the operation (``skip_ops``) raises as well.
+
+The cache identity is the planned workload, not a shape bucket: the resolved
+configuration, the mode (eager or CUDA graph), the bounds the kernels are
+planned with, a digest of the batch's metadata (the per-request query and KV
+lengths and the page ids), the workspace size, the device and the prepared
+candidates. A batch with other lengths or other pages is another workload.
+Computing the digest reads a device page table back, so an autotune plan
+synchronizes.
+
+The selecting ``run()`` cannot be under CUDA graph capture. In CUDA-graph
+mode it is the eager warm-up before capture: ``update()`` is refused until it
+has run, and the selected backend is the one the instance freezes, so later
+``update()`` calls re-plan that backend alone. An eager instance prepares
+every candidate on each ``plan()``, which costs more host time than an
+``"auto"`` plan. A named backend never enters the tuner.
+
 The SM100 rule is measured against
 ``BatchPrefillWithPagedKVCacheWrapper(backend="auto")`` on GB200
 (cudnn-frontend 1.32 / cuDNN 9.27, 2026-11-18; bf16, ``run()`` medians, every
@@ -442,7 +496,9 @@ failing or incorrect backends are kept with a ``status`` column and a
 resolve-time order and ``resolved_backend`` the backend the plan ran. Under
 ``auto`` the two differ when ``plan()`` ranks another candidate first for the
 batch or when a candidate declines it (``auto`` is a fixed rule, not
-autotuning). The benchmark generates fp16/bf16 Q and KV; see
+autotuning). ``--backends autotune`` warms each instance up inside
+``flashinfer.autotune(True)`` and then times the selected backend; its eager
+``plan`` rows include preparing every candidate. The benchmark generates fp16/bf16 Q and KV; see
 ``benchmarks/README.md`` for the columns.
 
 Tracing the unified API

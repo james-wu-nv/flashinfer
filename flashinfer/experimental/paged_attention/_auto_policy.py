@@ -1,20 +1,27 @@
-"""Automatic paged-prefill selection: architecture dispatch and ranking.
+"""Automatic paged-prefill selection through heuristics or current-workload
+autotuning.
 
-The policy only orders the auto candidates from plan-time request facts. It
-never decides support: the static capability table and probes
+The auto policy only orders the auto candidates from plan-time request facts.
+It never decides support: the static capability table and probes
 (``_selection.py``) own the candidate set, each backend's ``preflight()`` owns
 batch eligibility (typed ``_BackendPlanUnsupportedError``), and the controller
-walks the order returned here. Mirrors ``flashinfer/mla/_batch_mla/_auto_policy.py``.
+walks the order returned here.  The autotune policy (end of this module)
+selects among the candidates the controller planned for one workload by
+profiling.  Mirrors ``flashinfer/mla/_batch_mla/_auto_policy.py``.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from ...autotuner import AutoTuner, TunableRunner, TuningConfig
+from ._backends._capabilities import CAPABILITIES
 from ._contracts import _expect
 
 # Default fallback order: generated FA, then the Blackwell context kernel,
@@ -580,9 +587,227 @@ def plan_order(
     )
 
 
+# ---------------------------------------------------------------------------
+# Measured selection for the current planned workload (backend="autotune").
+#
+# The autotune policy of the MLA wrapper (``_BatchMLAPagedAttentionAutotuneBackend``)
+# on this package's controller: plan() prepares every eligible candidate, the
+# first run() selects one -- from the AutoTuner cache, or inside
+# ``flashinfer.autotune(True)`` by profiling them on the caller's own q / KV
+# with private output storage -- and the selection lasts until the next plan.
+# Nothing is synthesized and no bucket is swept: the cache identity is the
+# planned workload itself plus the run() signature.
+# ---------------------------------------------------------------------------
+_OP = "paged_attention"
+_CONFIGS = {
+    graph: TuningConfig(use_cuda_graph=graph, use_cold_l2_cache=True)
+    for graph in (False, True)
+}
+
+
+def _tensor_signature(value: Optional[torch.Tensor]) -> Optional[Tuple]:
+    if value is None:
+        return None
+    return (
+        tuple(value.shape),
+        tuple(value.stride()),
+        str(value.dtype),
+        str(value.device),
+        value.data_ptr() % 16,
+    )
+
+
+def _effective_config(tuner: AutoTuner, use_cuda_graph: bool) -> TuningConfig:
+    # Match choose_one's measurement policy for the strict cache checks. There
+    # are no dynamic dimensions: tuning_buckets never expands a plan.
+    config = tuner._apply_tuning_overrides(_CONFIGS[use_cuda_graph])
+    if tuner._effective_measure_policy is not None:
+        config = tuner._apply_measure_policy(config, tuner._effective_measure_policy)
+    if config.use_cuda_graph and not use_cuda_graph:
+        # choose_one reapplies the policy: reject instead of silently clamping.
+        raise ValueError(
+            "PagedAttention use_cuda_graph=False does not allow CUDA graph "
+            "profiling; use an eager autotune measurement policy."
+        )
+    return config
+
+
+def metadata_digest(tensors: Sequence[Tuple[str, Optional[torch.Tensor]]]) -> str:
+    """SHA-256 over the batch metadata tensors (name, shape, dtype, values),
+    as the MLA autotune plan digests its metadata snapshot.  A device tensor
+    is read back: an autotune plan is a warm-up step, not a hot path."""
+    digest = hashlib.sha256()
+    for name, value in tensors:
+        if value is None:
+            continue
+        digest.update(name.encode())
+        digest.update(str((tuple(value.shape), value.dtype)).encode())
+        digest.update(value.cpu().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def autotune_workload(
+    *,
+    config: Tuple,
+    facts: _PlanFacts,
+    digest: str,
+    workspace_bytes: int,
+    device: torch.device,
+    candidates: Sequence[str],
+) -> Tuple:
+    """The cache identity of one planned workload: the resolved configuration,
+    the mode, the bounds the kernels are planned with, the digest of the
+    batch's metadata (lengths and page ids), the scratch workspace size, the
+    device and the prepared candidates.  Host values only, stable across
+    processes."""
+    return (
+        "planned-v1",
+        bool(facts.use_cuda_graph),
+        digest,
+        (facts.batch_size, facts.total_q_tokens, facts.max_q_len, facts.max_kv_len),
+        tuple(str(v) for v in config),
+        int(workspace_bytes),
+        str(device),
+        tuple(candidates),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _RunArgs:
+    """One run()'s arguments, handed to the tuner as a single opaque input."""
+
+    q: torch.Tensor
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    out: torch.Tensor
+    lse: Optional[torch.Tensor]
+    options: Dict[str, Any]
+
+    def signature(self) -> Tuple:
+        # First-run cache identity only: layouts and host options, never
+        # tensor values.  A successful choice lasts until the next plan.
+        sinks = self.options.get("sinks")
+        return (
+            tuple(
+                _tensor_signature(t)
+                for t in (self.q, self.k_cache, self.v_cache, self.out, self.lse, sinks)
+            ),
+            tuple((k, v) for k, v in self.options.items() if k != "sinks"),
+        )
+
+
+# The tuner's inputs are ``[_RunArgs, device marker]``: the run arguments as
+# one opaque value (shape ``(0,)`` to the tuner; the cache key is the workload
+# and signature in the runners' extras, not tensor shapes) and a one-element
+# tensor on the device, which cold-L2 profiling needs to place its flush.
+_TUNER_SHAPES = ((0,), (1,))
+
+
+class _PlannedCandidate(TunableRunner):
+    """One planned candidate as a tuner runner."""
+
+    def __init__(self, name: str, backend: Any, cache_key: Tuple):
+        self.name = name
+        self.backend = backend
+        self.cache_key = cache_key
+
+    def __hash__(self) -> int:
+        return hash((_PlannedCandidate, self.name))
+
+    def get_cache_key_extras(self, inputs) -> Tuple:
+        return (self.name, self.cache_key)
+
+    def get_valid_tactics(self, inputs, profile, **kwargs) -> List[int]:
+        args = inputs[0]
+        if CAPABILITIES[self.name].requires_contiguous_q and not args.q.is_contiguous():
+            return []
+        return [-1]
+
+    def forward(self, inputs, tactic: Any = -1, do_preparation: bool = False, **kw):
+        args = inputs[0]
+        return self.backend.run(
+            args.q,
+            args.k_cache,
+            args.v_cache,
+            out=args.out,
+            lse=args.lse,
+            **args.options,
+        )
+
+
+def select_planned(
+    planned: Sequence[Tuple[str, Any]],
+    workload: Tuple,
+    use_cuda_graph: bool,
+    args: _RunArgs,
+) -> Tuple[str, str]:
+    """Select among the ``planned`` ``(name, backend)`` pairs for the first
+    run() of a plan.  Returns ``(name, how)``; ``how`` is a short provenance
+    for the selection trace.
+
+    A cached result for the workload and this run's signature answers.
+    Otherwise, inside ``flashinfer.autotune(True)``, every candidate is
+    launched once and then profiled on ``args`` with private ``out`` / ``lse``
+    storage (no caller-visible write), and the winner is cached.  Outside the
+    context a miss is an error: warm up first.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "PagedAttention backend='autotune' requires a prepared selection "
+            "before CUDA graph capture; warm up run() inside "
+            "flashinfer.autotune(True)."
+        )
+    tuner = AutoTuner.get()
+    config = _effective_config(tuner, use_cuda_graph)
+    cache_key = (workload, args.signature())
+    # Admission belongs to each candidate, before any launch; unexpected
+    # failures from admitted kernels still propagate.
+    runners = [_PlannedCandidate(n, b, cache_key) for n, b in planned]
+    runners = [r for r in runners if r.get_valid_tactics([args], None)]
+    if not runners:
+        raise ValueError(
+            "No autotune PagedAttention backend supports the current tensor layout."
+        )
+    names = [r.name for r in runners]
+    marker = torch.empty(1, dtype=torch.uint8, device=args.q.device)
+    inputs = [args, marker]
+    hit, index, _, _ = tuner.search_cache(
+        _OP, runners, _TUNER_SHAPES, config, inputs=inputs
+    )
+    if hit:
+        return names[index], "cached measurement"
+    if not tuner.is_tuning_mode:
+        raise RuntimeError(
+            "No cached PagedAttention autotune result for this planned workload "
+            "and run options. Warm up run() inside flashinfer.autotune(True)."
+        )
+    profile = dataclasses.replace(
+        args,
+        out=torch.empty_like(args.out),
+        lse=torch.empty_like(args.lse) if args.lse is not None else None,
+    )
+    # Surface validation/launch failures before the generic tuner can classify
+    # a failed tactic and fall back to its default runner.
+    for r in runners:
+        r([profile, marker], tactic=-1)
+    tuner.choose_one(_OP, runners, config, [profile, marker])
+    hit, index, _, _ = tuner.search_cache(
+        _OP, runners, _TUNER_SHAPES, config, inputs=inputs
+    )
+    if not hit:
+        raise RuntimeError(
+            "PagedAttention autotuning produced no measured selection; profiling "
+            "may have been skipped or failed."
+        )
+    return names[index], f"measured over {names}"
+
+
 __all__ = [
     "_AUTO_BACKEND_CANDIDATES",
     "_PlanFacts",
+    "autotune_workload",
+    "metadata_digest",
+    "select_planned",
     "ordered_backends",
     "ordered_sm80_backends",
     "ordered_sm90_backends",

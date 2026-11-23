@@ -58,8 +58,13 @@ Prototype simplifications (documented, not hidden):
   other architectures have fixed orders, of which sm_90 (the legacy
   wrapper's short-query rule, without its H100 cuDNN admission) and the
   other sm_10x parts put fa2 first for short queries.  cake is never an
-  auto candidate.  Autotune hook (§5.4) is not wired: ``auto`` never times
-  anything.
+  auto candidate.  ``auto`` never times anything; ``backend="autotune"``
+  (§5.4) selects within the same set by measurement, as the MLA wrapper's
+  ``backend="autotune"`` does: ``plan()`` prepares every candidate that
+  accepts the batch and the first ``run()`` selects one, from the autotuner
+  cache or, inside ``flashinfer.autotune(True)``, by profiling them on the
+  caller's tensors.  A workload that was never tuned raises outside the
+  context.
 - ``logits_soft_cap`` / ``custom_mask`` / ``use_sinks`` are explicit
   capability axes (fa2: all three; fa3: soft cap + sinks; trtllm-gen and
   cake: sinks; cuDNN: none) — a backend lacking a requested feature is excluded, never
@@ -228,6 +233,9 @@ def resolve_paged_attention(
     - ``backend``: ``"auto"`` resolves the auto candidates (fa2, fa3,
       trtllm-gen, cuDNN) that can run the configuration; a name resolves
       that backend alone.  ``cake`` is never an auto candidate: name it.
+      ``"autotune"`` resolves the ``"auto"`` set and marks the Resolution
+      (``Resolution.autotune``, carried to ``plan(backend=res)``): the choice
+      within the set is then measured -- see :meth:`PagedAttention.plan`.
     """
     from .experimental.paged_attention import resolve_paged_attention as _resolve
 
@@ -352,7 +360,9 @@ class PagedAttention:
 
     @property
     def backend(self) -> Optional[str]:
-        """Name of the backend chosen by the last successful ``plan()``."""
+        """Name of the backend chosen by the last successful ``plan()``;
+        ``"autotune"`` for an autotune plan (``explain()`` names the candidate
+        its first ``run()`` selected)."""
         return self._impl.backend
 
     @staticmethod
@@ -397,9 +407,10 @@ class PagedAttention:
           planned with ``capacity``, which also covers any eager plan that
           fits it; ``False`` gives the tighter eager-only bound, which does
           not depend on the token counts.
-        - ``backend``: ``"auto"`` takes the maximum over every backend that
-          resolves for the configuration; a name or a ``Resolution`` asks
-          about that candidate set.
+        - ``backend``: ``"auto"`` / ``"autotune"`` take the maximum over every
+          backend that resolves for the configuration (autotune plans them
+          all on one shared workspace and runs one at a time); a name or a
+          ``Resolution`` asks about that candidate set.
 
         Formulas (per backend; ``H`` query heads, ``H_kv`` KV heads, ``G =
         H / H_kv``, ``D`` = ``head_dim_vo``, ``SM`` = SM count, ``B`` =
@@ -533,6 +544,25 @@ class PagedAttention:
           never ranks ``cake`` in: name it.  A backend name, or a Resolution
           resolved with one, pins the backend; a batch it cannot plan raises
           ``ValueError``.
+
+          ``"autotune"`` (or a Resolution resolved with it) measures instead
+          of trusting the rule, as the MLA wrapper's ``backend="autotune"``
+          does.  plan() prepares every candidate that accepts the batch;
+          the first ``run()`` selects one and keeps it until the next plan.
+          :attr:`backend` stays ``"autotune"`` (``explain()`` names the
+          selected candidate), and every ``run()`` of such a plan requires
+          ``out=``.  That
+          ``run()`` takes the result cached for the planned workload (the
+          configuration, the planned bounds, the batch's lengths and page
+          ids, the workspace size, the device, the prepared candidates) and its own
+          tensor layouts and options -- from this process or a
+          ``flashinfer.autotune(cache=...)`` file.  Without one, inside
+          ``flashinfer.autotune(True)`` it launches each candidate once,
+          profiles them on its own q / KV with private output buffers and
+          caches the winner; outside the context it raises ``RuntimeError``:
+          warm up first.  The selecting ``run()`` cannot be under CUDA graph
+          capture; in CUDA-graph mode ``update()`` is refused until it has
+          run, and the selected backend is what the instance freezes.
 
         Publication is transactional: a failing ``plan()`` leaves the previous
         plan runnable (see ``experimental/paged_attention/_controller.py`` for

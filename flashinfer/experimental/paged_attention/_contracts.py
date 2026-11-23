@@ -236,6 +236,10 @@ class Resolution:
     Pass the whole Resolution to ``plan(backend=...)`` to enforce the
     pinning: plan() verifies its arguments and its device match ``config``
     and chooses only within ``backends``.
+
+    ``autotune`` (``resolve_paged_attention(backend="autotune")``) makes the
+    plan-time choice a measured one: plan() prepares every member that accepts
+    the batch and the first run() selects among them (``_auto_policy.py``).
     """
 
     backends: Tuple[str, ...]
@@ -244,6 +248,9 @@ class Resolution:
     # the resolve-time observational config, used by plan() to detect drift;
     # its last element is the device binding (cc_major, cc_minor, device_index)
     config: Tuple = ()
+    # the selection policy within ``backends``: the auto policy (False) or a
+    # measurement (True); a policy, not configuration, so not part of ``config``
+    autotune: bool = False
 
     @property
     def chosen(self) -> str:
@@ -285,6 +292,15 @@ class Resolution:
             )
         else:
             lines.append("max_q_len hint: none (default order)")
+        lines.append(
+            "selection: "
+            + (
+                "autotune (the first run() selects: a cached measurement, or a "
+                "profile inside flashinfer.autotune(True))"
+                if self.autotune
+                else "auto (policy order)"
+            )
+        )
         lines.append(
             f"candidates (resolve-time order; plan() ranks per batch): "
             f"{list(self.backends)}"
