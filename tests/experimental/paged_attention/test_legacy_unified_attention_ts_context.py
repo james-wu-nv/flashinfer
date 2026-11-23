@@ -758,7 +758,6 @@ def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
         PagedAttention.__init__,
         PagedAttention.plan,
         PagedAttention.run,
-        PagedAttention.update,
         PagedAttentionMetadata.dense,
         PagedAttentionMetadata.csr,
         resolve_paged_attention,

@@ -269,10 +269,9 @@ def test_explicit_backend_never_falls_back(monkeypatch):
 
 @needs_cuda
 def test_graph_replan_publishes_the_frozen_backend_alone(monkeypatch):
-    """A graph-mode instance ranks once.  A re-plan, through plan() as well
-    as update(), can only choose the captured backend: that is what
-    ``selection_order``, the trace and explain() then report, identically on
-    both paths, and the policy is not consulted."""
+    """A graph-mode instance ranks once.  A re-plan can only choose the
+    captured backend: that is what ``selection_order``, the trace and
+    explain() then report, and the policy is not consulted."""
     p = make_problem(seed=101, **_SHAPE)
     res = _resolve_or_skip(p, "auto")
     if len(res.backends) < 2:
@@ -292,10 +291,6 @@ def test_graph_replan_publishes_the_frozen_backend_alone(monkeypatch):
     assert impl.selection_trace == ((frozen, "preflight", "accepted"),)
     replanned = attn.explain()
     assert f"plan-time order: ['{frozen}']" in replanned
-    attn.update(make_metadata(p))
-    assert attn.backend == frozen and impl.selection_order == (frozen,)
-    assert impl.selection_trace == ((frozen, "preflight", "accepted"),)
-    assert attn.explain() == replanned
 
 
 def test_graph_replan_publishes_the_frozen_backend_alone_on_the_host(monkeypatch):
@@ -315,18 +310,13 @@ def test_graph_replan_publishes_the_frozen_backend_alone_on_the_host(monkeypatch
 
     monkeypatch.setattr(_controller, "plan_order", forbidden_ranking)
     # plan() re-resolves the whole set, in which fa2 is not the first member,
-    # and narrows it to the frozen backend before the walk ...
+    # and narrows it to the frozen backend before the walk
     attn.plan(_host_metadata([2048], [2048]), **_M14_PLAN)
     assert attn.backend == "fa2" and attn.selection_order == ("fa2",)
     assert attn.selection_trace == (("fa2", "preflight", "accepted"),)
     replanned = attn.explain()
     assert "plan-time order: ['fa2']" in replanned
     assert "not the backend the first graph-mode plan froze" in replanned
-    # ... which is the Resolution update() re-plans within: same report
-    attn.update(_host_metadata([2048], [2048]))
-    assert attn.backend == "fa2" and attn.selection_order == ("fa2",)
-    assert attn.selection_trace == (("fa2", "preflight", "accepted"),)
-    assert attn.explain() == replanned
 
 
 @needs_cuda

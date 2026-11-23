@@ -791,7 +791,7 @@ class _FaBackend:
         # Post-processing (fp8 V descale, LSE base fold) runs over the WHOLE
         # caller buffer, never the batch's row prefix: under CUDA-graph
         # capture the prefix is frozen at the first batch's row count, and a
-        # later update() that grows the live rows would leave the new rows
+        # later re-plan that grows the live rows would leave the new rows
         # unscaled / in base 2 (review R1).  Rows past the batch are
         # unspecified by contract, so scaling them is harmless.
         out_full = out if out is not None else (r[0] if need_lse else r)

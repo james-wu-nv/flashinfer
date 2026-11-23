@@ -13,7 +13,7 @@ Layout (mirrors ``flashinfer/mla/_batch_mla/``):
                      the candidate set and its resolve-time order)
     _auto_policy.py  plan-time ranking of the auto candidates for one batch
                      (level-2 order); ranks only, never decides support
-    _controller.py   plan()/update()/run() lifecycle, the candidate walk in
+    _controller.py   plan()/run() lifecycle, the candidate walk in
                      the policy's order, transactional publication
     _graph.py        GraphCapacity, reserved storage and staging for CUDA graphs
     _backends/       one module per backend + declarative capabilities

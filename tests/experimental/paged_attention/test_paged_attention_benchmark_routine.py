@@ -10,9 +10,8 @@ routine as it was before the fix:
 - R6 / R04: under the default CUDA-graph timing the helper's cold-L2 rotating
   clones were captured without an eager run, which cake refuses (M18); the
   run rows must time on every backend, cake included.
-- Missing deliverable: the engine-facing per-step ``update()`` under an
-  explicit ``GraphCapacity`` is measured (``update`` / ``update_replay`` rows,
-  graph mode only).
+- The phase rows are ``plan`` / ``run`` / ``step`` in both modes; under CUDA
+  graphs the ``plan`` row is the graph-mode re-plan.
 - Every row keeps its truthful ``status`` and the legacy rows carry the same
   ``static_backend`` / ``resolved_backend`` columns as the unified rows.
 
@@ -96,7 +95,7 @@ def test_legacy_cudnn_dense_rows_under_cuda_graphs_with_lse():
         "--lse_mode base2 --pa_legacy"
     )
     _skip_unless_runnable(rows, "cudnn")
-    assert _select(rows, "legacy", "update_replay")
+    assert _select(rows, "legacy", "run")
     _assert_all_ok(rows, "cudnn dense, graph, base2")
 
 
@@ -116,36 +115,26 @@ def test_cake_run_rows_time_under_cuda_graphs():
     _assert_all_ok(rows, "cake, graph")
 
 
-def test_update_rows_only_in_graph_mode():
-    """The update phases exist (and pass) under CUDA graphs and are absent
-    with --no_cuda_graph, where update() does not exist."""
-    graph_rows = _rows(
-        f"{COMMON} --backends fa2 --batch_size 2 --s_qo 4 --s_kv 64 "
-        "--lse_mode basee --pa_legacy"
-    )
-    _skip_unless_runnable(graph_rows, "fa2")
-    for variant in ("unified", "legacy"):
-        phases = [r["phase"] for r in _select(graph_rows, variant)]
-        assert phases == ["plan", "run", "update", "update_replay", "step"], phases
-        for phase in ("update", "update_replay"):
-            (row,) = _select(graph_rows, variant, phase)
+def test_phase_rows_are_the_same_in_both_modes():
+    """plan / run / step, with or without CUDA graphs: the graph-mode
+    re-plan is the ``plan`` row of a graph-mode instance."""
+    for mode, flag in (("graph", ""), ("eager", " --no_cuda_graph")):
+        rows = _rows(
+            f"{COMMON} --backends fa2 --batch_size 2 --s_qo 4 --s_kv 64 "
+            f"--lse_mode basee --pa_legacy{flag}"
+        )
+        _skip_unless_runnable(rows, "fa2")
+        for variant in ("unified", "legacy"):
+            phases = [r["phase"] for r in _select(rows, variant)]
+            assert phases == ["plan", "run", "step"], phases
+            (row,) = _select(rows, variant, "plan")
             assert row["timing_metric"] == "host_wall"
-            assert row["layers"] == ""
-    _assert_all_ok(graph_rows, "fa2 graph mode")
-
-    eager_rows = _rows(
-        f"{COMMON} --backends fa2 --batch_size 2 --s_qo 4 --s_kv 64 "
-        "--lse_mode basee --pa_legacy --no_cuda_graph"
-    )
-    for variant in ("unified", "legacy"):
-        phases = [r["phase"] for r in _select(eager_rows, variant)]
-        assert phases == ["plan", "run", "step"], phases
-    _assert_all_ok(eager_rows, "fa2 eager mode")
+        _assert_all_ok(rows, f"fa2 {mode} mode")
 
 
-def test_update_rows_for_the_csr_form():
-    """The explicit capacity of the flat form (flat_capacity = batch x width)
-    plans and updates; the legacy cuDNN rows say truthfully why they cannot."""
+def test_rows_for_the_csr_form():
+    """The flat form plans, re-plans and runs under CUDA graphs; the legacy
+    cuDNN rows say truthfully why they cannot."""
     rows = _rows(
         "--routine PagedAttention --backends fa2 cudnn --batch_size 3 --s_qo 5 "
         "--s_kv 100 --num_qo_heads 8 --num_kv_heads 2 --head_dim_qk 128 "
@@ -155,7 +144,7 @@ def test_update_rows_for_the_csr_form():
     )
     _skip_unless_runnable(rows, "fa2")
     fa2 = [r for r in rows if r["backend"] == "fa2"]
-    assert {r["phase"] for r in _select(fa2, "unified")} >= {"update", "update_replay"}
+    assert {r["phase"] for r in _select(fa2, "unified")} == {"plan", "run", "step"}
     _assert_all_ok(fa2, "fa2 csr")
     cudnn_legacy = [r for r in _select(rows, "legacy") if r["backend"] == "cudnn"]
     assert cudnn_legacy

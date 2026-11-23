@@ -569,7 +569,7 @@ def test_a_backend_declaring_packed_q_rejects_strided_views(monkeypatch):
     _check_unified(attn, p, p["q"])
 
 
-# (q lengths, KV lengths) of a capture batch and of an update that changes the
+# (q lengths, KV lengths) of a capture batch and of a re-plan that changes the
 # query partition, the KV lengths and (by seed) every page id inside the same
 # buffers.  Two requests with a few thousand KV tokens each: sized like the
 # batches cuDNN is given by auto on SM100, though nothing below depends on
@@ -586,8 +586,8 @@ def test_auto_runs_a_fused_qkv_query_on_the_leading_candidate(
     """q's storage layout reaches the library only at run(), after auto has
     ranked its candidates, so a plan-time rank cannot route around a candidate
     that would need packed q: whichever candidate leads must run the engines'
-    fused-QKV head slice, eager and replayed from a CUDA graph across an
-    update().  The rank is forced (the policy is replaced), so this holds for
+    fused-QKV head slice, eager and replayed from a CUDA graph across a
+    re-plan.  The rank is forced (the policy is replaced), so this holds for
     every candidate here and asserts no heuristic winner; cuDNN is the one
     auto ranks first for some batches on SM100 and that used to reject."""
     from flashinfer.experimental.paged_attention import _controller
@@ -655,11 +655,11 @@ def test_auto_runs_a_fused_qkv_query_on_the_leading_candidate(
     replay_matches(p)
     for step in (_exact_problem(*_AUTO_UPDATE, seed=109, **heads), p):
         # new values through the captured strided view and pools, new
-        # metadata through update()
+        # metadata through a re-plan
         q.copy_(step["q"])
         k_cache.copy_(step["k_cache"])
         v_cache.copy_(step["v_cache"])
-        attn.update(make_metadata(step))
+        attn.plan(make_metadata(step), **plan_kw)
         assert attn.backend == first
         replay_matches(step)
 

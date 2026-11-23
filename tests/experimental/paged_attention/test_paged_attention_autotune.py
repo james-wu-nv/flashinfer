@@ -463,20 +463,20 @@ def test_graph_mode_freezes_the_measured_winner(tuner, monkeypatch, input_form, 
     with flashinfer.autotune(True):
         g.plan(md, backend=res, **_plan_kw(p))
         with pytest.raises(RuntimeError, match="autotune selection is open"):
-            g.update(md)
+            g.plan(md, backend=res, **_plan_kw(p))
         # eager warm-up before capture settles and freezes the choice
         g.run(q_buf, (p["k_cache"], p["v_cache"]), out=out_buf, lse=lse_buf)
     assert g.backend == "autotune" and _selected(g) == winner
     assert g._impl._frozen["backend"] == winner
-    assert g._impl._frozen_plan_kwargs["backend"].backends == (winner,)
     _check(p, out_buf, lse_buf)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         g.run(q_buf, (p["k_cache"], p["v_cache"]), out=out_buf, lse=lse_buf)
-    # update() re-plans the frozen winner, no new measurement
+    # a re-plan keeps the frozen winner, no new measurement
     monkeypatch.setattr(tuner, "choose_one", _forbidden)
     out_buf.zero_()
-    g.update(md)
+    g.plan(md, backend=res, **_plan_kw(p))
+    assert g._impl.selection_order == (winner,)
     assert g.backend == "autotune" and _selected(g) == winner
     graph.replay()
     torch.cuda.synchronize()
@@ -498,8 +498,8 @@ def test_graph_mode_cached_result_freezes_at_the_first_run(tuner, monkeypatch):
     second = PagedAttention(dev, graph_capacity=dataclasses.replace(cap))
     second.plan(md, backend=res, **_plan_kw(p))
     with pytest.raises(RuntimeError, match="autotune selection is open"):
-        second.update(md)
+        second.plan(md, backend=res, **_plan_kw(p))
     _check(p, *_run(second, p))
     assert _selected(second) == winner and second._impl._frozen["backend"] == winner
-    second.update(md)
+    second.plan(md, backend=res, **_plan_kw(p))
     _check(p, *_run(second, p))

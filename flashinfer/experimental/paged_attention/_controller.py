@@ -22,7 +22,6 @@ its generated backends.
 from __future__ import annotations
 
 import dataclasses
-import inspect
 import math
 import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
@@ -317,10 +316,8 @@ class PagedAttentionController:
         self._graph: Optional[GraphBuffers] = (
             GraphBuffers(graph_capacity, dev) if graph_capacity is not None else None
         )
-        # what the first successful graph-mode plan froze (_frozen_contract),
-        # and the plan() kwargs update() re-issues from it
+        # what the first successful graph-mode plan froze (_frozen_contract)
         self._frozen: Optional[Dict[str, Any]] = None
-        self._frozen_plan_kwargs: Optional[Dict[str, Any]] = None
         # published plan state (swapped together, only on success)
         self._planned = False
         self._backend_name: Optional[str] = None
@@ -499,12 +496,19 @@ class PagedAttentionController:
                 gb = GraphBuffers(GraphCapacity.from_metadata(metadata), self.device)
             else:
                 gb = self._graph
+                if self._tuning is not None:
+                    raise RuntimeError(
+                        "plan() called while the autotune selection is open: the "
+                        "first graph-mode plan prepared several candidates, and "
+                        "the first run() (eager, before capture) selects the one "
+                        "the graph keeps"
+                    )
                 stream = torch.cuda.current_stream(self.device)
                 _expect(
                     gb.stream is None or stream == gb.stream,
                     "CUDA graph re-plan on a different stream than the first "
                     "graph-mode plan: the staging copies must be ordered before "
-                    "the replay — plan()/update() and graph.replay() on one "
+                    "the replay — plan() and graph.replay() on one "
                     "stream (the stream of the first graph-mode plan)",
                 )
             gb.preflight(metadata)
@@ -544,8 +548,7 @@ class PagedAttentionController:
             # A captured graph launches the frozen backend's kernels, so a
             # graph-mode re-plan has one candidate whatever set it was given:
             # nothing is ranked, and no other member is constructed, asked or
-            # reserved for.  plan() and update() then publish the same order,
-            # trace, explain() text and error.
+            # reserved for.
             resolution = _narrowed_to(resolution, frozen_backend)
         candidates = resolution.backends
         # autotune: every candidate that accepts the batch is planned
@@ -731,7 +734,7 @@ class PagedAttentionController:
             if gb.stream is None:
                 gb.stream = torch.cuda.current_stream(self.device)
             self._graph = gb
-            self._freeze(contract, resolution)
+            self._frozen = contract
         for n, c, _, _, _ in accepted:
             self._backends[(n, kv_layout)] = c
         # several planned candidates: run() settles the measured choice
@@ -754,20 +757,6 @@ class PagedAttentionController:
                 gb.kv_page_indices if gb is not None else metadata.kv_page_indices
             )
         self._planned = True
-
-    def _freeze(self, contract: Dict[str, Any], resolution: Resolution) -> None:
-        """Freeze a graph-mode plan's contract (the first plan, or the
-        autotune winner that replaces its provisional head)."""
-        self._frozen = contract
-        self._frozen_plan_kwargs = {
-            k: v for k, v in contract.items() if k in _PLAN_PARAMS
-        }
-        # update() re-plans within the pinned resolution narrowed to the
-        # frozen backend: no level-1 re-resolution per step, and explain()
-        # keeps the resolve-time exclusion reasons
-        self._frozen_plan_kwargs["backend"] = _narrowed_to(
-            resolution, contract["backend"]
-        )
 
     def _settle_autotune(
         self,
@@ -805,38 +794,8 @@ class PagedAttentionController:
         self._derived = derived
         self._trace.append((name, "autotune", how))
         if self._graph is not None:
-            assert self._resolution is not None
-            self._freeze(_frozen_contract(name, meta), self._resolution)
-
-    # ----------------------------- update -----------------------------
-
-    def update(self, metadata: PagedAttentionMetadata) -> None:
-        """Graph-mode re-plan with the frozen semantic kwargs.
-
-        Routes through :meth:`plan` with the kwargs the first graph-mode plan
-        froze (backend included), so it stages into the reserved storage,
-        preflights against the capacity and rolls back on failure exactly as
-        a re-plan does; there is no second staging path.
-        """
-        _expect_not_capturing("update()")
-        if not self._use_cuda_graph:
-            raise RuntimeError(
-                "update() is the CUDA-graph re-plan: construct "
-                "PagedAttention(graph_capacity=...) or PagedAttention("
-                "use_cuda_graph=True); eager instances re-plan with plan()"
-            )
-        if self._frozen_plan_kwargs is None:
-            raise RuntimeError(
-                "update() called before a successful plan(): the first plan() "
-                "freezes the backend and the semantic kwargs update() reuses"
-            )
-        if self._tuning is not None:
-            raise RuntimeError(
-                "update() called while the autotune selection is open: the first "
-                "graph-mode plan prepared several candidates, and the first "
-                "run() (eager, before capture) selects the one the graph keeps"
-            )
-        self.plan(metadata, **self._frozen_plan_kwargs)
+            # the measured winner replaces the plan's provisional head
+            self._frozen = _frozen_contract(name, meta)
 
     # ------------------------------ run -------------------------------
 
@@ -1127,8 +1086,8 @@ class PagedAttentionController:
     def selection_order(self) -> Tuple[str, ...]:
         """What the last successful plan() could choose from, in the order it
         walked them: the pinned candidates in the auto policy's order for the
-        batch, or -- on a CUDA-graph re-plan, through plan() or update(), where
-        nothing is ranked -- the frozen backend alone."""
+        batch, or -- on a CUDA-graph re-plan, where nothing is ranked -- the
+        frozen backend alone."""
         return self._order
 
     def explain(self) -> str:
@@ -1224,19 +1183,11 @@ class PagedAttentionController:
         }
 
 
-# plan() keyword arguments update() re-issues from the frozen contract; the
-# remaining frozen keys (kv_input_form, page_size, dense_table) come from the
-# metadata and the chosen backend and are checked, not passed
-_PLAN_PARAMS = frozenset(
-    inspect.signature(PagedAttentionController.plan).parameters
-) - {"self", "metadata"}
-
-
 def _expect_not_capturing(what: str) -> None:
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
-            f"{what} cannot run during CUDA graph capture: plan or update before "
-            "capture, replay inside it"
+            f"{what} cannot run during CUDA graph capture: plan before capture, "
+            "replay inside it"
         )
 
 

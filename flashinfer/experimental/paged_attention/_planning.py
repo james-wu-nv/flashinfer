@@ -106,7 +106,7 @@ class HostArrays:
     flight is only reused after the copy's stream event completes, and
     same-size re-allocations are served from the cache (about 1 us).
     Follow-up: pool one staging slot pair per PagedAttention instance so the
-    graph-mode update path can upload straight into its reserved storage.
+    graph-mode re-plan can upload straight into its reserved storage.
 
     The mirrors are trusted to match the device tensors (documented caller
     contract; validating equality would cost the sync this path removes).

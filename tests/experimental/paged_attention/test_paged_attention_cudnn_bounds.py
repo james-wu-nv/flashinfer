@@ -77,7 +77,7 @@ from .test_paged_attention_cudnn_prepared import (
     _problem,
     _replay,
     _require_prepared,
-    _update,
+    _replan,
     _warm_and_capture,
 )
 from .test_paged_attention_prototype import LSE_TOL, OUT_TOL, _gpu_activity
@@ -869,7 +869,7 @@ def test_cuda_graph_mode_declares_the_capacity(monkeypatch, lse_mode):
     """A bucket whose capacity is not a class: max_q_len 100 (an eager plan
     would declare 128) and max_kv_len 250 in a 16-column table (an eager
     plan would declare 256).  The captured graph must serve every later
-    batch of the bucket, so plan() and update() declare the capacity
+    batch of the bucket, so every plan() declares the capacity
     whatever the batch, through the reserved table itself; one capture
     replays batches with other lengths and page ids."""
     capacity = GraphCapacity(
@@ -908,7 +908,7 @@ def test_cuda_graph_mode_declares_the_capacity(monkeypatch, lse_mode):
     for p in batches[1:]:
         assert not torch.equal(p["block_tables"], p1["block_tables"])
         _load(buffers, p)
-        _update(attn, p)
+        _replan(attn, p, lse_mode=lse_mode)
         assert backend._block_tables is reserved
         assert torch.equal(reserved, p["block_tables"])  # the caller's columns
         assert _declared(backend) == (100, 250, 16)

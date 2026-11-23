@@ -24,7 +24,7 @@ and without timing thresholds:
 4. Eager re-plans of one instance: other lengths and page ids, another
    dtype (another module), custom mask to plain; a rejected re-plan leaves
    the previous plan runnable through the path it was staged for.
-5. CUDA-graph mode: capture on buffers larger than the batch, ``update()``
+5. CUDA-graph mode: capture on buffers larger than the batch, re-plan
    with other lengths and page ids, replay; no device allocation in a
    ``run()`` with caller buffers.
 6. ``run()`` does not synchronize.
@@ -721,9 +721,9 @@ def _load(buffers, p):
 @pytest.mark.parametrize("backend", FA_BACKENDS)
 @pytest.mark.parametrize("path", ["direct", "wrapper_run"])
 @pytest.mark.parametrize("lse_mode", ["none", "base2", "basee"])
-def test_graph_capture_update_replay(monkeypatch, backend, path, lse_mode):
+def test_graph_capture_replan_replay(monkeypatch, backend, path, lse_mode):
     """Capture one run on buffers of 48 rows for a 32-row batch (the launch
-    gets the row prefix), replay; ``update()`` -- without a synchronization --
+    gets the row prefix), replay; re-plan -- without a synchronization --
     with other query partitions, KV lengths and page ids (29 rows), replay.
     Run-time scales are captured with the launch: ``k_scale`` in the softmax
     scale, ``v_scale`` and the base-e fold over the whole buffers."""
@@ -760,7 +760,7 @@ def test_graph_capture_update_replay(monkeypatch, backend, path, lse_mode):
         if p is p2:
             torch.cuda.set_sync_debug_mode("error")
             try:
-                attn.update(make_metadata(p))
+                _plan(p, backend, attn=attn, **plan_kw)
             finally:
                 torch.cuda.set_sync_debug_mode("default")
             assert (backend_obj._staged is not None) == (path == "direct")

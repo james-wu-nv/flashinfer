@@ -24,7 +24,7 @@ design separates four concerns:
   (`PagedAttentionMetadata`), what a plan means (`PlanMetadata`), what a
   resolution promised (`Resolution`), validation, and the canonical-to-derived
   conversions.
-- The controller owns the plan/update/run lifecycle: level-1 pinning against a
+- The controller owns the plan/run lifecycle: level-1 pinning against a
   `Resolution`, the level-2 candidate walk in the auto policy's order,
   capacity substitution, the frozen contract of a captured graph,
   transactional staging and publication.
@@ -50,7 +50,7 @@ flashinfer.prefill.PagedAttention(device, graph_capacity=..., workspace_buffer=.
        -> publish
   -> run(q, (k_cache, v_cache), out=, lse=, sm_scale=, k_scale=, v_scale=, sinks=)
        -> runtime validation only, then backend.run()
-  -> [graph mode] update(metadata) per step, then graph.replay()
+  -> [graph mode] plan(metadata, same arguments) per step, then graph.replay()
 ```
 
 ## Motivation
@@ -87,7 +87,7 @@ error or returns results matching the oracle.
   of the batch and walks it, and only a typed unsupported signal from a
   candidate's `preflight()` moves on to the next candidate.
 - Capacity-based CUDA-graph lifecycle: construct with a `GraphCapacity`, let
-  the first plan freeze the semantic contract, then `update()` per step.
+  the first plan freeze the semantic contract, then `plan()` again per step.
 - Transactional publication: a failed plan leaves the previous plan runnable
   and, in graph mode, restores every reserved buffer it touched.
 - Sync-free planning with host mirrors: one numpy pass validates and derives
@@ -118,7 +118,7 @@ eagerly from `flashinfer/_paged_attention.py` and exposes the value types
 `PagedAttentionCapabilities` through a module `__getattr__`, so importing
 `flashinfer` never loads the experimental package
 (`tests/experimental/paged_attention/test_paged_attention_contract_cpu.py::test_importing_flashinfer_does_not_load_the_experimental_package`).
-`resolve_paged_attention`, `PagedAttention.plan`, `update` and `run` carry
+`resolve_paged_attention`, `PagedAttention.plan` and `run` carry
 `@flashinfer_experimental_api`; calling one is the opt-in and emits an
 `ExperimentalWarning` once.
 
@@ -175,7 +175,6 @@ PagedAttention(device=None, *, graph_capacity=None, use_cuda_graph=False,
       q_dtype, kv_dtype=None, kv_layout="HND", causal=True, window_left=-1,
       lse_mode="none", logits_soft_cap=None, custom_mask=None,
       use_sinks=False, backend="auto") -> PagedAttention
-.update(metadata) -> PagedAttention
 .run(q, kv_cache, *, out=None, lse=None, sm_scale=None,
      k_scale=None, v_scale=None, sinks=None) -> (out, lse)
 .explain() -> str
@@ -251,7 +250,9 @@ g = torch.cuda.CUDAGraph()
 with torch.cuda.graph(g):
     attn.run(q_buf, (k_cache, v_cache), out=out_buf, lse=lse_buf)
 for step in scheduler:
-    attn.update(md_step)                            # only the batch changes
+    attn.plan(md_step, num_qo_heads=8, num_kv_heads=2, head_dim_qk=128,
+              q_dtype=torch.bfloat16, kv_layout="HND", causal=True,
+              lse_mode="base2", backend=res)      # only the batch changes
     g.replay()
 ```
 
@@ -283,7 +284,7 @@ package. It contains no backend logic.
   published selection order and trace;
 - graph mode: capacity preflight, capacity substitution, reserved-table
   reservation, the frozen contract, the staging transaction;
-- publication of the plan state, `update()`, `run()` validation and dispatch,
+- publication of the plan state, `run()` validation and dispatch,
   `explain()`, and the read-only `trace_context()`.
 
 ### Contracts and planning
@@ -367,7 +368,7 @@ flashinfer/
     |-- _planning.py               validation, HostArrays, Derived, derive()
     |-- _selection.py              resolve_paged_attention(), probes, HEURISTIC_ORDER
     |-- _auto_policy.py            plan-time ranking of the auto candidates
-    |-- _controller.py             plan()/update()/run() lifecycle
+    |-- _controller.py             plan()/run() lifecycle
     |-- _graph.py                  GraphCapacity, GraphBuffers, Transaction
     `-- _backends/
         |-- __init__.py            factory, derived_needs()
@@ -489,17 +490,17 @@ published: a backend built against an unpublished capacity is cached only at
 publication, so a failed first plan leaves neither a capacity nor a backend
 sized to it.
 
-**Stage 3, `update()`.** `update(metadata)` re-issues `plan()` with the
-keyword arguments the first graph-mode plan froze and, as `backend=`, the
-plan's `Resolution` narrowed to the frozen backend, so it stages into the
-reserved storage, preflights against the capacity and rolls back on failure
-exactly as a re-plan does; there is no second staging path, and nothing is
-resolved or ranked per step. It raises `RuntimeError` when the instance is
-not in graph mode, when no plan has succeeded yet, or when the current
-stream is capturing. `plan()` is also rejected during capture. After the
-first graph-mode plan, `plan()` and `update()` must run on that plan's
+**Stage 3, the per-step re-plan.** Each step calls `plan()` again with the
+new metadata and the arguments of the first plan; there is no separate
+update call, as in the MLA wrapper. The re-plan stages into the reserved
+storage, preflights against the capacity and rolls back on failure. Nothing
+is ranked: the controller narrows the candidate set to the frozen backend.
+With a pinned `Resolution` as `backend=` nothing is resolved per step
+either; a backend string is resolved again on every plan (about 0.02 ms on
+the host). `plan()` raises `RuntimeError` when the current stream is
+capturing. After the first graph-mode plan it must run on that plan's
 stream, the stream the graph is replayed on, so that the staging copies
-precede the replay; on another stream they raise `ValueError`.
+precede the replay; on another stream it raises `ValueError`.
 
 **Warm-up before capture.** Every backend needs one eager `run()` after the
 plan and before capture for its lazy work (module load, cuDNN graph build).
@@ -843,8 +844,8 @@ otherwise.
 Eager instances rank on every `plan()`, so the backend can change between
 batches. A graph-mode instance ranks on the capacity's bounds and the
 planned batch's host lengths until a plan succeeds: the first successful
-plan freezes its backend, and later plans and `update()` keep it without
-consulting the policy.
+plan freezes its backend, and later plans keep it without consulting the
+policy.
 
 The row and fill rule reads only the capacity. The cuDNN region also reads
 the first plan's per-request lengths (the exact work, the Q == KV proof and
@@ -961,8 +962,8 @@ selection after its argument checks (`_settle_autotune` calling
 
 The selected candidate becomes the active backend until the next plan, and
 in graph mode it replaces the provisional head in the frozen contract, so
-`update()` re-plans it alone. `update()` is refused while the selection is
-open. An error in the first `run()` leaves the selection open.
+a re-plan plans it alone. A graph-mode re-plan is refused while the
+selection is open. An error in the first `run()` leaves the selection open.
 
 ### `explain()`
 
@@ -976,9 +977,8 @@ candidates in resolve-time order, and each exclusion reason). The trace and the 
 
 The walked order is the auto policy's order for an eager plan and for a
 graph-mode plan made before a backend is frozen. Once a graph-mode backend
-is frozen nothing is ranked and the order is the frozen backend alone, on a
-re-plan through `plan()` and through `update()`. Either way the controller
-narrows the `Resolution` to the frozen backend before the walk
+is frozen nothing is ranked and the order is the frozen backend alone: the
+controller narrows the `Resolution` to the frozen backend before the walk
 (`_narrowed_to`), so the trace holds only that backend's entry, no other
 member is constructed or asked, and the `Resolution.explain()` text lists
 the other members among its exclusions ("not the backend the first
@@ -1369,11 +1369,7 @@ synchronized host wall; a graph-mode re-plan when CUDA graphs are on), `run`
 (warmed `run()` with preallocated buffers, GPU time: by default one `run()`
 on the case's own buffers captured once and its replay timed with CUDA events
 and an L2 flush before every replay — bindings fixed, so cake's M18 rule holds
-for every backend, instead of the timing helper's rotating clones), `update`
-and `update_replay` (CUDA graphs on: a second instance built with an explicit
-`GraphCapacity` from the case, one `run()` captured, then per step a fresh
-metadata plus `update()`, alone and followed by the replay; synchronized host
-wall, the replayed buffers re-checked against the oracle), `step` (one plan
+for every backend, instead of the timing helper's rotating clones), `step` (one plan
 plus N eager runs). Rows for unsupported, erroring or incorrect candidates
 are kept with a `status` column; the typed preflight signal, alone or chained
 under the candidate walk's `ValueError`, is classified as `unsupported`.
@@ -1385,9 +1381,7 @@ same kernel; its cuDNN provider hands the native API the width-exact column
 view of the case's wider block table with the actual `max_kv_len` (the
 unified cuDNN backend declares other bounds: its capacity's in CUDA-graph
 mode, here the table's full width, and a shape class with a table of its
-own in an eager plan), and its `update` rows time the per-step re-arm of the
-captured legacy call (the graph-mode wrapper's `plan()` for fa2/fa3, the
-device-metadata derivation into fixed buffers for cuDNN and trtllm-gen/cake).
+own in an eager plan).
 `benchmarks/bench_paged_attention_plan.py` is the micro-benchmark for
 metadata construction, eager plan and graph re-plan cost, with launch and
 memcpy counts from the profiler.
@@ -1460,7 +1454,7 @@ declines run through the wrapper's `run()` and produce its records.
 | `_fa_common.py` + `fa2_backend.py` + `fa3_backend.py` | `fa_backend.py` (one class, backend name parameter) |
 | `cutlass_backend.py`, `trtllm_gen_backend.py`, ... | `cudnn_backend.py`, `trtllm_gen_backend.py` (trtllm-gen and cake) |
 | reserved metadata buffers, `supports_cuda_graph_replan` per backend | `GraphCapacity`, `GraphBuffers`, `Transaction` in `_graph.py`; every backend re-plans through reserved storage |
-| no public plan-update API | `PagedAttention.update(metadata)` |
+| no public plan-update API: a graph re-plan is `plan()` again | the same |
 | MLA trace template in `trace/templates/attention.py` | `trace/templates/paged_attention.py` |
 
 Differences worth knowing: paged attention has no deprecated argument forms

@@ -313,7 +313,7 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         # against the oracle: a fused-QKV head slice, a slice from the middle
         # of a fused buffer, a padded head stride, a storage offset, token
         # stride 2 and a padded token stride; the first four also on the
-        # functional entry and replayed from a CUDA graph across update(),
+        # functional entry and replayed from a CUDA graph across re-plans,
         # with and without LSE (max out err 8.5e-3, the packed q's own).  A
         # zero token stride (an expanded q) is not addressed -- the graph
         # refuses it, the element-offset path misreads it -- and the

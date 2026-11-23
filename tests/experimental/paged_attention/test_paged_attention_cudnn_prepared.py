@@ -23,7 +23,7 @@ paged-attention oracle and without timing thresholds:
    tables of other widths, row strides and owners (derived from flat page
    ids or the caller's); across LSE modes, masks and LSE layouts; a rejected
    re-plan and one that fails after staging.
-5. CUDA-graph mode: capture one run, ``update()`` with changed lengths and
+5. CUDA-graph mode: capture one run, re-plan with changed lengths and
    page ids, replay -- on the prepared path, on the functional fallback and
    with cuDNN's backend engines alone (provider control), in a small bucket
    and in one large enough for the frontend's own prefill engines; NHD,
@@ -66,7 +66,6 @@ from .test_paged_attention_prototype import (
     LSE_TOL,
     OUT_TOL,
     _resolve_or_skip,
-    make_metadata,
 )
 
 pytestmark = [
@@ -998,30 +997,31 @@ def _replay(graph, buffers):
     torch.cuda.synchronize()
 
 
-def _update(attn, p):
-    """update() must not synchronize: it is the per-step host path."""
+def _replan(attn, p, *, causal=True, lse_mode="base2"):
+    """A graph-mode re-plan must not synchronize: it is the per-step host
+    path."""
     torch.cuda.set_sync_debug_mode("error")
     try:
-        attn.update(make_metadata(p))
+        plan(attn, p, "cudnn", causal=causal, lse_mode=lse_mode)
     finally:
         torch.cuda.set_sync_debug_mode("default")
 
 
-def _capture_update_replay(
+def _capture_replan_replay(
     monkeypatch, batches, *, lse_mode, arm, causal=True, scales=None
 ):
-    """Plan ``batches[0]``, capture one run, replay; then update() with each
-    later batch and replay the same capture, and run the updated plan eagerly
+    """Plan ``batches[0]``, capture one run, replay; then re-plan with each
+    later batch and replay the same capture, and run the new plan eagerly
     too.  Arms:
 
-    - ``any_engine``: the prepared path where the gate holds.  update() keeps
+    - ``any_engine``: the prepared path where the gate holds.  A re-plan keeps
       the very plan object the capture was made with (its bindings are the
       reserved buffers), no cuDNN graph is prepared after the capture, and
-      the eager run after an update does no plan-time work.
+      the eager run after a re-plan does no plan-time work.
     - ``backend``: the same with cuDNN's backend engines alone, on the
       private graph cache (provider control; the engines are checked).
     - ``functional``: no staged plan from the first plan on and through every
-      update(), so the capture and every eager run go through the functional
+      re-plan, so the capture and every eager run go through the functional
       entry -- the path below the library gate.
     """
     scales = scales or {}
@@ -1060,11 +1060,11 @@ def _capture_update_replay(
     check(p1)
     for p in batches[1:]:
         _load(buffers, p)
-        _update(attn, p)
+        _replan(attn, p, causal=causal, lse_mode=lse_mode)
         assert backend._cudnn_plan is captured_plan
         _replay(graph, buffers)
         check(p)
-        # the updated plan also serves an eager run of the same instance
+        # the new plan also serves an eager run of the same instance
         _clear(buffers)
         counts.clear()
         entry_calls.clear()
@@ -1090,17 +1090,17 @@ def _capture_update_replay(
         ("base2", "page_indices"),  # the dense table is derived and reserved
     ],
 )
-def test_cuda_graph_update_with_changed_lengths_and_page_ids(
+def test_cuda_graph_replan_with_changed_lengths_and_page_ids(
     monkeypatch, lse_mode, input_form, bucket, arm
 ):
-    """Plan, capture one run, replay; then update() twice with changed
+    """Plan, capture one run, replay; then re-plan twice with changed
     lengths, query partitions and page ids and replay the same capture (see
-    ``_capture_update_replay`` for the arms).  In the ``large`` bucket the
+    ``_capture_replan_replay`` for the arms).  In the ``large`` bucket the
     ``any_engine`` arm may run on the frontend's own prefill engine, which
     the ``backend`` arm excludes."""
     batches = _graph_batches(bucket, seed=121, input_form=input_form)
     assert not torch.equal(batches[0]["block_tables"], batches[1]["block_tables"])
-    _capture_update_replay(monkeypatch, batches, lse_mode=lse_mode, arm=arm)
+    _capture_replan_replay(monkeypatch, batches, lse_mode=lse_mode, arm=arm)
 
 
 @pytest.mark.parametrize("arm", ["any_engine", "functional"])
@@ -1118,12 +1118,12 @@ def test_cuda_graph_update_with_changed_lengths_and_page_ids(
 def test_cuda_graph_layouts_masks_and_run_time_scales(
     monkeypatch, kv_layout, causal, scales, arm
 ):
-    """The same capture / update() / replay lifetime with an NHD cache (the
+    """The same capture / re-plan / replay lifetime with an NHD cache (the
     capture binds permuted K/V views), without the causal mask, and with
     sm_scale / k_scale / v_scale given to the captured run: the capture keeps
-    its scales across update(), as it keeps its buffers."""
+    its scales across re-plans, as it keeps its buffers."""
     batches = _graph_batches("small", seed=131, kv_layout=kv_layout)
-    _capture_update_replay(
+    _capture_replan_replay(
         monkeypatch, batches, lse_mode="base2", arm=arm, causal=causal, scales=scales
     )
 
@@ -1132,7 +1132,7 @@ def test_cuda_graph_two_captures_with_different_scales(monkeypatch):
     """One instance, two captures: the second with other run-time scales, so
     with another prepared cuDNN graph, which replaces the first as the
     instance's last prepared one.  Both captures stay valid: after every
-    update() each replays the new batch with its own scales, in either
+    re-plan each replays the new batch with its own scales, in either
     order, and nothing more is prepared -- not by the replays, and not by
     eager runs with either scale (both graphs are in the history)."""
     p1, p2, p3 = _graph_batches("small", seed=141)
@@ -1153,7 +1153,7 @@ def test_cuda_graph_two_captures_with_different_scales(monkeypatch):
         if step:
             for _, buffers, _ in captures:
                 _load(buffers, p)
-            _update(attn, p)
+            _replan(attn, p)
         for graph, buffers, scales in captures[:: -1 if step % 2 else 1]:
             _replay(graph, buffers)
             _assert_rows_match(*buffers[3:], p, lse_mode="base2", **scales)
@@ -1173,7 +1173,7 @@ def test_cuda_graph_capture_is_the_instances_first_run():
     run is this instance's first, on the prepared path a miss of the (empty)
     history that fetches the graph from the process-wide cache under
     capture.  As with the functional entry, it builds nothing there, and the
-    capture survives update() like a warmed one."""
+    capture survives a re-plan like a warmed one."""
     p1, p2, _ = _graph_batches("small", seed=144)
     buffers = _capture_buffers(p1, "base2")
     q, k, v, out, lse = buffers
@@ -1191,13 +1191,13 @@ def test_cuda_graph_capture_is_the_instances_first_run():
     _replay(graph, buffers)
     _assert_rows_match(out, lse, p1, lse_mode="base2")
     _load(buffers, p2)
-    _update(attn, p2)
+    _replan(attn, p2)
     _replay(graph, buffers)
     _assert_rows_match(out, lse, p2, lse_mode="base2")
 
 
 def test_cuda_graph_staging_failure_keeps_the_captured_state(monkeypatch):
-    """An update() whose cuDNN staging raises must leave everything a captured
+    """A re-plan whose cuDNN staging raises must leave everything a captured
     run reads as it was: the reserved buffers (the controller's rollback) and
     the backend-owned LSE gather indices, which the backend refills in place
     only after staging.  Pinned on the padded-stats (gather) LSE path, the
@@ -1220,16 +1220,16 @@ def test_cuda_graph_staging_failure_keeps_the_captured_state(monkeypatch):
     with monkeypatch.context() as m:
         m.setattr(backend, "_stage_cudnn_plan", failing)
         with pytest.raises(RuntimeError, match="injected staging failure"):
-            attn.update(make_metadata(p2))
+            plan(attn, p2, "cudnn", causal=True, lse_mode="base2")
     assert backend._cudnn_plan is kept_plan
     assert torch.equal(backend._batch_ids, batch_ids)
     assert torch.equal(backend._pos, pos)
     _replay(graph, buffers)
     _assert_rows_match(out, lse, p1, lse_mode="base2")
 
-    # and the instance still takes a valid update
+    # and the instance still takes a valid re-plan
     _load(buffers, p2)
-    attn.update(make_metadata(p2))
+    plan(attn, p2, "cudnn", causal=True, lse_mode="base2")
     assert not torch.equal(backend._batch_ids, batch_ids)  # the partition changed
     _replay(graph, buffers)
     _assert_rows_match(out, lse, p2, lse_mode="base2")

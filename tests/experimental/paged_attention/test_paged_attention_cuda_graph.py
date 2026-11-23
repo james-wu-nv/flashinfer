@@ -27,9 +27,8 @@ Contract under test (``PagedAttention(use_cuda_graph=True)``):
    reserved storage at construction; in the flat ``kv_page_indices`` form the
    dense block table is reserved only for a backend that reads it (never at
    ``page_size < 8``, where it would be ``(batch, max_context)``).
-9. ``update(metadata)`` is the graph-mode re-plan with the frozen semantic
-   kwargs: same staging path as ``plan()``, rejected before a plan, in eager
-   mode, and during capture (as is a graph-mode ``plan()``).
+9. A graph-mode re-plan is ``plan()`` again with the same semantic kwargs;
+   it is rejected during capture.
 """
 
 import dataclasses
@@ -133,9 +132,9 @@ def _sibling_batch(p, seed, *, shrink=False):
     )
 
 
-def _plan(attn, p, backend):
+def _plan(attn, p, backend, metadata=None):
     attn.plan(
-        make_metadata(p),
+        make_metadata(p) if metadata is None else metadata,
         num_qo_heads=p["num_qo_heads"],
         num_kv_heads=p["num_kv_heads"],
         head_dim_qk=p["head_dim_qk"],
@@ -291,7 +290,7 @@ def test_capture_replan_replay_large_pages(backend):
     q.copy_(p2["q"])
     k.copy_(p2["k_cache"])
     v.copy_(p2["v_cache"])
-    attn.update(make_metadata(p2))
+    _plan(attn, p2, backend)
     g.replay()
     torch.cuda.synchronize()
     ref_out2, ref_lse2 = _reference(p2)
@@ -1012,10 +1011,10 @@ def test_explicit_capacity_headroom_replay(backend):
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
-def test_update_sibling_replay(backend):
-    """capture -> update(sibling) -> replay matches the oracle, for a
-    same-shape sibling and for a smaller one; update() takes no semantic
-    kwargs and reuses the frozen ones."""
+def test_replan_sibling_replay_without_sync(backend):
+    """capture -> re-plan(sibling) -> replay matches the oracle, for a
+    same-shape sibling and for a smaller one; the re-plan is the per-step
+    host path and does not synchronize."""
     p1 = make_problem(seed=62, **_SHAPE)
     _resolve_or_skip(p1, backend)
     dev = torch.device(p1["device"])
@@ -1046,7 +1045,7 @@ def test_update_sibling_replay(backend):
         torch.cuda.synchronize()
         torch.cuda.set_sync_debug_mode("error")
         try:
-            assert attn.update(make_metadata(p2)) is attn
+            _plan(attn, p2, backend)
         finally:
             torch.cuda.set_sync_debug_mode("default")
         g.replay()
@@ -1057,25 +1056,10 @@ def test_update_sibling_replay(backend):
     assert attn.backend == attn._impl._frozen["backend"]
 
 
-def test_update_before_plan_and_outside_graph_mode_raise():
-    p = make_problem(seed=65, **_SHAPE)
-    _resolve_or_skip(p, "fa2")
-    dev = torch.device(p["device"])
-    md = make_metadata(p)
-    with pytest.raises(RuntimeError, match="before a successful plan"):
-        PagedAttention(dev, use_cuda_graph=True).update(md)
-    with pytest.raises(RuntimeError, match="before a successful plan"):
-        PagedAttention(dev, graph_capacity=_graph_capacity_of(p)).update(md)
-    eager = PagedAttention(dev)
-    _plan(eager, p, "fa2")
-    with pytest.raises(RuntimeError, match="CUDA-graph re-plan"):
-        eager.update(md)
-
-
-def test_plan_and_update_during_capture_raise():
-    """Neither plan() nor update() may run while the current stream is
-    capturing: their metadata copies and backend planning would be recorded
-    into the graph instead of executed."""
+def test_plan_during_capture_raises():
+    """plan() may not run while the current stream is capturing: its
+    metadata copies and backend planning would be recorded into the graph
+    instead of executed."""
     p = make_problem(seed=66, **_SHAPE)
     _resolve_or_skip(p, "fa2")
     dev = torch.device(p["device"])
@@ -1088,12 +1072,9 @@ def test_plan_and_update_during_capture_raise():
     _plan(attn, p, "fa2")
     attn.run(q, (k, v), out=out, lse=lse)
     torch.cuda.synchronize()
-    md = make_metadata(_sibling_batch(p, seed=67))
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         attn.run(q, (k, v), out=out, lse=lse)
-        with pytest.raises(RuntimeError, match="during CUDA graph capture"):
-            attn.update(md)
         with pytest.raises(RuntimeError, match="during CUDA graph capture"):
             _plan(attn, p, "fa2")
     # the capture itself is intact and computes the planned batch
@@ -1232,7 +1213,7 @@ def test_replan_toggles_padding_rows(backend, input_form):
 
 # ---------------------------------------------------------------------------
 # Review follow-ups: schedule-upload ordering, capture-row binding, stream
-# binding, the frozen resolution on update(), padding rows in a flat first batch
+# binding, the frozen resolution on a re-plan, padding rows in a flat first batch
 # ---------------------------------------------------------------------------
 
 
@@ -1263,10 +1244,10 @@ def _capture(attn, p, backend, *, rows=None):
     return g, q, k, v, out, lse
 
 
-def test_update_waits_for_the_previous_schedule_upload():
+def test_replan_waits_for_the_previous_schedule_upload():
     """The fa wrapper uploads every plan's kernel schedule from ONE pinned
     host buffer with an asynchronous copy.  With the device lagging, the
-    sequence update(A); replay; update(B); replay must not let B's plan
+    sequence plan(A); replay; plan(B); replay must not let B's plan
     rewrite the host buffer before A's upload executed — or replay A runs
     with B's schedule (request/tile indices, merge offsets) and is wrong."""
     p1 = make_problem(seed=90, **_SHAPE)
@@ -1282,13 +1263,13 @@ def test_update_waits_for_the_previous_schedule_upload():
         v.copy_(p1["v_cache"])
         torch.cuda.synchronize()
         torch.cuda._sleep(200_000_000)  # the device falls behind the host
-        attn.update(make_metadata(p1))
+        _plan(attn, p1, "fa2")
         g.replay()
         out_a, lse_a = out.clone(), lse.clone()  # stream-ordered snapshot of A
         q.copy_(p2["q"])
         k.copy_(p2["k_cache"])
         v.copy_(p2["v_cache"])
-        attn.update(make_metadata(p2))  # must wait for A's upload
+        _plan(attn, p2, "fa2")  # must wait for A's upload
         g.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(out_a[:total].float(), ref1[0], **OUT_TOL)
@@ -1301,7 +1282,7 @@ def test_update_waits_for_the_previous_schedule_upload():
 def test_capture_on_smaller_buffers_binds_the_row_count(backend):
     """Capture buffers smaller than the capacity are legal, but the graph
     captured on them must never replay a batch with more rows: the first
-    run() binds the row count and a later update() past it is rejected
+    run() binds the row count and a later re-plan past it is rejected
     before anything is staged."""
     p1 = make_problem(seed=92, **_SHAPE)
     _resolve_or_skip(p1, backend)
@@ -1315,7 +1296,7 @@ def test_capture_on_smaller_buffers_binds_the_row_count(backend):
     q.copy_(p2["q"])
     k.copy_(p2["k_cache"])
     v.copy_(p2["v_cache"])
-    attn.update(make_metadata(p2))
+    _plan(attn, p2, backend)
     g.replay()
     torch.cuda.synchronize()
     ref = _reference(p2)
@@ -1341,14 +1322,14 @@ def test_capture_on_smaller_buffers_binds_the_row_count(backend):
     assert bigger.total_q_tokens == total + 1 <= cap.total_q_tokens
     assert bigger.max_q_len <= cap.max_q_len
     with pytest.raises(ValueError, match="rows"):
-        attn.update(bigger)
-    g.replay()  # the rejected update left p2's plan in place
+        _plan(attn, p1, backend, bigger)
+    g.replay()  # the rejected re-plan left p2's plan in place
     torch.cuda.synchronize()
     torch.testing.assert_close(out.float(), ref[0], **OUT_TOL)
 
 
 def test_replan_on_another_stream_is_rejected():
-    """Re-plans and updates stay on the stream of the first graph-mode plan,
+    """Re-plans stay on the stream of the first graph-mode plan,
     the stream the graph is replayed on, so the staging copies precede the
     replay."""
     p = make_problem(seed=94, **_SHAPE)
@@ -1357,28 +1338,29 @@ def test_replan_on_another_stream_is_rejected():
     _plan(attn, p, "fa2")
     other = torch.cuda.Stream()
     with torch.cuda.stream(other), pytest.raises(ValueError, match="stream"):
-        attn.update(make_metadata(p))
-    attn.update(make_metadata(p))  # back on the planning stream
+        _plan(attn, p, "fa2")
+    _plan(attn, p, "fa2")  # back on the planning stream
 
 
-def test_update_reuses_the_pinned_resolution(monkeypatch):
-    """update() re-plans inside the pinned resolution narrowed to the frozen
-    backend: no level-1 resolution per step, and explain() keeps the
+def test_replan_reuses_the_pinned_resolution(monkeypatch):
+    """A re-plan with the pinned Resolution stays inside it, narrowed to the
+    frozen backend: no level-1 resolution per step, and explain() keeps the
     resolve-time exclusions and marks the other candidates frozen out."""
     from flashinfer.experimental.paged_attention import _controller
 
     p = make_problem(seed=95, **_SHAPE)
     attn = PagedAttention(torch.device(p["device"]), use_cuda_graph=True)
-    _plan(attn, p, "auto")
+    pinned = _resolve_or_skip(p, "auto")
+    _plan(attn, p, pinned)
     before = attn.explain()
     frozen = attn._impl._frozen["backend"]
     candidates = attn._impl._resolution.backends
 
     def boom(*args, **kwargs):
-        raise AssertionError("level-1 resolution re-run by update()")
+        raise AssertionError("level-1 resolution re-run by a pinned re-plan")
 
     monkeypatch.setattr(_controller, "resolve_paged_attention", boom)
-    attn.update(make_metadata(_sibling_batch(p, seed=96, shrink=True)))
+    _plan(attn, _sibling_batch(p, seed=96, shrink=True), pinned)
     after = attn.explain()
     assert f"chosen: {frozen}" in after
     for line in before.splitlines():
@@ -1678,7 +1660,7 @@ def _one_request_pool(seed, *, kv_len, pages, page_size, hq, hk, d, dtype, kv_dt
 @pytest.mark.parametrize("lse_mode", ["base2", "basee"])
 @pytest.mark.parametrize("kv", ["bf16", "fp8"])
 def test_graph_growth_covers_lse_fold_and_v_scale(kv, lse_mode):
-    """Capture with 2 live rows out of a capacity of 8, update() to 8 rows,
+    """Capture with 2 live rows out of a capacity of 8, re-plan to 8 rows,
     replay, then back to 2 and 5: every live row must carry the LSE base fold
     and the fp8 V descale.  Before the fix both were captured for the first
     batch's row prefix only, so rows 2..7 came back in base 2 and unscaled
@@ -1709,8 +1691,7 @@ def test_graph_growth_covers_lse_fold_and_v_scale(kv, lse_mode):
         table_width=4,
     )
     attn = PagedAttention(dev, graph_capacity=cap)
-    attn.plan(
-        _single_request_metadata(p, 2, dev),
+    plan_kw = dict(
         num_qo_heads=p["num_qo_heads"],
         num_kv_heads=p["num_kv_heads"],
         head_dim_qk=p["head_dim_qk"],
@@ -1720,6 +1701,7 @@ def test_graph_growth_covers_lse_fold_and_v_scale(kv, lse_mode):
         lse_mode=lse_mode,
         backend="fa2",
     )
+    attn.plan(_single_request_metadata(p, 2, dev), **plan_kw)
     out = torch.full(
         (8, p["num_qo_heads"], p["head_dim_vo"]), 7.0, dtype=q8.dtype, device=dev
     )
@@ -1737,7 +1719,7 @@ def test_graph_growth_covers_lse_fold_and_v_scale(kv, lse_mode):
         attn.run(q8, (k, v), **run_kw)
     for n in (2, 8, 2, 5):
         md = _single_request_metadata(p, n, dev)
-        attn.update(md)
+        attn.plan(md, **plan_kw)
         g.replay()
         torch.cuda.synchronize()
         ref_out, ref_lse = reference_paged_prefill(

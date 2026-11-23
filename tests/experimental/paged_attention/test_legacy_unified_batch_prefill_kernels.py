@@ -401,7 +401,7 @@ def test_batch_prefill_with_paged_kv_cache(
         # workspace sized for it (the legacy 256 MiB buffer overflowed, which
         # is why the legacy xfails these rows), a warm-up plan (kv_len capped
         # at qo_len, since causal needs kv >= q), warm-up on a side stream,
-        # capture, update() to the real batch, replay.
+        # capture, re-plan to the real batch, replay.
         capacity = GraphCapacity(
             batch_size=batch_size,
             total_q_tokens=batch_size * qo_len,
@@ -454,7 +454,12 @@ def test_batch_prefill_with_paged_kv_cache(
         with torch.cuda.graph(g):
             o, _ = attn.run(q, kv_cache)
 
-        attn.update(metadata)
+        attn.plan(
+            metadata,
+            **plan_kw,
+            lse_mode="base2" if return_lse else "none",
+            backend=backend,
+        )
 
         g.replay()
 
@@ -937,7 +942,12 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             o, _ = attn.run(q, kv_data)
-        attn.update(metadata)
+        attn.plan(
+            metadata,
+            **plan_kw,
+            lse_mode="base2" if return_lse else "none",
+            backend=backend,
+        )
         g.replay()
 
     k_cache, v_cache = kv_data_fp32

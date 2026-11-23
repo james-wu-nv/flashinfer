@@ -145,8 +145,8 @@ the capacity from the first plan); the first graph-mode ``plan()`` freezes the
 backend and every semantic argument, and a later plan that changes one is
 rejected (a re-plan chooses from the frozen backend alone, so ``explain()``
 then lists only that backend in the order and the trace);
-``update(metadata)`` then re-plans each step's batch into the
-reserved storage so the captured ``run()`` replays it. A batch must fit the
+calling ``plan()`` again with the same arguments then stages each step's
+batch into the reserved storage so the captured ``run()`` replays it. A batch must fit the
 capacity: batch size, paging form and page size exactly, total query tokens
 and host maxes at most the capacity's, which is what the kernels are planned
 with. Run once eagerly after the plan and before capturing, with ``q`` in
@@ -239,7 +239,7 @@ upper bounds, not the batch's longest lengths. An eager instance ranks on
 every ``plan()``, so ``PagedAttention.backend`` can change from one batch to
 the next. A CUDA-graph instance ranks on the bounds of its capacity and the
 per-request lengths of the batch being planned, until its first successful
-plan freezes the backend: later plans and ``update()`` keep it. Plan the
+plan freezes the backend: later plans keep it. Plan the
 first batch of a bucket with representative lengths, or pin the backend. A
 backend name, or a ``Resolution`` resolved with one, pins the backend:
 nothing is ranked, and a batch that backend cannot plan raises a
@@ -400,9 +400,9 @@ Computing the digest reads a device page table back, so an autotune plan
 synchronizes.
 
 The selecting ``run()`` cannot be under CUDA graph capture. In CUDA-graph
-mode it is the eager warm-up before capture: ``update()`` is refused until it
+mode it is the eager warm-up before capture: a re-plan is refused until it
 has run, and the selected backend is the one the instance freezes, so later
-``update()`` calls re-plan that backend alone. An eager instance prepares
+plans re-plan that backend alone. An eager instance prepares
 every candidate on each ``plan()``, which costs more host time than an
 ``"auto"`` plan. A named backend never enters the tuner.
 
@@ -560,7 +560,7 @@ plan with attention sinks, and a plan whose launch cannot be staged.
     resolve_paged_attention
 
 .. autoclass:: PagedAttention
-    :members: plan, update, run, explain, backend, workspace_requirements
+    :members: plan, run, explain, backend, workspace_requirements
 
     .. automethod:: __init__
 

@@ -11,7 +11,7 @@ Three layers, mirroring ``tests/attention/test_mla_auto_backend.py``:
    plan's facts, walks the order it returns, moves on only after a typed
    rejection, and freezes the choice in graph mode.
 3. Execution (GPU): auto against the fp32 oracle, eager and under capture /
-   update / replay.  No test here asserts which backend the rule picks: the
+   re-plan / replay.  No test here asserts which backend the rule picks: the
    lifetime tests put a named candidate first (``_force_first``) and check
    that it ran, and the two tests that keep the real rule check numbers only.
 
@@ -1673,8 +1673,8 @@ def _forbid_ranking(monkeypatch):
 
 
 def test_graph_mode_keeps_the_first_backend(planners, monkeypatch):
-    """A graph-mode instance ranks once: a re-plan, through plan() or
-    update(), does not ask the policy and reports the frozen backend alone."""
+    """A graph-mode instance ranks once: a re-plan does not ask the policy
+    and reports the frozen backend alone."""
     attn = planners.controller(use_cuda_graph=True)
     attn.plan(_host_metadata(*_TRTLLM_BATCH), **_HOST_KW)
     assert attn.backend == "trtllm-gen"
@@ -1688,10 +1688,6 @@ def test_graph_mode_keeps_the_first_backend(planners, monkeypatch):
         assert attn.backend == "trtllm-gen"
         assert attn.selection_order == ("trtllm-gen",)
         assert planners.preflights == ["trtllm-gen"]
-        attn.update(small)
-        assert attn.backend == "trtllm-gen"
-        assert attn.selection_order == ("trtllm-gen",)
-        assert planners.preflights == ["trtllm-gen"] * 2
     eager = planners.controller()  # control: the same batch does rank eagerly
     eager.plan(small, **_HOST_KW)
     assert eager.backend == "fa2"
@@ -1705,16 +1701,13 @@ def test_graph_mode_typed_fallback_freezes_the_selection(planners):
     # the first choice would accept now; the capture keeps fa2
     planners.decline()
     planners.preflights.clear()
-    attn.update(_host_metadata(*_TRTLLM_BATCH))
+    attn.plan(_host_metadata(*_TRTLLM_BATCH), **_HOST_KW)
     assert attn.backend == "fa2" and planners.preflights == ["fa2"]
-    # the frozen backend declining later is an error, not a switch: the same
-    # one through update() and through plan(), naming the frozen backend only
+    # the frozen backend declining later is an error, not a switch, and it
+    # names the frozen backend only
     planners.decline("fa2")
-    with pytest.raises(ValueError, match="no pinned candidate") as by_update:
-        attn.update(_host_metadata(*_TRTLLM_BATCH))
     with pytest.raises(ValueError, match="no pinned candidate") as by_plan:
         attn.plan(_host_metadata(*_TRTLLM_BATCH), **_HOST_KW)
-    assert str(by_plan.value) == str(by_update.value)
     assert "candidates ['fa2']" in str(by_plan.value)
     assert attn.backend == "fa2"
 
@@ -1757,8 +1750,8 @@ def test_graph_mode_cudnn_admission_reads_the_first_batch(planners):
         attn.plan(_host_metadata(*batch, width=256), **_HOST_KW)
         frozen.append(attn.backend)
         # the other first batch arrives later: the capture keeps its backend
-        attn.update(_host_metadata([256], [2048], width=256))
-        attn.update(_host_metadata([255], [2048], width=256))
+        attn.plan(_host_metadata([256], [2048], width=256), **_HOST_KW)
+        attn.plan(_host_metadata([255], [2048], width=256), **_HOST_KW)
         assert attn.backend == frozen[-1]
     assert frozen[0] == "cudnn" and frozen[1] != "cudnn"
 
@@ -1785,7 +1778,7 @@ def test_graph_mode_cudnn_extension_reads_the_first_batch(planners):
         attn.plan(_host_metadata(q_lens, [4096] * 6, width=4096), **_HOST_KW)
         frozen.append(attn.backend)
         for later in batches:
-            attn.update(_host_metadata(later, [4096] * 6, width=4096))
+            attn.plan(_host_metadata(later, [4096] * 6, width=4096), **_HOST_KW)
         assert attn.backend == frozen[-1]
     assert frozen[0] == "cudnn" and frozen[1] != "cudnn"
 
@@ -1921,7 +1914,7 @@ _HQ, _HK, _HD, _PAGE = 16, 4, 128, 16
 # shape -> (first batch, second batch, table width in pages).  The second
 # batch changes the lengths, the query partition and (by seed) every page id
 # while staying inside the first batch's capacity, so it serves as a graph
-# update as well as an eager re-plan.  When written, the SM100 rule gave
+# re-plan as well as an eager one.  When written, the SM100 rule gave
 # "long-kv" to cuDNN, "long-q" to trtllm-gen and "short-q" to fa2; no test
 # below depends on that.
 _SHAPES = {
@@ -2135,27 +2128,27 @@ def test_auto_eager_switches_providers(monkeypatch, lead):
 
 @needs_cuda
 @pytest.mark.parametrize("first", _AUTO_BACKEND_CANDIDATES)
-def test_auto_capture_update_replay(monkeypatch, first):
+def test_auto_capture_replan_replay(monkeypatch, first):
     p1, p2 = _problems(_SHAPE_OF[first])
     _force_first(monkeypatch, first)
     attn = PagedAttentionFacade(use_cuda_graph=True)
     q, k_cache, v_cache, out, lse = _graph_buffers(p1)
     _plan_auto(attn, p1)
     assert attn.backend == first  # the injected order, not the rule's
-    _forbid_ranking(monkeypatch)  # run(), capture, update() and replay never rank
+    _forbid_ranking(monkeypatch)  # run(), capture, re-plan and replay never rank
     graph = _capture(attn, q, k_cache, v_cache, out, lse)
     _replay(graph, out, lse)
     _assert_matches_oracle(p1, out, lse)
 
     _load(p2, q, k_cache, v_cache)
-    attn.update(make_metadata(p2))
+    _plan_auto(attn, p2)
     assert attn.backend == first
     _replay(graph, out, lse)
     _assert_matches_oracle(p2, out, lse)
 
     # back to the larger batch: the rows past p2's total must be written again
     _load(p1, q, k_cache, v_cache)
-    attn.update(make_metadata(p1))
+    _plan_auto(attn, p1)
     _replay(graph, out, lse)
     _assert_matches_oracle(p1, out, lse)
 
@@ -2173,7 +2166,7 @@ def test_auto_capture_update_replay(monkeypatch, first):
 )
 def test_graph_typed_fallback_freezes_and_replays(monkeypatch, first, fallback):
     """The first choice declines the capture batch; the capture then keeps
-    the fallback through an update that the first choice would accept."""
+    the fallback through a re-plan that the first choice would accept."""
     p1, p2 = _problems(_SHAPE_OF[first])
     _force_first(monkeypatch, first, fallback)
     attn = PagedAttentionFacade(use_cuda_graph=True)
@@ -2192,7 +2185,7 @@ def test_graph_typed_fallback_freezes_and_replays(monkeypatch, first, fallback):
     _assert_matches_oracle(p1, out, lse)
 
     _load(p2, q, k_cache, v_cache)
-    attn.update(make_metadata(p2))
+    _plan_auto(attn, p2)
     assert attn.backend == fallback
     _replay(graph, out, lse)
     _assert_matches_oracle(p2, out, lse)
@@ -2259,7 +2252,7 @@ def test_auto_plan_does_not_read_the_device_back(monkeypatch, first, shape):
     for md in (md2, md1):
         # One busy window per plan.  The drain first: fa2 / fa3 wait for their
         # own previous schedule upload by design (fa_backend.plan; pinned by
-        # test_update_waits_for_the_previous_schedule_upload).
+        # test_replan_waits_for_the_previous_schedule_upload).
         torch.cuda.synchronize()
         torch.cuda._sleep(1 << 28)  # a plan() that waits returns only after this
         busy = torch.cuda.Event()

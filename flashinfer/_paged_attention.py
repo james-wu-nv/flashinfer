@@ -83,8 +83,8 @@ CUDA-graph lifecycle — three stages (``experimental/paged_attention/_graph.py`
     dtypes, heads, head dims, layout, paging form, page size): the captured
     kernels bake them in.  A later ``plan()`` that changes one is rejected
     before anything is written — construct a new instance and recapture.
-3.  ``update(metadata)`` per step.  Only the batch changes.  It is staged
-    into the reserved storage (rolled back on failure) and must fit the
+3.  ``plan()`` again per step, with the same arguments.  Only the batch
+    changes.  It is staged into the reserved storage (rolled back on failure) and must fit the
     capacity: batch size, paging form and page size exact; total query
     tokens, host maxes and flat page-id length at most the capacity's.
     Capacity substitution: backends are planned with, and the captured
@@ -95,9 +95,9 @@ CUDA-graph lifecycle — three stages (``experimental/paged_attention/_graph.py`
     captured on those buffers cannot reach past them).  Rows past the batch
     are not read; ``out`` / ``lse`` rows past it are unspecified and may be
     written (a backend's whole-buffer post-processing, cuDNN's base
-    conversion, trtllm-gen's ``-inf`` fill).  ``plan()`` and ``update()`` are
+    conversion, trtllm-gen's ``-inf`` fill).  ``plan()`` is
     rejected while the current stream is capturing, and after the first
-    graph-mode plan they must run on that plan's stream — the stream the
+    graph-mode plan it must run on that plan's stream — the stream the
     graph is replayed on, so the staging copies precede the replay.
     ``sm_scale`` /
     ``k_scale`` / ``v_scale`` are launch scalars: a captured graph keeps the
@@ -302,7 +302,9 @@ class PagedAttention:
         with torch.cuda.graph(g):
             attn.run(q_buf, (k_cache, v_cache), out=out_buf, lse=lse_buf)
         for step in engine:
-            attn.update(md_step)   # only the batch changes; must fit ``cap``
+            attn.plan(md_step, num_qo_heads=8, num_kv_heads=2, head_dim_qk=128,
+                      q_dtype=torch.bfloat16, causal=True, lse_mode="base2",
+                      backend=res)   # only the batch changes; must fit ``cap``
             g.replay()
     """
 
@@ -561,7 +563,7 @@ class PagedAttention:
           profiles them on its own q / KV with private output buffers and
           caches the winner; outside the context it raises ``RuntimeError``:
           warm up first.  The selecting ``run()`` cannot be under CUDA graph
-          capture; in CUDA-graph mode ``update()`` is refused until it has
+          capture; in CUDA-graph mode a re-plan is refused until it has
           run, and the selected backend is what the instance freezes.
 
         Publication is transactional: a failing ``plan()`` leaves the previous
@@ -569,7 +571,8 @@ class PagedAttention:
         the one generated-FA caveat).  In CUDA-graph mode the new batch is
         staged into reserved storage and rolled back on failure; it must fit
         the :class:`GraphCapacity` and keep the semantic arguments the first
-        graph-mode plan froze (use :meth:`update` to pass only the metadata).
+        graph-mode plan froze; such a re-plan is how each step's batch reaches
+        a captured graph.
         """
         self._impl.plan(
             metadata,
@@ -588,30 +591,6 @@ class PagedAttention:
             use_sinks=use_sinks,
             backend=backend,
         )
-        return self
-
-    @flashinfer_experimental_api(feature=_FEATURE)
-    def update(self, metadata: "PagedAttentionMetadata") -> "PagedAttention":
-        """Re-plan a captured graph's next batch (CUDA-graph mode only).
-
-        Takes only the per-step metadata: the backend and every semantic
-        ``plan()`` argument were frozen by the first successful graph-mode
-        ``plan()`` and are reused here.  The new batch must fit the
-        :class:`GraphCapacity` (same batch size, paging form and page size;
-        at most the capacity's total query tokens, host maxes and flat page-id
-        length); it is staged into the reserved storage and rolled back on
-        failure, so a failed ``update()`` leaves the previous batch
-        replayable.  Call it outside capture, on the stream the graph is
-        replayed on; then ``graph.replay()``.
-
-        Raises ``RuntimeError`` when the instance is not in graph mode, when
-        no ``plan()`` has succeeded yet, or when the current stream is
-        capturing.  It re-issues ``plan()`` with the frozen arguments and, as
-        ``backend=``, the plan's ``Resolution`` narrowed to the frozen
-        backend, so nothing is resolved or ranked per step; ``update()`` is
-        the engine-facing spelling (sglang's ``fast_prefill_plan`` role).
-        """
-        self._impl.update(metadata)
         return self
 
     @flashinfer_experimental_api(feature=_FEATURE, trace=paged_attention_trace_dispatch)
@@ -712,8 +691,7 @@ class PagedAttention:
     def explain(self) -> str:
         """Chosen backend, the candidates the last plan could choose from in
         the order it walked them (the auto policy's order for that batch;
-        the frozen backend alone on a CUDA-graph re-plan, through ``plan()``
-        or ``update()``), the plan-time trace (every candidate tried and why
+        the frozen backend alone on a CUDA-graph re-plan), the plan-time trace (every candidate tried and why
         it was accepted or declined; on such a re-plan the frozen backend's
         entry alone) and the resolve-time exclusion reasons, which on such
         a re-plan include the candidates the freeze left out.

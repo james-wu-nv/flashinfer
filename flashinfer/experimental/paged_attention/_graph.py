@@ -62,7 +62,7 @@ class GraphCapacity:
     ``table_width=``.  ``PagedAttention(use_cuda_graph=True)`` infers the
     capacity from the first plan instead (:meth:`from_metadata`).
 
-    Rules every later batch (``plan()`` / ``update()``) is checked against:
+    Rules every later batch (a re-``plan()``) is checked against:
 
     - ``batch_size``, ``kv_input_form`` and ``page_size`` hold exactly (each
       backend's grid and paging dialect follow from them).
