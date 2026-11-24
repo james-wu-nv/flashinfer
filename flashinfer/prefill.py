@@ -3095,12 +3095,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with a paged KV cache for a batch of
     requests.
 
-    .. note::
-
-        Superseded by the experimental :class:`~flashinfer.prefill.PagedAttention`;
-        scheduled for deprecation once that API graduates (tracking issue #5007). This class stays supported and keeps
-        receiving bug fixes; new integrations should start from the unified API.
-
     Check :ref:`our tutorial <kv-layout>` for page table layout.
 
     Example
