@@ -1009,7 +1009,7 @@ def test_attention_ts_context_run_rejects_causal_q_longer_than_kv(paged: bool):
         num_qo_heads=4,
         num_kv_heads=4,
         head_dim=128,
-        qkv_dtype=torch.bfloat16,
+        qk_dtype=torch.bfloat16,
         mask_type="causal",
         seed=2026071930,
     )
