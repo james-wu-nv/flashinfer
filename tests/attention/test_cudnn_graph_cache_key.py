@@ -39,6 +39,17 @@ def _skip_if_unsupported(device):
         pytest.skip("cuDNN SDPA requires SM80+")
 
 
+def _build_failure():
+    """Exception types of a graph build that cuDNN rejects at finalize: the
+    backend's ``RuntimeError``, or the frontend's
+    ``cudnnGraphNotSupportedError`` (not a ``RuntimeError``) when it reports
+    that no engine proposed a plan.  Which one surfaces depends on the
+    cudnn-frontend version; the backend's message is in both."""
+    import cudnn
+
+    return (RuntimeError, getattr(cudnn, "cudnnGraphNotSupportedError", RuntimeError))
+
+
 def _reference(q, k, v, q_lens, kv_lens, scale, causal):
     outs = []
     qo_off = 0
@@ -355,11 +366,12 @@ def _paged_call(p, workspace, *, block_tables=None, max_sequence_kv=None):
 
 def test_cudnn_prefill_table_width_in_graph_cache_key():
     """Tables of width 64 and 67 (each exact for its own max_kv) build two
-    distinct cache entries and are both correct; a width-67 table handed to
-    the width-64 max_kv must not replay the width-64 graph (the old key, which
-    ignored the table's shape, returned "ok" with a mismatched descriptor) —
-    cuDNN's finalize rejects it instead.  Found by the PagedAttention
-    benchmark smoke run."""
+    distinct cache entries and are both correct (the old key ignored the
+    table's shape and replayed one graph with a mismatched descriptor).  A
+    table wider than the declared KV range, storage that reserves columns for
+    later replans, is described by its leading ``ceil(max_kv / page_size)``
+    columns and stays correct.  Found by the PagedAttention benchmark smoke
+    run."""
     device = "cuda:0"
     _skip_if_unsupported(device)
     torch.manual_seed(0)
@@ -388,19 +400,23 @@ def test_cudnn_prefill_table_width_in_graph_cache_key():
         out, _ = _paged_call(p, workspace)
         torch.testing.assert_close(out.float(), p["reference"](), atol=2e-2, rtol=2e-2)
     assert len(keys) == 2, "width-64 and width-67 tables must not share a cache entry"
-    # width 67 with the width-64 problem's max_kv: reject, never replay
-    with pytest.raises(RuntimeError, match="page table"):
-        _paged_call(p64, workspace, block_tables=p67["block_tables"])
-        torch.cuda.synchronize()
+    # the width-64 problem in a width-67 table: three reserved columns after
+    # the request's own pages
+    wide = torch.zeros(p64["batch_size"], 67, dtype=torch.int32, device=device)
+    wide[:, :64] = p64["block_tables"]
+    out, _ = _paged_call(p64, workspace, block_tables=wide)
+    torch.testing.assert_close(out.float(), p64["reference"](), atol=2e-2, rtol=2e-2)
 
 
 def test_cudnn_prefill_failed_build_leaves_no_cache_entry():
-    """A build that fails at finalize (over-wide page table -> BAD_PARAM) must
-    not leave a half-built graph in the cache: retrying the same call must
-    raise the same cuDNN error (not "attn_scale with tensor and value cannot
-    be set at the same time" from re-building the stale object), and a valid
-    same-process call must stay correct.  Found by the PagedAttention
-    benchmark smoke run."""
+    """A build that fails at finalize (here: page size 3, "block size needs
+    to be ... a power of 2") must not leave a half-built graph in the cache:
+    retrying the same call must raise the same cuDNN error (not "attn_scale
+    with tensor and value cannot be set at the same time" from re-building the
+    stale object), and a valid same-process call must stay correct.  Found by
+    the PagedAttention benchmark smoke run with an over-wide page table, which
+    cuDNN rejected at the time; such a table is accepted now (see the
+    table-width test above)."""
     device = "cuda:0"
     _skip_if_unsupported(device)
     torch.manual_seed(1)
@@ -409,11 +425,10 @@ def test_cudnn_prefill_failed_build_leaves_no_cache_entry():
     ref = p["reference"]()
     out, _ = _paged_call(p, workspace)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
-    wide = torch.zeros(p["batch_size"], 8 + 3, dtype=torch.int32, device=device)
-    wide[:, :8] = p["block_tables"]
+    bad = _paged_problem(device, batch_size=2, width=16, page_size=3)
     for _ in range(2):  # the second attempt must fail the same way
-        with pytest.raises(RuntimeError, match="page table"):
-            _paged_call(p, workspace, block_tables=wide)
+        with pytest.raises(_build_failure(), match="power of 2"):
+            _paged_call(bad, workspace)
             torch.cuda.synchronize()
     out, _ = _paged_call(p, workspace)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
@@ -589,7 +604,7 @@ def test_cudnn_decode_failed_build_leaves_no_cache_entry():
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
     bad = _decode_problem(device, batch_size=2, width=4, page_size=3)
     for _ in range(2):  # the second attempt must fail the same way
-        with pytest.raises(RuntimeError, match="power of 2"):
+        with pytest.raises(_build_failure(), match="power of 2"):
             _decode_call(bad, workspace)
             torch.cuda.synchronize()
     out = _decode_call(p, workspace)
