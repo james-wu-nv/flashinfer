@@ -9,7 +9,10 @@ and the correspondence to the Batch MLA package it mirrors
 (`docs/design_docs/batch_mla_backend_architecture.md`). Everything stated
 here is taken from the code; where a report and the code disagree, the code
 wins, and the "Known limitations" section carries the ledger ids of the open
-items.
+items. The user-facing reference (status, opt-in, limitations, the backend
+selection rule and its measurements) is
+`flashinfer/experimental/paged_attention/README.md`; the API is not listed in
+`docs/api/` before graduation.
 
 ## Summary
 
@@ -250,7 +253,7 @@ g = torch.cuda.CUDAGraph()
 with torch.cuda.graph(g):
     attn.run(q_buf, (k_cache, v_cache), out=out_buf, lse=lse_buf)
 for step in scheduler:
-    attn.plan(md_step, num_qo_heads=8, num_kv_heads=2, head_dim_qk=128,
+    attn.plan(md_step, num_qo_heads=32, num_kv_heads=8, head_dim_qk=128,
               q_dtype=torch.bfloat16, kv_layout="HND", causal=True,
               lse_mode="base2", backend=res)      # only the batch changes
     g.replay()

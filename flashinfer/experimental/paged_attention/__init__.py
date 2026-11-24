@@ -18,6 +18,9 @@ Layout (mirrors ``flashinfer/mla/_batch_mla/``):
     _graph.py        GraphCapacity, reserved storage and staging for CUDA graphs
     _backends/       one module per backend + declarative capabilities
 
+``README.md`` in this directory is the user-facing reference (status, opt-in,
+contract, limitations, backend selection and benchmark).
+
 Reject-or-correct is the property the whole package is built around: any
 call either raises a clean, actionable error or returns results matching an
 independent reference.
