@@ -121,12 +121,11 @@ Paging metadata comes in exactly one of two forms (never both):
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Optional, Sequence, Tuple, Union
 
 import torch
 
 from .api_logging import flashinfer_experimental_api
-from .trace.templates.paged_attention import paged_attention_trace_dispatch
 
 if TYPE_CHECKING:  # pragma: no cover — types only; the package is imported lazily
     from .experimental.paged_attention import (
@@ -593,7 +592,7 @@ class PagedAttention:
         )
         return self
 
-    @flashinfer_experimental_api(feature=_FEATURE, trace=paged_attention_trace_dispatch)
+    @flashinfer_experimental_api(feature=_FEATURE)
     def run(
         self,
         q: torch.Tensor,
@@ -668,14 +667,6 @@ class PagedAttention:
         unwritten (fa2/fa3 and cuDNN write a zero row and an LSE of -inf,
         trtllm-gen leaves them untouched; cake declines such batches at plan
         time); never read them.
-
-        Tracing: ``flashinfer.fi_trace(attn.run, q=q, kv_cache=(k, v))`` on a
-        planned instance (or ``FLASHINFER_TRACE_DUMP=1`` during ``run()``)
-        exports a flashinfer-bench definition whose identity is the plan's
-        paging form, KV layout, causal / window / LSE settings and geometry,
-        with the plan-owned metadata read from the last successful ``plan()``.
-        ``logits_soft_cap`` (an integer cap; a non-integer cap refuses to
-        trace), a custom mask and sinks are part of the identity as well.
         """
         return self._impl.run(
             q,
@@ -697,11 +688,3 @@ class PagedAttention:
         a re-plan include the candidates the freeze left out.
         Raises ``ValueError`` before the first successful ``plan()``."""
         return self._impl.explain()
-
-    def _trace_context(self) -> Dict[str, Any]:
-        """Read-only facts of the last successful ``plan()`` for ``fi_trace``.
-
-        Private: consumed by the trace template bound to :meth:`run`.  Raises
-        ``ValueError`` before the first successful plan; never syncs.
-        """
-        return self._impl.trace_context()

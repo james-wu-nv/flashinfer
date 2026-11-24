@@ -502,56 +502,22 @@ autotuning). ``--backends autotune`` warms each instance up inside
 ``plan`` rows include preparing every candidate. The benchmark generates fp16/bf16 Q and KV; see
 ``benchmarks/README.md`` for the columns.
 
-Tracing the unified API
------------------------
+API logging and trace
+---------------------
 
-``run()`` carries a `flashinfer-bench <https://github.com/flashinfer-ai/flashinfer-bench>`_
-trace template. After ``plan()``, ``flashinfer.fi_trace(attn.run, q=q,
-kv_cache=(k, v))`` returns (and with ``save_dir=`` writes) the definition of
-the planned contract, and ``FLASHINFER_TRACE_DUMP=1`` exports it automatically
-on the first ``run()`` of each definition. The trace is read-only and
-sync-free: it takes the plan-owned ``qo_indptr``, ``kv_seq_lens`` and the
-page table (the dense block table, or the live prefix of the flat page ids)
-from the last successful ``plan()``, so it describes what ``run()`` executes
-even after a rejected re-plan, and in CUDA-graph mode it points at the
-reserved storage a captured ``run()`` reads. The identity of a definition is
-the plan's paging form (``paged_attention_dense`` / ``paged_attention_csr``,
-``_fp8kv`` for an fp8 KV cache), Q and KV dtypes, KV layout, causal flag,
-sliding window, LSE mode and geometry, encoded as integer Const axes so the
-exported reference can be called with the same values and the exported
-``init`` rebuilds the traced variant from the JSON alone: ``csr`` 0/1 = dense
-block table / flat page ids, ``fp8_kv`` 0/1 = K/V in q's dtype /
-float8_e4m3fn (the init then plans with that ``kv_dtype`` and puts
-``k_scale`` / ``v_scale`` in its run bundle), ``q_dtype`` 0/1 =
-bfloat16/float16, ``kv_layout`` 0/1 = HND/NHD, ``causal`` 0/1,
-``window_left`` -1 = unlimited, ``lse_mode`` 0/1/2 = none/base-2/natural
-log. The resolved backend is not part of the identity, so fa2, fa3, cuDNN and
-trtllm-gen traces of one plan compare against the same definition. Tracing
-tensors whose dtypes differ from the plan's is refused. The plan's feature
-knobs are Const axes too: ``logits_soft_cap`` (the integer cap of ``cap *
-tanh(score / cap)``, applied to the scaled scores before masking; 0 = off; a
-non-integer cap refuses to trace), ``use_sinks`` (a ``sinks`` input of
-``(num_qo_heads,)`` fp32 logits, one per head in the softmax denominator with
-no value; the LSE includes it; pass ``sinks=`` to the trace as to ``run()``)
-and ``use_custom_mask`` (the plan-owned flattened bool ``custom_mask`` input
-with a ``mask_len`` axis, ANDed with the causal / window envelope). Each
-enters the name only when on (``_cap30``, ``_sinks1``, ``_mask1``), the
-reference applies them, and ``init`` rebuilds them. Tracing requires the planned
-instance: ``PagedAttention.run.fi_trace(...)`` and a trace before ``plan()``
-raise instead of guessing; a batch with padding rows (``kv_len == 0``)
-refuses to trace, which the
-definition's ``min(kv_seq_lens) >= 1`` constraint excludes. Requests without
-query rows (``q_len == 0``, vLLM's padded ``query_start_loc`` tail) are part
-of the definition: its constraint is ``min(q_len) >= 0``, the reference
-skips them, and the exported ``init`` produces them when ``total_q <
-batch_size``.
+``PagedAttention.run`` has no fi_trace template: trace templates are optional
+for an experimental API and required for graduation, so
+``flashinfer.fi_trace(attn.run, ...)`` raises a ``ValueError``. API logging
+(``FLASHINFER_LOGLEVEL``) covers ``resolve_paged_attention``, ``plan()`` and
+``run()`` like any other API.
+
 The fa2/fa3 backends launch the kernel module from an argument list staged
 at ``plan()`` and do not enter ``BatchPrefillWithPagedKVCacheWrapper.run()``,
-so ``run()`` of such a plan produces the unified API-log entry, dump and
-definition only. The wrapper's ``run()`` log entry and level-10 dump, its
-nested ``gqa_paged_prefill`` definition and Trace Apply under that definition
-name apply only to the plans that go through the wrapper's ``run()``: a
-plan with attention sinks, and a plan whose launch cannot be staged.
+so ``run()`` of such a plan produces the unified API-log entry and dump only.
+The wrapper's ``run()`` log entry and level-10 dump, its ``gqa_paged_prefill``
+trace definition and Trace Apply under that definition name apply only to
+the plans that go through the wrapper's ``run()``: a plan with attention
+sinks, and a plan whose launch cannot be staged.
 
 .. currentmodule:: flashinfer.prefill
 

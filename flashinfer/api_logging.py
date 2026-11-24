@@ -2215,11 +2215,6 @@ _TRACE_FI_API_ALIASES = {
     "flashinfer.mla._batch_mla._wrapper.BatchMLAPagedAttentionWrapper.run": (
         "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run"
     ),
-    # The experimental PagedAttention is defined in the core entry module and
-    # re-exported from flashinfer.prefill, the path users call.
-    "flashinfer._paged_attention.PagedAttention.run": (
-        "flashinfer.prefill.PagedAttention.run"
-    ),
 }
 
 

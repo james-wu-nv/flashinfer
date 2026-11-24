@@ -4,8 +4,8 @@ This document describes the experimental `flashinfer.prefill.PagedAttention`
 facade and the private `flashinfer.experimental.paged_attention` package behind
 it: the public surface, the three-stage CUDA-graph lifecycle, backend
 selection, per-backend metadata derivation, the input, zero-row and LSE
-contracts, the feature axes, workspace ownership, the benchmark and trace
-tooling, and the correspondence to the Batch MLA package it mirrors
+contracts, the feature axes, workspace ownership, the benchmark tooling,
+and the correspondence to the Batch MLA package it mirrors
 (`docs/design_docs/batch_mla_backend_architecture.md`). Everything stated
 here is taken from the code; where a report and the code disagree, the code
 wins, and the "Known limitations" section carries the ledger ids of the open
@@ -268,8 +268,8 @@ passed to
 ### Facade
 
 `flashinfer/_paged_attention.py` owns the public signatures, the
-experimental marker, the trace hook on `run()` and the lazy handoff to the
-package. It contains no backend logic.
+experimental marker and the lazy handoff to the package. It contains no
+backend logic.
 
 ### Controller
 
@@ -284,8 +284,8 @@ package. It contains no backend logic.
   published selection order and trace;
 - graph mode: capacity preflight, capacity substitution, reserved-table
   reservation, the frozen contract, the staging transaction;
-- publication of the plan state, `run()` validation and dispatch,
-  `explain()`, and the read-only `trace_context()`.
+- publication of the plan state, `run()` validation and dispatch, and
+  `explain()`.
 
 ### Contracts and planning
 
@@ -361,7 +361,6 @@ How each backend launches:
 flashinfer/
 |-- prefill.py                     re-exports; lazy value types
 |-- _paged_attention.py            facade: resolve_paged_attention, PagedAttention
-|-- trace/templates/paged_attention.py
 `-- experimental/paged_attention/
     |-- __init__.py
     |-- _contracts.py              PagedAttentionMetadata, PlanMetadata, Resolution
@@ -1356,7 +1355,7 @@ needs N bytes of scratch workspace for this batch but the workspace buffer
 holds M bytes; ..."` (`_workspace_too_small` gives the reason, the
 controller adds the backend's name as for every preflight reason).
 
-## Benchmark and trace
+## Benchmark and API records
 
 ### Benchmark
 
@@ -1388,46 +1387,15 @@ memcpy counts from the profiler.
 
 ### Trace
 
-`PagedAttention.run` carries a flashinfer-bench trace template
-(`flashinfer/trace/templates/paged_attention.py`, bound through
-`@flashinfer_experimental_api(trace=paged_attention_trace_dispatch)`).
-`flashinfer.fi_trace(attn.run, q=q, kv_cache=(k, v))` on a planned instance,
-or `FLASHINFER_TRACE_DUMP=1` during `run()`, exports a definition whose
-identity is the plan's paging form (`paged_attention_dense` /
-`paged_attention_csr`, with a `_fp8kv` schema variant), Q and KV dtypes, KV
-layout, causal flag, sliding window, LSE mode and feature knobs as integer
-`Const` axes (`csr`, `fp8_kv`, `q_dtype`, `kv_layout`, `causal`,
-`window_left`, `lse_mode`, `logits_soft_cap`, `use_sinks`,
-`use_custom_mask`) plus the geometry (heads, head dims, page size). The
-feature axes name the definition only when on (`_cap30`, `_sinks1`,
-`_mask1`); a soft cap is its integer value (a non-integer cap refuses to
-trace), sinks add a `sinks` input `(num_qo_heads,)` fp32 that the trace
-takes like `run()`, and a custom mask adds the plan-owned flattened bool
-`custom_mask` input with a `mask_len` axis. The reference applies them
-(cap * tanh before masking; the sink as one extra logit per head in the
-denominator, included in the LSE; the mask ANDed with the envelope). The exported
-`init` and `reference` take the same axes, so a consumer rebuilds a CSR,
-fp8-KV or fp16 definition from the JSON alone (the fp8 init plans with
-`kv_dtype=float8_e4m3fn` and carries `k_scale` / `v_scale` in its run
-bundle). The resolved backend is provenance, not
-identity, so fa2, cuDNN and trtllm-gen traces of one plan compare against the
-same definition. The dispatcher reads the controller's read-only
-`trace_context()`: no device-to-host copy, no launch; the tensors are the
-ones the planned kernels read (the reserved storage in graph mode), and the
-flat form traces the live prefix of the plan's own page-id list even when
-the chosen backend read a derived dense table. A planned batch that contains
-padding rows (`kv_len == 0`) refuses to trace, because the definition constrains
-`min(kv_seq_lens) >= 1` and its reference has no padding-row convention.
-Requests without query rows (`q_len == 0`) are inside the definition: the
-constraint is `min(q_len) >= 0`, the reference skips them and `init` emits
-them for `total_q < batch_size`.
-Tracing before the first successful plan or through the unbound
-`PagedAttention.run.fi_trace(...)` raises.
+`PagedAttention.run` has no fi_trace template. Trace templates are optional
+for an experimental API and part of the graduation checklist
+(`flashinfer/experimental/README.md`), together with the
+`tests/trace/example.py` entry.
 
 ### Records of the inner fa wrapper
 
-The API log, the dump and the trace described above belong to the unified
-entry, `PagedAttention.run`. For a plain fa2 / fa3 plan, `run()` launches the
+The API log and the dump belong to the unified entry,
+`PagedAttention.run`. For a plain fa2 / fa3 plan, `run()` launches the
 kernel module from the argument list staged at `plan()` and does not enter
 `BatchPrefillWithPagedKVCacheWrapper.run()`, so a unified fa run does not
 produce that method's own records:
@@ -1436,8 +1404,8 @@ produce that method's own records:
 - the `gqa_paged_prefill_*` trace dump under `FLASHINFER_TRACE_DUMP`;
 - Trace Apply under that definition name.
 
-A consumer that keyed on those records uses the `PagedAttention.run` entry
-and the `paged_attention_*` definitions. A sink plan and a plan the staging
+A consumer that keyed on those records uses the `PagedAttention.run` entry;
+there is no unified trace definition yet. A sink plan and a plan the staging
 declines run through the wrapper's `run()` and produce its records.
 
 ## Correspondence to the Batch MLA package
@@ -1455,7 +1423,7 @@ declines run through the wrapper's `run()` and produce its records.
 | `cutlass_backend.py`, `trtllm_gen_backend.py`, ... | `cudnn_backend.py`, `trtllm_gen_backend.py` (trtllm-gen and cake) |
 | reserved metadata buffers, `supports_cuda_graph_replan` per backend | `GraphCapacity`, `GraphBuffers`, `Transaction` in `_graph.py`; every backend re-plans through reserved storage |
 | no public plan-update API: a graph re-plan is `plan()` again | the same |
-| MLA trace template in `trace/templates/attention.py` | `trace/templates/paged_attention.py` |
+| MLA trace template in `trace/templates/attention.py` | none yet: optional for an experimental API, required for graduation |
 
 Differences worth knowing: paged attention has no deprecated argument forms
 and no compatibility adapters; its `plan()` accepts every backend's semantic
@@ -1489,7 +1457,6 @@ and referred to by id elsewhere.
 | — | `custom_mask` with graph mode raises `ValueError`: the FA wrapper's packed-mask storage is not part of `GraphCapacity`. | Follow-up. |
 | — | The generated-FA backend re-plans its wrapper in place; a failure inside that plan can leave backend-internal state ahead of the published metadata. | Same caveat as the MLA generated backends. |
 | — | fa3 rows are compiled-checked only; the verification pool has no SM90 device. fa3 shares fa2's staged launch list, which has not been executed on SM90 either. | Needs one H100 run. |
-| — | The trace definition constrains `min(kv_seq_lens) >= 1`, older than the zero-row contract; a batch with padding rows refuses to trace rather than export a self-violating workload. | Give the reference a padding-row convention, relax the constraint and regenerate the fixture. |
 | — | Capacity substitution plans kernels for the capacity maxes, and a graph-mode instance ranks `auto` on those bounds and the host lengths of the first batch it plans successfully, and keeps that backend. A short batch replayed in a prefill-sized capacity stays on the capacity's choice; the performance effect on short batches is unmeasured. So is cuDNN frozen by a first batch inside the length-based extension of its SM100 region under a capacity far above that batch: the cuDNN plan declares the capacity's bounds, not a shape class of the batch. | Benchmark item. Plan the first batch with representative lengths, or pin the backend. |
 | — | cuDNN in CUDA-graph mode binds the controller's reserved table, the caller's columns included. One cuDNN engine loads pages through the columns past a request's own pages, up to the end of the request's last 128-token KV tile, and, where the capacity's KV bound is not a whole number of 128-token tiles, pool page 0 for the rest of the last tile; a NaN or Inf in such a page reaches the output as `0 * NaN`. An eager plan binds a table that names only each request's own pages, so no page the batch does not own reaches the result (`tests/experimental/paged_attention/test_paged_attention_cudnn_bounds.py::test_pages_the_batch_does_not_own_do_not_reach_the_result`). | In graph mode keep the pages those columns name finite, and either choose a capacity KV bound of whole 128-token tiles or keep pool page 0 finite. |
 | D1 | Head dim 256 on SM100. The legacy wrapper's `auto` also selects cuDNN in a head-dim-256 GQA prefix domain (`flashinfer.prefill._blackwell_paged_gqa_auto_cudnn`: bf16, HND, page size 16, at most four requests of 64 to 1024 query tokens, each over 2048 to 32768 keys and at least four times its query length, GQA groups of 2, 4, 8 or 16, from 16 Mi of work), behind `_cudnn_supports_paged_gqa_auto(256)`, which needs cudnn-frontend 1.33. This API has no cuDNN candidate at head dim 256 (the capability table declares 128 and (192, 128) for cuDNN), so `auto` plans fa2 there. | Not copied: the gate is False on cudnn-frontend 1.32, the stack this API is measured on, and cuDNN at head dim 256 is not verified through this API. `_in_sm100_cudnn_region` answers False at head dim 256. Pinned by `tests/experimental/paged_attention/test_paged_attention_auto_policy.py::test_sm100_head_dim_256_is_not_copied`. |
