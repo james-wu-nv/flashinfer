@@ -8,12 +8,18 @@ rejection.  The unified sizing contract is
 caller scratch buffer (the int workspace is instance-owned).  Same geometry
 (batch 3, q 64, kv 1024, page 16, H16:4, D128, fp16, NHD, non-causal).
 
-- fixed split: ``fixed_split_size`` is not a ``plan()`` /
-  ``workspace_requirements()`` argument, an expected failure naming the API.
+- fixed split: ``plan(fixed_split_size=16)`` on fa2, the one backend that
+  declares the control, eager as in the legacy test: a buffer of exactly
+  ``workspace_requirements(fixed_split_size=16, use_cuda_graph=False)`` bytes
+  (non-zero: 16 pages split the 64-page KV range) plans and runs.
 - CUDA graph: once per backend (fa2, fa3, cudnn, trtllm-gen; skipped with the
   resolver's reason where it cannot run), a buffer of exactly the reported size
-  plans, captures and replays; the legacy only planned, so the replayed output
-  and LSE are checked against the fp32 oracle.
+  plans, captures and replays.
+- CUDA graph without a split: ``plan(disable_split_kv=True)`` on fa2;
+  ``workspace_requirements()`` reports 0 bytes and a zero-byte buffer plans,
+  captures and replays.
+- the legacy only planned, so each of these checks the output and LSE against
+  the fp32 oracle.
 - unaligned buffer: once per backend, plan() must reject it with the legacy
   "16-byte aligned" message; an expected failure (with the reason) where the
   backend accepts it.
@@ -46,8 +52,10 @@ LEGACY_MAP = [
     (
         "tests/attention/test_workspace_size.py::test_batch_prefill_workspace_size_plans_fixed_split_with_exact_buffers",
         ["test_batch_prefill_workspace_size_plans_fixed_split_with_exact_buffers"],
-        "unsupported-by-design",
-        "xfail: plan() / workspace_requirements() have no fixed_split_size (API limit)",
+        "partial",
+        "fa2, eager: a buffer of exactly workspace_requirements(fixed_split_size=16, "
+        "use_cuda_graph=False) bytes plans and runs with plan(fixed_split_size=16), "
+        "checked against the fp32 oracle; no separate int workspace",
     ),
     (
         "tests/attention/test_workspace_size.py::test_batch_prefill_workspace_size_plans_cuda_graph_with_exact_buffers",
@@ -57,6 +65,16 @@ LEGACY_MAP = [
         "workspace_requirements(use_cuda_graph=True, backend=...) bytes plans, "
         "captures and replays, checked against the fp32 oracle; no separate int "
         "workspace",
+    ),
+    (
+        "tests/attention/test_workspace_size.py::test_batch_prefill_workspace_size_plans_no_split_cuda_graph_with_exact_buffers",
+        [
+            "test_batch_prefill_workspace_size_plans_no_split_cuda_graph_with_exact_buffers"
+        ],
+        "partial",
+        "fa2 graph mode with plan(disable_split_kv=True): workspace_requirements() "
+        "is 0 and a zero-byte buffer plans, captures and replays, checked against "
+        "the fp32 oracle; no separate int workspace",
     ),
     (
         "tests/attention/test_workspace_size.py::test_batch_decode_workspace_size_rejects_unaligned_workspace_buffer",
@@ -95,7 +113,7 @@ PLAN_KWARGS = dict(
 )
 
 
-def _skip_unless_runnable(backend):
+def _skip_unless_runnable(backend, **control):
     try:
         resolve_paged_attention(
             device=torch.device("cuda:0"),
@@ -109,6 +127,7 @@ def _skip_unless_runnable(backend):
             need_lse=True,
             kv_input_form="page_indices",
             backend=backend,
+            **control,
         )
     except ValueError as e:
         pytest.skip(f"{backend} not runnable here: {e}")
@@ -131,11 +150,72 @@ def _metadata():
     )
 
 
-def test_batch_prefill_workspace_size_plans_fixed_split_with_exact_buffers():
-    pytest.xfail(
-        "API limit: PagedAttention.plan() / workspace_requirements() have no "
-        "fixed_split_size (the legacy sizes and plans a fixed split of 16 pages)"
+def _qkv(device):
+    torch.manual_seed(0)
+    num_pages = BATCH_SIZE * ((KV_LEN + PAGE_SIZE - 1) // PAGE_SIZE)
+    q = torch.randn(
+        BATCH_SIZE * QO_LEN, NUM_QO_HEADS, HEAD_DIM, dtype=torch.float16, device=device
     )
+    k = torch.randn(
+        num_pages, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=torch.float16, device=device
+    )
+    return q, k, torch.randn_like(k)
+
+
+def _capture_and_replay(attn, q, k, v):
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        attn.run(q, (k, v))
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, lse = attn.run(q, (k, v))
+    graph.replay()
+    torch.cuda.synchronize()
+    return out, lse
+
+
+def _assert_matches_oracle(metadata, q, k, v, out, lse):
+    """fp32 oracle (the legacy tests only plan)."""
+    ref_out, ref_lse = reference_paged_prefill(
+        q,
+        k,
+        v,
+        metadata.qo_indptr.cpu(),
+        metadata.kv_seq_lens.cpu(),
+        None,
+        PAGE_SIZE,
+        False,
+        kv_layout="NHD",
+        kv_page_indices=metadata.kv_page_indices,
+    )
+    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
+    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+
+
+def test_batch_prefill_workspace_size_plans_fixed_split_with_exact_buffers():
+    control = dict(fixed_split_size=16)  # the legacy split, in pages
+    _skip_unless_runnable("fa2", **control)
+    device = torch.device("cuda:0")
+    metadata = _metadata()
+    nbytes = PagedAttention.workspace_requirements(
+        GraphCapacity.from_metadata(metadata),
+        device=device,
+        **PLAN_KWARGS,
+        use_cuda_graph=False,
+        backend="fa2",
+        **control,
+    )
+    assert nbytes > 0  # the legacy assertion: a fixed split needs float scratch
+    attn = PagedAttention(
+        device, workspace_buffer=torch.empty(nbytes, dtype=torch.uint8, device=device)
+    )
+    attn.plan(metadata, **PLAN_KWARGS, lse_mode="base2", backend="fa2", **control)
+    assert attn.backend == "fa2"
+    q, k, v = _qkv(device)
+    out, lse = attn.run(q, (k, v))
+    _assert_matches_oracle(metadata, q, k, v, out, lse)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
@@ -154,43 +234,36 @@ def test_batch_prefill_workspace_size_plans_cuda_graph_with_exact_buffers(backen
     )
     attn.plan(metadata, **PLAN_KWARGS, lse_mode="base2", backend=backend)
     assert attn.backend == backend
+    q, k, v = _qkv(device)
+    out, lse = _capture_and_replay(attn, q, k, v)
+    _assert_matches_oracle(metadata, q, k, v, out, lse)
 
-    torch.manual_seed(0)
-    num_pages = BATCH_SIZE * ((KV_LEN + PAGE_SIZE - 1) // PAGE_SIZE)
-    q = torch.randn(
-        BATCH_SIZE * QO_LEN, NUM_QO_HEADS, HEAD_DIM, dtype=torch.float16, device=device
-    )
-    k = torch.randn(
-        num_pages, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM, dtype=torch.float16, device=device
-    )
-    v = torch.randn_like(k)
 
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        attn.run(q, (k, v))
-    torch.cuda.current_stream().wait_stream(s)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out, lse = attn.run(q, (k, v))
-    graph.replay()
-    torch.cuda.synchronize()
-
-    # fp32 oracle (the legacy test only plans)
-    ref_out, ref_lse = reference_paged_prefill(
-        q,
-        k,
-        v,
-        metadata.qo_indptr.cpu(),
-        metadata.kv_seq_lens.cpu(),
-        None,
-        PAGE_SIZE,
-        False,
-        kv_layout="NHD",
-        kv_page_indices=metadata.kv_page_indices,
+def test_batch_prefill_workspace_size_plans_no_split_cuda_graph_with_exact_buffers():
+    control = dict(disable_split_kv=True)
+    _skip_unless_runnable("fa2", **control)
+    device = torch.device("cuda:0")
+    metadata = _metadata()
+    capacity = GraphCapacity.from_metadata(metadata)
+    nbytes = PagedAttention.workspace_requirements(
+        capacity,
+        device=device,
+        **PLAN_KWARGS,
+        use_cuda_graph=True,
+        backend="fa2",
+        **control,
     )
-    torch.testing.assert_close(out.float(), ref_out, **OUT_TOL)
-    torch.testing.assert_close(lse, ref_lse, **LSE_TOL)
+    assert nbytes == 0  # an unsplit plan takes no float scratch
+    attn = PagedAttention(
+        device,
+        graph_capacity=capacity,
+        workspace_buffer=torch.empty(nbytes, dtype=torch.uint8, device=device),
+    )
+    attn.plan(metadata, **PLAN_KWARGS, lse_mode="base2", backend="fa2", **control)
+    assert attn.backend == "fa2"
+    q, k, v = _qkv(device)
+    out, lse = _capture_and_replay(attn, q, k, v)
+    _assert_matches_oracle(metadata, q, k, v, out, lse)
 
 
 @pytest.mark.parametrize("backend", BACKENDS)
