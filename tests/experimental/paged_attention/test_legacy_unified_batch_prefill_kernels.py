@@ -62,9 +62,9 @@ LEGACY_MAP = [
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_lazy_stride_router_plan_reuse",
         ["test_batch_prefill_lazy_stride_router_plan_reuse"],
         "partial",
-        "same fixture on fa2, one plan over equal / unequal / equal V strides, plan "
-        "info unchanged across runs, legacy tolerances; plan() has no "
-        "fixed_split_size, so the legacy forced split-KV is not reproduced",
+        "same fixture on fa2, one plan with the legacy fixed_split_size=2 (split-KV "
+        "forced, checked on the plan info) over equal / unequal / equal V strides, "
+        "plan info unchanged across runs, legacy tolerances",
     ),
     (
         "tests/attention/test_batch_prefill_kernels.py::test_batch_prefill_lazy_stride_router_nvfp4",
@@ -534,6 +534,7 @@ def test_batch_prefill_lazy_stride_router_plan_reuse(kv_layout, head_dim):
             kv_layout=kv_layout,
             causal=True,
             kv_input_form="page_indices",
+            fixed_split_size=2,
             backend="fa2",
         )
     except ValueError as e:
@@ -586,9 +587,8 @@ def test_batch_prefill_lazy_stride_router_plan_reuse(kv_layout, head_dim):
             128 * 1024 * 1024, device="cuda", dtype=torch.uint8
         ),
     )
-    # The legacy plan also passes fixed_split_size=2 to force split-KV;
-    # PagedAttention.plan() has no such knob, so this plan uses the default
-    # split heuristic.
+    # fixed_split_size=2 (pages) forces split-KV, as the legacy plan does: the
+    # 7-page KV range of each request is planned in 4 chunks
     attn.plan(
         metadata,
         num_qo_heads=num_qo_heads,
@@ -598,11 +598,13 @@ def test_batch_prefill_lazy_stride_router_plan_reuse(kv_layout, head_dim):
         kv_dtype=torch.bfloat16,
         kv_layout=kv_layout,
         causal=True,
+        fixed_split_size=2,
         backend="fa2",
     )
     assert attn.backend == "fa2"
     # fa2's plan info, read from the wrapper the fa2 backend holds
     plan_info = tuple(attn._impl._active._active._plan_info)
+    assert plan_info[14], "the plan is not split"  # PrefillPlanInfo::split_kv
     outputs = [
         attn.run(q, cache)[0] for cache in ((k, v_equal), (k, v_unequal), (k, v_equal))
     ]
