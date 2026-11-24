@@ -1,6 +1,6 @@
 """Demo: PagedAttention (experimental) — run me and read the output.
 
-    PYTHONPATH=<this worktree> python prototype_demo_paged_attention.py
+    python examples/experimental/paged_attention.py
 
 What it shows, in order:
  1. resolve() at "engine init" — static, tensor-free, with exclusion reasons

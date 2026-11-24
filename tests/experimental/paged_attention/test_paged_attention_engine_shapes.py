@@ -2,7 +2,8 @@
 actually build it, fed to the unified API unchanged.
 
 These are the machine-checked half of the consumer-integration verification
-(the companion diffs live in ``integrations/``).  Each test replicates the
+(the companion diffs live in
+``flashinfer/experimental/paged_attention/integrations/``).  Each test replicates the
 engine's *real* construction pipeline — persistent buffer reuse,
 over-allocation, pinned host mirrors, rebased mixed-batch slices — rather
 than an idealized version, so any impedance mismatch between the unified
@@ -10,7 +11,7 @@ contract and what an engine can cheaply supply shows up here as a failure
 or a documented friction note.
 
 Friction log (kept current — this docstring is part of the deliverable;
-the full audited list lives in integrations/README.md):
+the full audited list lives in that directory's README.md):
 - vLLM: metadata maps 1:1 (dense table + GPU seq_lens + host maxes + CPU
   mirrors; rebased mixed-batch slice; preallocated out).  Carried friction:
   the all-trtllm async mode skips seq_lens_cpu retrieval today and would

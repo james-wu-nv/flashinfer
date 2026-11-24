@@ -86,11 +86,16 @@ out, lse = attn.run(q, (k_cache, v_cache))  # one call per layer
 print(attn.explain())
 ```
 
-The design doc's "Public usage" section has the engine-shaped loop and the
-CUDA-graph form. The docstrings of `PagedAttention` (`plan`, `run`,
-`explain`, `backend`, `workspace_requirements`), `PagedAttentionMetadata`
-(`dense`, `csr`), `GraphCapacity` (`from_metadata`) and
-`resolve_paged_attention` are the argument reference.
+`examples/experimental/paged_attention.py` is the runnable example: it
+resolves at engine init, runs one batch on every runnable backend and
+compares them, runs a decode-shaped batch through `auto`, and shows a
+rejected call. The design doc's "Public usage" section has the engine-shaped
+loop and the CUDA-graph form, and [`integrations/`](integrations/README.md)
+holds the vLLM and SGLang integration sketches. The docstrings of
+`PagedAttention` (`plan`, `run`, `explain`, `backend`,
+`workspace_requirements`), `PagedAttentionMetadata` (`dense`, `csr`),
+`GraphCapacity` (`from_metadata`) and `resolve_paged_attention` are the
+argument reference.
 
 ## Contract
 
@@ -510,6 +515,7 @@ sinks, and a plan whose launch cannot be staged.
 | `_auto_policy.py` | Plan-time ranking of the auto candidates for one batch; ranks only, never decides support |
 | `_controller.py` | `plan()` / `run()` lifecycle, the candidate walk, transactional publication |
 | `_graph.py` | `GraphCapacity`, reserved storage and staging for CUDA graphs |
+| `integrations/` | vLLM and SGLang integration sketches (documents, not code) |
 | `_backends/` | One module per backend (`fa_backend.py`, `cudnn_backend.py`, `trtllm_gen_backend.py`; `cake` is a variant of the trtllm-gen one) and the declarative capabilities |
 
 The layout mirrors `flashinfer/mla/_batch_mla/`. Core imports this package
@@ -519,6 +525,7 @@ only through deferred imports in `flashinfer/_paged_attention.py`.
 
 ```bash
 python -m pytest tests/experimental/paged_attention -q
+python examples/experimental/paged_attention.py
 python benchmarks/bench_paged_attention.py \
     --testlist benchmarks/bench_paged_attention_testlist.txt --output_path pa.csv
 ```

@@ -265,7 +265,7 @@ class PagedAttention:
     """Paged attention over the existing fa2/fa3, cuDNN, trtllm-gen and cake
     kernels behind one contract (experimental).
 
-    Usage (engine-shaped; see ``prototype_demo_paged_attention.py``)::
+    Usage (engine-shaped; see ``examples/experimental/paged_attention.py``)::
 
         res = resolve_paged_attention(cc_major=9, num_qo_heads=8, num_kv_heads=2,
                                       head_dim_qk=128, q_dtype=torch.bfloat16,
