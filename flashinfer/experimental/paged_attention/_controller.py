@@ -53,6 +53,7 @@ from ._contracts import (
     _expect_heads,
     _expect_lse_mode,
     _expect_pinned_device,
+    _expect_split_kv_control,
     _expect_window_left,
     _normalize_logits_soft_cap,
     resolve_config_key,
@@ -119,6 +120,8 @@ def workspace_requirements(
     logits_soft_cap: Optional[float] = None,
     custom_mask: bool = False,
     use_sinks: bool = False,
+    fixed_split_size: Optional[int] = None,
+    disable_split_kv: bool = False,
     use_cuda_graph: bool = True,
     backend: Union[str, Resolution] = "auto",
 ) -> int:
@@ -141,6 +144,13 @@ def workspace_requirements(
         dev = torch.device("cuda", torch.cuda.current_device())
     head_dim_vo = head_dim_vo if head_dim_vo is not None else head_dim_qk
     kv_dtype = kv_dtype if kv_dtype is not None else q_dtype
+    _expect_split_kv_control(fixed_split_size, disable_split_kv)
+    _expect(
+        fixed_split_size is None or not use_cuda_graph,
+        f"fixed_split_size={fixed_split_size} with use_cuda_graph=True: plan() "
+        "rejects a fixed split on a CUDA-graph instance, so there is no "
+        "graph-mode bound — pass use_cuda_graph=False for the eager bound",
+    )
     if isinstance(backend, Resolution):
         candidates = backend.backends
     else:
@@ -161,6 +171,8 @@ def workspace_requirements(
             logits_soft_cap=logits_soft_cap,
             custom_mask=custom_mask,
             sinks=use_sinks,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
             backend=backend,
         ).backends
     props = torch.cuda.get_device_properties(dev)
@@ -177,6 +189,8 @@ def workspace_requirements(
         max_kv_len=capacity.max_kv_len,
         need_lse=need_lse,
         window_left=window_left,
+        fixed_split_size=fixed_split_size,
+        disable_split_kv=disable_split_kv,
         use_cuda_graph=use_cuda_graph,
         sm_count=int(props.multi_processor_count),
         smem_optin=getattr(props, "shared_memory_per_block_optin", None),
@@ -378,6 +392,8 @@ class PagedAttentionController:
         logits_soft_cap: Optional[float] = None,
         custom_mask: Optional[torch.Tensor] = None,
         use_sinks: bool = False,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
         backend: Union[str, Resolution] = "auto",
     ) -> None:
         _expect(
@@ -415,6 +431,7 @@ class PagedAttentionController:
                 int((q_lens * metadata.kv_seq_lens_cpu.to(torch.int64)).sum()),
             )
         use_sinks = bool(use_sinks)
+        _expect_split_kv_control(fixed_split_size, disable_split_kv)
 
         if isinstance(backend, Resolution):
             # Level-1 pinning (proposal §5.3): verify the plan config AND the
@@ -436,6 +453,8 @@ class PagedAttentionController:
                 logits_soft_cap,
                 custom_mask is not None,
                 use_sinks,
+                fixed_split_size,
+                disable_split_kv,
                 backend.max_q_len,  # the hint is the Resolution's own; checked per batch below
                 *self._device_binding(),
             )
@@ -465,6 +484,8 @@ class PagedAttentionController:
                 logits_soft_cap=logits_soft_cap,
                 custom_mask=custom_mask is not None,
                 sinks=use_sinks,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
                 backend=backend,
             )
         # Plan-time choice within the pinned set (level 2): walk the
@@ -641,6 +662,8 @@ class PagedAttentionController:
                 logits_soft_cap=logits_soft_cap,
                 custom_mask=custom_mask,
                 use_sinks=use_sinks,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
             )
             key = (name, kv_layout)
             candidate = self._backends.get(key)

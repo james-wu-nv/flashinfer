@@ -187,6 +187,8 @@ def resolve_paged_attention(
     logits_soft_cap: Optional[float] = None,
     custom_mask: bool = False,
     sinks: bool = False,
+    fixed_split_size: Optional[int] = None,
+    disable_split_kv: bool = False,
     max_q_len: Optional[int] = None,
     backend: str = "auto",
 ) -> "Resolution":
@@ -208,6 +210,10 @@ def resolve_paged_attention(
       ``custom_mask`` and ``sinks``: the features the plans will request.  A
       backend that cannot apply a requested feature is excluded with the
       reason — ``auto`` never drops a feature silently.
+    - ``fixed_split_size`` / ``disable_split_kv``: the split-KV controls the
+      plans will pass (see :meth:`PagedAttention.plan`), with the values
+      they will pass.  Either one excludes every backend whose planner does
+      not take them; fa2 is the one that does.
     - ``max_q_len``: optional shape hint — the batches planned with this
       Resolution have at most this many query tokens per request (1 for
       plain decode, the draft length for speculative decode; leave ``None``
@@ -256,6 +262,8 @@ def resolve_paged_attention(
         logits_soft_cap=logits_soft_cap,
         custom_mask=custom_mask,
         sinks=sinks,
+        fixed_split_size=fixed_split_size,
+        disable_split_kv=disable_split_kv,
         max_q_len=max_q_len,
         backend=backend,
     )
@@ -385,6 +393,8 @@ class PagedAttention:
         logits_soft_cap: Optional[float] = None,
         custom_mask: bool = False,
         use_sinks: bool = False,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
         use_cuda_graph: bool = True,
         backend: Union[str, "Resolution"] = "auto",
     ) -> int:
@@ -404,6 +414,10 @@ class PagedAttention:
         - model configuration and feature flags as for :meth:`plan`
           (``need_lse`` defaults to ``True`` so the bound covers plans with
           and without an LSE output).
+        - ``fixed_split_size`` / ``disable_split_kv``: the split-KV controls
+          the plans will pass.  They change what fa2 allocates (below), so a
+          buffer sized without them does not cover a ``fixed_split_size``
+          plan.
         - ``use_cuda_graph``: ``True`` (default) bounds a graph-mode instance
           planned with ``capacity``, which also covers any eager plan that
           fits it; ``False`` gives the tighter eager-only bound, which does
@@ -426,7 +440,11 @@ class PagedAttention:
           bound is independent of ``N`` and loose by the tile and work-item
           ratios.  Example (B200, 148 SMs, 32/8 heads, ``D = 128``): one
           request of 2048 tokens in graph mode needs 32.25 MiB; eager prefill
-          of any batch needs at most 18.75 MiB.
+          of any batch needs at most 18.75 MiB.  With ``disable_split_kv``
+          nothing is allocated.  With ``fixed_split_size = S`` (eager only)
+          the work items are not capped by the SM count: ``P * T <= (N * G +
+          B * (T - 1)) * ceil(ceil(max_kv_len / page_size) / S)``, with ``T``
+          at its ceiling.
         - **trtllm-gen / cake**: with an LSE output, softmax stats of
           ``8 * H * B * round_up(max_q_len, 256)`` bytes plus a 1 MiB guard;
           nothing otherwise.
@@ -462,6 +480,8 @@ class PagedAttention:
             logits_soft_cap=logits_soft_cap,
             custom_mask=custom_mask,
             use_sinks=use_sinks,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
             use_cuda_graph=use_cuda_graph,
             backend=backend,
         )
@@ -484,6 +504,8 @@ class PagedAttention:
         logits_soft_cap: Optional[float] = None,
         custom_mask: Optional[torch.Tensor] = None,
         use_sinks: bool = False,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
         backend: Union[str, "Resolution"] = "auto",
     ) -> "PagedAttention":
         """Plan one batch.
@@ -530,11 +552,39 @@ class PagedAttention:
         - ``use_sinks``: declare that ``run()`` will pass per-head attention
           sinks (the backend plans its sink-aware kernel variant); ``run()``
           then requires ``sinks=``.
+        - ``fixed_split_size`` / ``disable_split_kv``: fix how the planner
+          splits a request's KV range across kernel blocks, as the arguments
+          of the same names of ``BatchPrefillWithPagedKVCacheWrapper.plan()``
+          do.  By default the planner chooses the split from the whole
+          batch, so the order in which a request's partial results are
+          merged, and with it the last bits of its output, depends on the
+          other requests.  ``fixed_split_size=S`` splits every KV range into
+          chunks of ``S`` pages; ``disable_split_kv=True`` never splits.
+          Under either, a request's output and LSE are bitwise the same in
+          every batch that the planner gives the same query tile.  The tile
+          is not fixed by these arguments: an eager plan derives it from the
+          batch's average ``q_len * (num_qo_heads // num_kv_heads)``
+          (thresholds at 16 and 64 below head dim 512), so two batches on
+          different sides of a threshold still differ in the last bits; a
+          CUDA-graph instance derives it from its capacity, the same for
+          every re-plan.  The two arguments are mutually exclusive
+          (``ValueError``; the legacy wrapper lets ``disable_split_kv``
+          win).  Only fa2 takes them: every other backend is excluded with
+          the reason.  In CUDA-graph mode ``disable_split_kv`` is frozen by
+          the first plan like every semantic argument, and
+          ``fixed_split_size`` is rejected: whether a batch is split at all
+          would then depend on its KV lengths, and a captured graph launches
+          what the first plan decided.  A ``fixed_split_size`` plan launches
+          one kernel block per query tile and KV chunk, so a small ``S``
+          over a long KV range needs more scratch workspace than the default
+          bound (:meth:`workspace_requirements` takes the same two
+          arguments).
         - ``backend``: a backend name, ``"auto"``, or a ``Resolution`` from
           :func:`resolve_paged_attention` — the latter pins the candidate set
           decided at engine init (plan() verifies the config, including the
-          three feature flags, matches).  Backends that cannot apply a
-          requested feature are excluded with a reason, never silently.
+          feature flags and the split-KV controls, matches).  Backends that
+          cannot apply a requested feature are excluded with a reason, never
+          silently.
           With ``"auto"`` or a Resolution of several candidates, plan() ranks
           them for this batch from host facts (the rule is in
           ``experimental/paged_attention/_auto_policy.py``) and takes the
@@ -588,6 +638,8 @@ class PagedAttention:
             logits_soft_cap=logits_soft_cap,
             custom_mask=custom_mask,
             use_sinks=use_sinks,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=disable_split_kv,
             backend=backend,
         )
         return self

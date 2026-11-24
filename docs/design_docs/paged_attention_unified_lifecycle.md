@@ -135,6 +135,7 @@ resolve_paged_attention(
     causal=True, need_lse=False, window_left=-1,
     kv_input_form="block_tables",
     logits_soft_cap=None, custom_mask=False, sinks=False,
+    fixed_split_size=None, disable_split_kv=False,
     max_q_len=None,
     backend="auto",
 ) -> Resolution
@@ -177,7 +178,8 @@ PagedAttention(device=None, *, graph_capacity=None, use_cuda_graph=False,
 .plan(metadata, *, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo=None,
       q_dtype, kv_dtype=None, kv_layout="HND", causal=True, window_left=-1,
       lse_mode="none", logits_soft_cap=None, custom_mask=None,
-      use_sinks=False, backend="auto") -> PagedAttention
+      use_sinks=False, fixed_split_size=None, disable_split_kv=False,
+      backend="auto") -> PagedAttention
 .run(q, kv_cache, *, out=None, lse=None, sm_scale=None,
      k_scale=None, v_scale=None, sinks=None) -> (out, lse)
 .explain() -> str
@@ -559,8 +561,8 @@ capability table (`rejection_reason`) and, if admitted, the environment probe
 
 The result is a frozen `Resolution(backends, excluded, kv_layout, config)`.
 `config` is `resolve_config_key(...)`: the semantic arguments including the
-three feature flags and the `max_q_len` hint, and as its last element the
-device binding `(cc_major, cc_minor, device_index)`.
+three feature flags, the two split-KV controls and the `max_q_len` hint, and
+as its last element the device binding `(cc_major, cc_minor, device_index)`.
 
 `HEURISTIC_ORDER` (`_selection.py`):
 
@@ -586,16 +588,17 @@ backend: `cc_majors`, `q_dtypes`, `kv_dtypes`, `head_dims` (pairs),
 `supports_lse`, `supports_noncausal`, `supports_window`,
 `supports_window_noncausal`, `sinks_head_dims`, `requires_contiguous_q`, `needs_dense`,
 `supports_logits_soft_cap`, `supports_custom_mask`,
-`supports_sinks`. The rule is capability honesty: an admitted configuration
-is one the conformance matrix and fuzzer exercise on hardware.
+`supports_sinks`, `supports_split_kv_control`. The rule is capability
+honesty: an admitted configuration is one the conformance matrix and fuzzer
+exercise on hardware.
 
-| backend | cc | head dims | page sizes | layouts | noncausal | window | window + noncausal | contiguous q | kv dtypes | dense table | soft cap | custom mask | sinks |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| fa2 | 8, 9, 10, 12 | 64, 128, 256, 512 | any | HND, NHD | yes | yes | no | no | f16/bf16, fp8 e4m3 / e5m2 | no | yes | yes | yes |
-| fa3 | 9 | 64, 128, 256 | any | HND, NHD | yes | yes | no | no | f16/bf16 | no | yes | no | yes |
-| cudnn | 8, 9, 10, 12 | 128, (192, 128) | any | HND, NHD | yes | no | n/a | no | f16/bf16 | yes | no | no | no |
-| trtllm-gen | 10 | 64, 128 | 16, 32, 64, 128, 256, 512, 1024 | HND, NHD | yes | yes | no | no | f16/bf16 | yes | no | no | yes |
-| cake | 10 | 128 | 16, 32, 64, 128, 256, 512, 1024 | HND, NHD | yes | yes | no | no | f16/bf16 | yes | no | no | yes |
+| backend | cc | head dims | page sizes | layouts | noncausal | window | window + noncausal | contiguous q | kv dtypes | dense table | soft cap | custom mask | sinks | split-KV control |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| fa2 | 8, 9, 10, 12 | 64, 128, 256, 512 | any | HND, NHD | yes | yes | no | no | f16/bf16, fp8 e4m3 / e5m2 | no | yes | yes | yes | yes |
+| fa3 | 9 | 64, 128, 256 | any | HND, NHD | yes | yes | no | no | f16/bf16 | no | yes | no | yes | no |
+| cudnn | 8, 9, 10, 12 | 128, (192, 128) | any | HND, NHD | yes | no | n/a | no | f16/bf16 | yes | no | no | no | no |
+| trtllm-gen | 10 | 64, 128 | 16, 32, 64, 128, 256, 512, 1024 | HND, NHD | yes | yes | no | no | f16/bf16 | yes | no | no | yes | no |
+| cake | 10 | 128 | 16, 32, 64, 128, 256, 512, 1024 | HND, NHD | yes | yes | no | no | f16/bf16 | yes | no | no | yes | no |
 
 No backend declares `requires_contiguous_q`. `q` reaches the library only at
 `run()`, after `plan()` has ranked the candidates, so the ranking cannot
@@ -605,8 +608,9 @@ declare `False`.
 `rejection_reason()` checks, in order: compute capability, q dtype, kv dtype,
 the q/kv pair (only an fp8 KV with an f16/bf16 q may differ), head dims, page
 size, layout, non-causal, LSE, window, window with non-causal, soft cap,
-custom mask, sinks, and finally whether a dense-reading backend would have
-to derive its table from flat page ids below `MIN_DENSE_PAGE_SIZE`.
+custom mask, sinks, the split-KV control, and finally whether a dense-reading
+backend would have to derive its table from flat page ids below
+`MIN_DENSE_PAGE_SIZE`.
 
 ### Level 2: the auto policy
 
@@ -1295,6 +1299,28 @@ time, and frozen by the first graph-mode plan:
   adapter refuses a sink tensor with `NotImplementedError`); trtllm-gen and
   cake pass the tensor natively. The pair mirrors the MLA wrapper's
   `use_sinks` / `sinks`.
+- `fixed_split_size` / `disable_split_kv`: the split-KV controls, the
+  arguments of the same names of the legacy wrapper's `plan()`. The fa2
+  planner splits a request's KV range across kernel blocks and merges the
+  partial results; by default it chooses the chunk size from the whole
+  batch, so the merge order of a request, and with it the last bits of its
+  output, depends on the other requests. `fixed_split_size=S` fixes the chunk
+  at `S` pages and `disable_split_kv=True` never splits. fa2 only (they are
+  arguments of its planner, `PrefillPlan` in
+  `include/flashinfer/attention/scheduler.cuh`; the SM90 planner takes
+  neither). They are part of `resolve_paged_attention()` and of the pinned
+  key with the values the plans pass. Three rules differ from the legacy
+  wrapper: a non-positive or non-int `fixed_split_size` is rejected (the
+  legacy planner reads it as unset); the two together are rejected (the
+  legacy planner lets `disable_split_kv` win); and `fixed_split_size` is
+  rejected on a CUDA-graph instance. The last one because the planner then
+  turns the split on for a batch only when one of its requests has more than
+  one chunk, while a captured graph launches what the first plan decided,
+  with or without the merge kernel, and because the planner raises once a
+  batch has more work items than the capacity's padded size.
+  `disable_split_kv` is graph-safe (the split is off for every plan) and
+  frozen by the first plan. What the controls guarantee and what they do
+  not is known limitation M24.
 - fp8 KV cache: `kv_dtype=torch.float8_e4m3fn` or `torch.float8_e5m2` with
   an f16/bf16 q, declared for fa2 only (e5m2 measured on B200 against the
   oracle on the dequantized cache, same error magnitude as e4m3; see the
@@ -1338,7 +1364,13 @@ pass a private buffer where that isolation is needed.
 
 The fa2 split-KV planner is the only consumer whose need grows with the
 geometry (ledger M14). trtllm-gen and cake need the softmax-stats scratch of
-an LSE plan, and cuDNN sizes its own graph workspace.
+an LSE plan, and cuDNN sizes its own graph workspace. The split-KV controls
+change the fa2 need: `disable_split_kv` allocates nothing, and a
+`fixed_split_size` plan has one work item per query tile and KV chunk with
+no cap from the launch grid, so `workspace_requirements()` takes the same
+two arguments (a bound computed without them does not cover a
+`fixed_split_size` plan, which is then declined at `plan()` naming the
+bytes).
 `PagedAttention.workspace_requirements(capacity, ...)` returns a conservative
 upper bound in bytes for every plan within a `GraphCapacity`: the maximum
 over the backends that resolve for the configuration, or over the one named
@@ -1448,6 +1480,7 @@ and referred to by id elsewhere.
 | id | limitation | state |
 | --- | --- | --- |
 | M14 | The fa2 split-KV planner carves scratch that grows with the geometry (heads, head dim, SM count, and in graph mode the capacity's query tokens), so a bucket can need more than the buffer in use, the shared 512 MiB default included. | `PagedAttention.workspace_requirements()` bounds the need for sizing a caller-owned buffer. fa2 declines a batch that does not fit at `plan()` with the typed signal: `auto` moves on to the next candidate, a named backend raises `ValueError` naming the bytes. |
+| M24 | `fixed_split_size` / `disable_split_kv` fix the KV split, not the query tile. The fa2 planner derives the tile from the batch's average packed query length in eager mode (`FA2DetermineCtaTileQ`: thresholds at 16 and 64 packed rows below head dim 512) and from the capacity in graph mode, and the tile changes the last bits of a request's output. Measured on GB200 (bf16, head dim 128): with either control a request is bitwise the same in a batch and in a prefix of it when both plan the same tile, mixed KV and query lengths included; a request of 8 query tokens (8 query / 2 KV heads) planned alone (tile 64) and next to a 200-token request (tile 128) differs by up to 9.8e-4, both within the oracle tolerance. The planner is the one the legacy wrapper calls. | Documented; `tests/experimental/paged_attention/test_paged_attention_split_kv.py::test_split_kv_control_does_not_fix_the_query_tile` is an expected failure that fails once the two outputs are bitwise equal. Invariance across arbitrary batches needs the tile fixed too; the stable wrapper's `batch_invariant=True` class (`flashinfer/attention/batch_invariant/`) is a separate mechanism that this API does not reach. |
 | M15 | `flashinfer/cudnn/decode.py` keeps the older graph-cache key and decorator order that the prefill path fixed. | Out of this package; recorded. |
 | M16 | trtllm-gen and cake compute silently wrong results when the V cache's page stride differs from the K cache's (independently allocated pools); cuDNN and fa2 are correct. | Rejected at `run()` in the trtllm-gen backend (a `ValueError` naming the stride constraint); `tests/experimental/paged_attention/test_paged_attention_coverage.py::test_tc05_strided_inputs[trtllm-gen-kv_independent_strides]` pins it. |
 | M18 | Cake creates its TMA descriptors for `q`, `k_cache` and `v_cache` (storage address, shape, strides) eagerly and pins them at capture; a `run()` whose q/k/v binding was never run eagerly raises `RuntimeError("... prewarm each Cake FMHA tensor/layout binding before CUDA Graph capture")` inside the capture. The eager descriptor pool is bounded (`kMaxReusableSlots = kMaxPinnedSlots = 4096` in `csrc/cake_fmha/jit/*_jit_binding.cu`), so a capture over thousands of distinct binding sets — the timing helper's cold-L2 rotating clones for an input far below L2 — cannot be prewarmed into it. | Documented rule, not fixable from `plan()` (it sees no tensors): run the exact `q`, `k_cache`, `v_cache` once eagerly before capturing them; `out` and `lse` may be fresh. The failed capture is clean (no device fault, instance reusable). The benchmark therefore captures one `run()` on fixed buffers and flushes L2 between replays. `tests/experimental/paged_attention/test_paged_attention_cuda_graph.py::test_cake_capture_requires_an_eager_run_on_the_captured_tensors`. |

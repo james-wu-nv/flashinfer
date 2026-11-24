@@ -87,6 +87,35 @@ def _normalize_logits_soft_cap(logits_soft_cap: Optional[float]) -> Optional[flo
     return float(logits_soft_cap) if logits_soft_cap > 0 else None
 
 
+def _expect_split_kv_control(
+    fixed_split_size: Optional[int], disable_split_kv: bool
+) -> None:
+    """The two split-KV planner controls (the legacy wrapper's ``plan()``
+    arguments of the same names).  The legacy planner reads a non-positive
+    ``fixed_split_size`` as "unset" and lets ``disable_split_kv`` override a
+    fixed size without a word; here both are errors."""
+    _expect(
+        fixed_split_size is None
+        or (
+            isinstance(fixed_split_size, int)
+            and not isinstance(fixed_split_size, bool)
+            and fixed_split_size >= 1
+        ),
+        "fixed_split_size must be None (the planner chooses the KV split) or a "
+        f"positive host int, the KV pages per split, got {fixed_split_size!r}",
+    )
+    _expect(
+        isinstance(disable_split_kv, bool),
+        f"disable_split_kv must be a bool, got {disable_split_kv!r}",
+    )
+    _expect(
+        fixed_split_size is None or not disable_split_kv,
+        f"fixed_split_size={fixed_split_size} with disable_split_kv=True: the "
+        "two contradict (a fixed split size splits the KV range, "
+        "disable_split_kv never does) — pass one of them",
+    )
+
+
 def _expect_custom_mask(
     custom_mask: torch.Tensor, device: torch.device, numel: int
 ) -> None:
@@ -150,6 +179,8 @@ def resolve_config_key(
     logits_soft_cap,
     custom_mask,
     sinks,
+    fixed_split_size,
+    disable_split_kv,
     max_q_len,
     cc_major,
     cc_minor,
@@ -158,7 +189,8 @@ def resolve_config_key(
     """The observational config a Resolution is pinned to (drift detection).
 
     ``logits_soft_cap`` (normalized value or None), ``custom_mask`` and
-    ``sinks`` (booleans) are the feature axes: pinning covers them, so a
+    ``sinks`` (booleans), ``fixed_split_size`` (pages or None) and
+    ``disable_split_kv`` are the feature axes: pinning covers them, so a
     plan() that requests a feature the Resolution was not resolved for is a
     drift error rather than a silent capability change.
 
@@ -192,6 +224,8 @@ def resolve_config_key(
         logits_soft_cap,
         bool(custom_mask),
         bool(sinks),
+        fixed_split_size,
+        bool(disable_split_kv),
         max_q_len,
         (cc_major, cc_minor, device_index),
     )
@@ -581,6 +615,11 @@ class PlanMetadata:
     # attention sinks will be passed to run(): the backend must plan the
     # sink-aware kernel variant
     use_sinks: bool = False
+    # split-KV planner controls (batch-invariant outputs): the KV pages per
+    # split, fixed instead of chosen from the batch (None = the planner
+    # chooses), and "never split the KV range"; mutually exclusive
+    fixed_split_size: Optional[int] = None
+    disable_split_kv: bool = False
 
     @cached_property
     def total_q_tokens(self) -> int:
@@ -606,6 +645,7 @@ __all__ = [
     "Resolution",
     "_expect_custom_mask",
     "_expect_pinned_device",
+    "_expect_split_kv_control",
     "_normalize_logits_soft_cap",
     "resolve_config_key",
 ]

@@ -25,6 +25,9 @@ the default wrapper's ``run(sinks=)`` reaches the kernel only on the
 trtllm-gen path, and its standard fa2 / fa3 adapter refuses a sink tensor
 (``NotImplementedError``), so a sink plan selects the variant wrapper here and
 passes the sink tensor as the variant's additional run() argument.
+``fixed_split_size`` / ``disable_split_kv`` are arguments of the fa2 planner
+and go to the wrapper's plan() unchanged; the workspace arithmetic below
+follows them.
 """
 
 from __future__ import annotations
@@ -96,6 +99,15 @@ def _envelope_mask(custom_mask: torch.Tensor, meta: PlanMetadata) -> torch.Tenso
 #              ceil(total_rows * gqa_group / cta_tile_q) + batch_size - 1),
 #          total_rows being the wrapper's row budget (the graph capacity), and
 #          split_kv is always on.
+# The two planner controls replace the binary search:
+#   disable_split_kv: one chunk per request, split_kv off in both modes, no
+#          float scratch;
+#   fixed_split_size = S (pages): ceil(kv_pages_i / S) chunks per request and
+#          split_kv on when any request has more than one.  Eager:
+#          new_batch_size = sum_i q_tiles_i * chunks_i, with no cap from the
+#          grid.  Graph mode keeps the padded size above, raises when
+#          new_batch_size exceeds it, and decides split_kv per batch, which a
+#          captured launch cannot follow: preflight() refuses the combination.
 # cta_tile_q is FA2DetermineCtaTileQ (include/flashinfer/utils.cuh) of the
 # average (eager) or maximum (graph) packed query length -- a power of two in
 # {16, 32, 64, 128}, so the byte count is monotone in it.  The SM90 (fa3)
@@ -295,6 +307,21 @@ class _FaBackend:
                     f"fa3 needs SM90a and CUDA >= 12.3; {self._device} does not qualify"
                 )
         else:
+            if meta.fixed_split_size is not None and self._graph_capacity is not None:
+                # Not a fallback case (no other backend takes the control).
+                # The planner turns split_kv on for a batch only when one of
+                # its requests has more than one chunk, and a captured graph
+                # launches what the first plan decided (with or without the
+                # merge kernel); it also raises once a batch has more work
+                # items than the capacity's padded size.
+                raise ValueError(
+                    f"fixed_split_size={meta.fixed_split_size} with "
+                    "use_cuda_graph=True is not supported: whether a batch is "
+                    "split would depend on its KV lengths, and a captured "
+                    "graph launches what the first plan decided — use "
+                    "disable_split_kv=True on a CUDA-graph instance, or plan "
+                    "fixed_split_size on an eager instance"
+                )
             self._check_workspace(meta)
         if meta.use_sinks:
             # The AttentionSink variant owns the softmax update: it has no
@@ -336,6 +363,10 @@ class _FaBackend:
         use_cuda_graph: bool,
         sm_count: int,
         smem_optin: Optional[int],
+        page_size: int = 1,
+        max_kv_len: int = 0,
+        fixed_split_size: Optional[int] = None,
+        disable_split_kv: bool = False,
         **_unused: Any,
     ) -> int:
         """Upper bound on the float-workspace bytes the fa2 planner allocates
@@ -344,12 +375,23 @@ class _FaBackend:
         Graph mode is exact given the capacity (the planner pads to the same
         maximum); eager mode bounds the work items by the grid and the tile
         by its ceiling, so it is loose by the ratio of the chosen tile to the
-        ceiling and of the actual work items to the grid.
+        ceiling and of the actual work items to the grid.  ``disable_split_kv``
+        allocates nothing.  ``fixed_split_size`` (eager only, see preflight)
+        has no grid cap: every request has at most ``ceil(max_pages /
+        fixed_split_size)`` chunks and its query tiles cover at most
+        ``packed_q_i + tile - 1`` packed rows.
         """
-        if name != "fa2":
+        if name != "fa2" or disable_split_kv:
             return 0
         gqa = num_qo_heads // num_kv_heads
         grid = _FA2_BLOCKS_PER_SM * sm_count // num_kv_heads
+        if fixed_split_size is not None:
+            chunks = -(-max(-(-max_kv_len // page_size), 1) // fixed_split_size)
+            if chunks <= 1:
+                return 0  # no request is split
+            tile = _fa2_tile_ceiling(head_dim_vo, head_dim_qk)
+            packed = (total_q_tokens * gqa + batch_size * (tile - 1)) * chunks
+            return _fa2_split_bytes(num_qo_heads, gqa, packed, 1, head_dim_vo)
         if not use_cuda_graph:
             tile = _fa2_tile_ceiling(head_dim_vo, head_dim_qk)
             return _fa2_split_bytes(num_qo_heads, gqa, grid, tile, head_dim_vo)
@@ -378,7 +420,7 @@ class _FaBackend:
         (unknown shared-memory limit) the smaller outcome is taken, so a
         check built on this never rejects a batch the planner would accept.
         """
-        if self.name != "fa2":
+        if self.name != "fa2" or meta.disable_split_kv:
             return 0
         gqa = meta.num_qo_heads // meta.num_kv_heads
         page = meta.page_size
@@ -416,6 +458,20 @@ class _FaBackend:
             else:
                 eff = pages
             eff = np.maximum(eff, 1)
+            if meta.fixed_split_size is not None:
+                # eager only (preflight): the chunk size is given, not searched
+                chunks = -(-eff // meta.fixed_split_size)
+                if int(chunks.max()) <= 1:
+                    return 0  # no request is split
+                size = _fa2_split_bytes(
+                    meta.num_qo_heads,
+                    gqa,
+                    int((q_tiles * chunks).sum()),
+                    tile,
+                    meta.head_dim_vo,
+                )
+                need = size if need is None else min(need, size)
+                continue
             max_pages = int(eff.max())
             low, high = min_chunk, max_pages
             while low < high:
@@ -462,6 +518,10 @@ class _FaBackend:
             use_cuda_graph=cap is not None,
             sm_count=self._sm_count,
             smem_optin=self._smem_optin,
+            page_size=meta.page_size,
+            max_kv_len=meta.max_kv_len,
+            fixed_split_size=meta.fixed_split_size,
+            disable_split_kv=meta.disable_split_kv,
         )
         if bound <= avail:
             return
@@ -658,6 +718,9 @@ class _FaBackend:
             seq_lens=derived.require("kv_seq_lens_host"),
             max_token_per_sequence=meta.max_q_len,
             max_sequence_kv=meta.max_kv_len,
+            # None -> -1 (unset) in the wrapper
+            fixed_split_size=meta.fixed_split_size,
+            disable_split_kv=meta.disable_split_kv,
         )
         if upload is None:
             upload = self._upload_events[id(wrapper)] = torch.cuda.Event()

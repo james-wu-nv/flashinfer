@@ -114,6 +114,12 @@ class PagedAttentionCapabilities:
     # declared pair (the sink JIT variant is compiled per head dim, so a
     # backend can be right at one size and wrong at another — see fa2 / M21)
     sinks_head_dims: Optional[frozenset] = None
+    # split-KV control: plan(fixed_split_size=...) / plan(disable_split_kv=True),
+    # the controls that make a request's output independent of the rest of
+    # the batch.  They are arguments of the fa2 planner (PrefillPlan in
+    # include/flashinfer/attention/scheduler.cuh); a backend without them is
+    # excluded when either is requested.
+    supports_split_kv_control: bool = False
 
     def rejection_reason(
         self,
@@ -132,6 +138,7 @@ class PagedAttentionCapabilities:
         logits_soft_cap: Optional[float] = None,
         use_custom_mask: bool = False,
         use_sinks: bool = False,
+        split_kv_control: bool = False,
     ) -> Optional[str]:
         """Return None if runnable, else the exclusion reason (for explain())."""
         if cc_major not in self.cc_majors:
@@ -172,6 +179,10 @@ class PagedAttentionCapabilities:
             return (
                 f"attention sinks not supported at head dims ({head_dim_qk}, "
                 f"{head_dim_vo}) (verified: {sorted(self.sinks_head_dims)})"
+            )
+        if split_kv_control and not self.supports_split_kv_control:
+            return (
+                "split-KV control (fixed_split_size / disable_split_kv) not supported"
             )
         if (
             self.needs_dense
@@ -255,6 +266,10 @@ CAPABILITIES: Dict[str, PagedAttentionCapabilities] = {
         # sinks are exact; the legacy sink wrapper is wrong there too.  The
         # pair is excluded until the kernel is fixed.
         sinks_head_dims=frozenset({(64, 64), (128, 128), (256, 256)}),
+        # Both are arguments of the fa2 planner.  fa3 is not declared: its
+        # planner (PrefillSM90Plan) takes neither, and no SM90 device is in
+        # the verification pool to measure what it does without them.
+        supports_split_kv_control=True,
     ),
     "fa3": PagedAttentionCapabilities(
         name="fa3",

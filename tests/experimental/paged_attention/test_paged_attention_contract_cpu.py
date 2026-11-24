@@ -111,6 +111,8 @@ KEY_KW = dict(
     logits_soft_cap=None,
     custom_mask=False,
     sinks=False,
+    fixed_split_size=None,
+    disable_split_kv=False,
     max_q_len=None,
     cc_major=9,
     cc_minor=None,
@@ -132,6 +134,8 @@ KEY_DRIFT = dict(
     logits_soft_cap=30.0,
     custom_mask=True,
     sinks=True,
+    fixed_split_size=16,
+    disable_split_kv=True,
     max_q_len=4,
     cc_major=10,
     cc_minor=0,
@@ -158,6 +162,8 @@ def test_resolve_config_key_layout_is_pinned():
         None,  # logits_soft_cap
         False,  # custom mask
         False,  # sinks
+        None,  # fixed_split_size (None = the planner chooses the KV split)
+        False,  # disable_split_kv
         None,  # max_q_len hint (None = no hint: default order)
         (9, None, None),  # device binding: (cc_major, cc_minor, device_index)
     )
@@ -215,6 +221,8 @@ def test_resolution_is_frozen_and_config_matches_key(no_probes):
         None,
         False,
         False,
+        None,  # fixed_split_size
+        False,  # disable_split_kv
         None,  # max_q_len hint
         9,
         None,
@@ -397,6 +405,17 @@ def _capability_rows():
         ("trtllm-gen", "sinks", dict(use_sinks=True), None),
         ("cake", "sinks", dict(use_sinks=True), None),
         ("cudnn", "sinks", dict(use_sinks=True), "attention sinks"),
+        # split-KV control: an argument of the fa2 planner only
+        ("fa2", "split-kv-control", dict(split_kv_control=True), None),
+        ("fa3", "split-kv-control", dict(split_kv_control=True), "split-KV control"),
+        ("cudnn", "split-kv-control", dict(split_kv_control=True), "split-KV control"),
+        (
+            "trtllm-gen",
+            "split-kv-control",
+            dict(split_kv_control=True),
+            "split-KV control",
+        ),
+        ("cake", "split-kv-control", dict(split_kv_control=True), "split-KV control"),
     ]
     return rows
 
@@ -501,11 +520,41 @@ def test_probes_run_only_for_capability_admitted_backends(monkeypatch):
         (dict(page_size=0), "page_size"),
         (dict(page_size=True), "page_size must be a positive host int"),
         (dict(page_size=4), f"< {MIN_DENSE_PAGE_SIZE}"),
+        (dict(fixed_split_size=0), "fixed_split_size must be None"),
+        (dict(fixed_split_size=-1), "fixed_split_size must be None"),
+        (dict(fixed_split_size=True), "fixed_split_size must be None"),
+        (dict(fixed_split_size=16.0), "fixed_split_size must be None"),
+        (dict(fixed_split_size=np.int64(16)), "fixed_split_size must be None"),
+        (dict(disable_split_kv=1), "disable_split_kv must be a bool"),
+        (dict(disable_split_kv=None), "disable_split_kv must be a bool"),
+        (dict(fixed_split_size=16, disable_split_kv=True), "the two contradict"),
     ],
 )
 def test_resolve_rejects_contract_violations_before_capabilities(no_probes, kw, match):
     with pytest.raises(ValueError, match=match):
         _resolve(10, **kw)
+
+
+@pytest.mark.parametrize("cc_major", [8, 9, 10, 12])
+@pytest.mark.parametrize(
+    "control", [dict(fixed_split_size=16), dict(disable_split_kv=True)]
+)
+def test_split_kv_control_resolves_to_fa2_alone(no_probes, cc_major, control):
+    """Either control excludes every backend whose planner does not take it
+    (with the reason), on every architecture, and is part of the pinned key."""
+    plain = _resolve(cc_major)
+    res = _resolve(cc_major, **control)
+    assert res.backends == ("fa2",)
+    for name in plain.backends:
+        if name != "fa2":
+            assert "split-KV control" in res.excluded[name], (name, res.excluded)
+    assert res.config != plain.config
+    assert res.config[-4:-2] == (
+        control.get("fixed_split_size"),
+        control.get("disable_split_kv", False),
+    )
+    with pytest.raises(ValueError, match="fa3: split-KV control"):
+        _resolve(9, backend="fa3", **control)
 
 
 def test_resolve_accepts_token_csr_below_the_dense_floor(no_probes):

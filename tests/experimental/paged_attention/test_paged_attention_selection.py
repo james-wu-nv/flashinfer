@@ -354,18 +354,18 @@ def test_features_exclude_backends_with_reasons():
     assert res.excluded["cudnn"] == "logits soft cap not supported"
     assert res.excluded["trtllm-gen"] == "logits soft cap not supported"
     assert "fa2" in res.backends
-    assert res.config[-5:-2] == (30.0, False, False)
+    assert res.config[-7:-4] == (30.0, False, False)
 
     res = resolve_paged_attention(cc_major=9, custom_mask=True, **_CFG)
     assert res.excluded["fa3"] == "custom attention mask not supported"
     assert res.excluded["cudnn"] == "custom attention mask not supported"
     assert res.backends == ("fa2",)
-    assert res.config[-5:-2] == (None, True, False)
+    assert res.config[-7:-4] == (None, True, False)
 
     res = resolve_paged_attention(cc_major=10, sinks=True, **_CFG)
     assert res.excluded["cudnn"] == "attention sinks not supported"
     assert set(res.backends) == {"trtllm-gen", "fa2"}
-    assert res.config[-5:-2] == (None, False, True)
+    assert res.config[-7:-4] == (None, False, True)
 
     # a configuration only cuDNN could run + a feature cuDNN lacks: loud
     with pytest.raises(ValueError, match="cudnn: logits soft cap not supported"):

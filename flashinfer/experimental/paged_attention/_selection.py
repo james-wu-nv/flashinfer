@@ -25,6 +25,7 @@ from ._contracts import (
     _expect_head_dims,
     _expect_heads,
     _expect_page_size,
+    _expect_split_kv_control,
     _expect_window_left,
     _normalize_logits_soft_cap,
     resolve_config_key,
@@ -205,6 +206,8 @@ def resolve_paged_attention(
     logits_soft_cap: Optional[float] = None,
     custom_mask: bool = False,
     sinks: bool = False,
+    fixed_split_size: Optional[int] = None,
+    disable_split_kv: bool = False,
     max_q_len: Optional[int] = None,
     backend: str = "auto",
 ) -> Resolution:
@@ -215,9 +218,10 @@ def resolve_paged_attention(
     neither ``device`` nor ``cc_major`` is given); with only ``cc_major`` it
     is pinned to that compute-capability major and to no device.
 
-    ``logits_soft_cap`` / ``custom_mask`` / ``sinks`` declare the features the
-    plans will use; a backend that cannot apply one is excluded (with the
-    reason) rather than dropping it silently.
+    ``logits_soft_cap`` / ``custom_mask`` / ``sinks`` / ``fixed_split_size`` /
+    ``disable_split_kv`` declare the features the plans will use; a backend
+    that cannot apply one is excluded (with the reason) rather than dropping
+    it silently.
 
     ``max_q_len`` is an optional shape hint: the batches planned with this
     Resolution have at most this many query tokens per request.  It is pinned
@@ -249,6 +253,7 @@ def resolve_paged_attention(
     _expect_max_q_len_hint(max_q_len)
     logits_soft_cap = _normalize_logits_soft_cap(logits_soft_cap)
     custom_mask, sinks = bool(custom_mask), bool(sinks)
+    _expect_split_kv_control(fixed_split_size, disable_split_kv)
 
     order = heuristic_order(cc_major, max_q_len)
     autotune = backend == "autotune"
@@ -284,6 +289,7 @@ def resolve_paged_attention(
             logits_soft_cap=logits_soft_cap,
             use_custom_mask=custom_mask,
             use_sinks=sinks,
+            split_kv_control=fixed_split_size is not None or disable_split_kv,
         )
         if (
             reason is None
@@ -321,6 +327,8 @@ def resolve_paged_attention(
             logits_soft_cap,
             custom_mask,
             sinks,
+            fixed_split_size,
+            disable_split_kv,
             max_q_len,
             cc_major,
             cc_minor,

@@ -107,9 +107,10 @@ argument reference.
 - **Resolve.** `resolve_paged_attention` answers at engine init which
   backends can run a configuration and why the others cannot.
 - **Plan.** `plan()` declares the LSE base (`lse_mode`) and the feature axes
-  (`window_left`, `logits_soft_cap`, `custom_mask`, `use_sinks`), each
-  capability-checked so `backend="auto"` excludes a backend that cannot apply
-  one instead of dropping it.
+  (`window_left`, `logits_soft_cap`, `custom_mask`, `use_sinks`,
+  `fixed_split_size` / `disable_split_kv`), each capability-checked so
+  `backend="auto"` excludes a backend that cannot apply one instead of
+  dropping it.
 - **Run.** `run()` takes the per-layer `sm_scale`, the `sinks` tensor when
   planned, and the per-tensor `k_scale` / `v_scale` (dequantization scales of
   an fp8 e4m3 / e5m2 KV cache, plain multipliers of a fp16 / bf16 one;
@@ -157,6 +158,43 @@ candidate set in which none fits, raises a `ValueError` naming the required
 bytes (`backend 'fa2' cannot plan this batch: needs N bytes of scratch
 workspace ...`).
 
+### Split-KV control
+
+`plan(fixed_split_size=S)` and `plan(disable_split_kv=True)` are the legacy
+wrapper's arguments of the same names. The fa2 planner splits a request's KV
+range across kernel blocks and merges the partial results; by default it
+chooses the chunk size from the whole batch, so the last bits of a request's
+output depend on the other requests. `fixed_split_size` fixes the chunk at
+`S` pages; `disable_split_kv` never splits.
+
+- Only fa2 takes them. Pass the same values to `resolve_paged_attention`:
+  every other backend is then excluded with the reason, and `auto` plans on
+  fa2.
+- The two are mutually exclusive, and `fixed_split_size` must be a positive
+  Python int.
+- On a CUDA-graph instance `disable_split_kv` works and is frozen by the
+  first plan; `fixed_split_size` is rejected (whether a batch is split would
+  depend on its KV lengths, and a captured graph launches what the first
+  plan decided).
+- A `fixed_split_size` plan can need more scratch workspace than the default
+  bound; `workspace_requirements()` takes the same two arguments.
+
+Measured on GB200 through this API (bf16, head dim 128, page size 16;
+request 0 of a batch against the same request in a prefix of the batch):
+
+| batch and prefix | query tile (batch / prefix) | default | `disable_split_kv` | `fixed_split_size` 8 / 64 |
+| --- | --- | --- | --- | --- |
+| 4 x (q 128, kv 4096), first 2 | 128 / 128 | differs | bitwise equal | bitwise equal |
+| q 64 x 3 over kv 4096 / 300 / 9000, first 1 | 128 / 128 | differs | bitwise equal | bitwise equal |
+| q 40 / 700 / 3 over kv 3000 / 700 / 8000, first 2 | 128 / 128 | differs | bitwise equal | bitwise equal |
+| q 8 / 200 over kv 2048, first 1 | 128 / 64 | differs | differs | differs |
+| q 200 and 15 x q 1 over kv 2048, first 1 | 64 / 128 | differs | differs | differs |
+
+The differences are in the last bits (at most 2e-3 here; every run is within
+the oracle tolerance). So the controls make a request's output independent
+of the batch as long as the planner gives the batches the same query tile.
+See "Limitations" for what decides the tile.
+
 ### Tensor layout and argument types
 
 `run()` takes `q` as any view that is dense along `head_dim`, stored
@@ -184,6 +222,16 @@ NaN or Inf there reaches the output as `0 * NaN` (design doc, known
 limitation M23). Any finite content — stale tokens, zeros — gives the exact
 result; a KV pool allocated with `torch.empty` and never written past
 `kv_len` is not covered by that guarantee until its storage is initialised.
+
+`fixed_split_size` and `disable_split_kv` do not fix the fa2 query tile, so
+they give bitwise batch invariance only across batches planned with the same
+tile (design doc, known limitation M24). An eager plan derives the tile from
+the batch's average `q_len * (num_qo_heads // num_kv_heads)`: 128 above 64
+packed rows (64 at head dim 256), 64 above 16, otherwise 16 or 64 by the
+device's shared memory; head dim 512 uses 16 and 32. A CUDA-graph instance
+derives it from its capacity, the same for every re-plan. The stable
+wrapper's `batch_invariant=True` class is a separate mechanism and is not
+reachable through this API.
 
 cuDNN finalizes one execution plan per declared shape (about 5 ms), so an
 eager cuDNN plan declares a shape class instead of the batch's exact maxes,
@@ -532,7 +580,7 @@ python benchmarks/bench_paged_attention.py \
 
 `tests/experimental/paged_attention/` holds the suites of this API
 (`test_paged_attention_*.py`: contract, selection, auto policy, autotune,
-CUDA graphs, feature axes, strides, workspace, the benchmark script
-and a fuzzer of valid and corrupted inputs) and the legacy wrapper's suites
+CUDA graphs, feature axes, the split-KV control, strides, workspace, the
+benchmark script and a fuzzer of valid and corrupted inputs) and the legacy wrapper's suites
 converted to it (`test_legacy_unified_*.py`). Results are checked against the
 fp32 oracle in `paged_attention_reference.py`.
