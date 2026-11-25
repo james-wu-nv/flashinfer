@@ -55,8 +55,9 @@ LEGACY_MAP = [
         ["test_attention_ts_context_public_surfaces_hide_internal_tuning"],
         "partial",
         "the same forbidden-token scan over the PagedAttention / metadata / resolve "
-        "/ GraphCapacity signatures; 'backend' is allowed (the unified selection "
-        "axis)",
+        "/ GraphCapacity signatures; 'backend' (the unified selection axis) and "
+        "the split-KV controls 'fixed_split_size' / 'disable_split_kv' (legacy "
+        "BatchPrefillWithPagedKVCacheWrapper.plan() arguments) are allowed",
     ),
     (
         "tests/attention/test_attention_ts_context.py::test_attention_ts_context_paged_wrapper_has_no_workspace_api",
@@ -805,9 +806,10 @@ def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
         "use_cluster_smem_reduction",
         "use_tensor_cores",
     }
-    # the unified selection axis (design doc "Backend selection") is the one
-    # legacy-forbidden name the unified API carries on purpose
-    allowed_exact_names = {"backend"}
+    # legacy-forbidden names the unified API carries on purpose: the selection
+    # axis (design doc "Backend selection") and the two split-KV controls of
+    # the legacy paged wrapper's plan() (design doc "Feature axes")
+    allowed_exact_names = {"backend", "fixed_split_size", "disable_split_kv"}
     violations = []
     for surface in surfaces:
         for parameter in inspect.signature(surface).parameters.values():
