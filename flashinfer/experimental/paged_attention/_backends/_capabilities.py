@@ -50,7 +50,7 @@ def _workspace_too_small(need: int, available: int) -> str:
         f"needs {need} bytes of scratch workspace for this batch but the "
         f"workspace buffer holds {available} bytes; size a "
         "caller-owned buffer with PagedAttention.workspace_requirements(...) "
-        "and pass it as PagedAttention(workspace_buffer=...)"
+        "and pass it to PagedAttention(workspace_buffer, ...)"
     )
 
 

@@ -40,13 +40,11 @@ below are those of `flashinfer/_paged_attention.py` at the integration head.
 +logger.info_once(self._prefill_resolution.explain())   # per-backend reasons
 +
 +# Eager instance, constructed ONCE (per-build construction would redo backend
-+# setup every scheduler step).  Pass the workspace vLLM already shares with
-+# its legacy wrappers; without it every instance on the device shares one
-+# 512 MiB library pool (PagedAttention.workspace_requirements() bounds the
-+# need of a bucket; ledger M14).
-+self._prefill_attn = PagedAttention(
-+    self.device, workspace_buffer=self._get_workspace_buffer()
-+)
++# setup every scheduler step).  The workspace is required, as for the legacy
++# wrappers: pass the one vLLM already shares with them
++# (PagedAttention.workspace_requirements() bounds the need of a bucket;
++# ledger M14).
++self._prefill_attn = PagedAttention(self._get_workspace_buffer())
 ```
 
 Deletes on the prefill side: the `prefill_use_trtllm` predicate
@@ -150,8 +148,7 @@ cap = GraphCapacity(
     page_size=page_size,
     table_width=block_table_width,
 )
-attn = PagedAttention(self.device, graph_capacity=cap,
-                      workspace_buffer=self._get_workspace_buffer())
+attn = PagedAttention(self._get_workspace_buffer(), graph_capacity=cap)
 attn.plan(md_capture, ..., backend=self._prefill_resolution)   # freezes backend + semantics
 with torch.cuda.graph(g):
     attn.run(q_buf, (k_cache, v_cache), out=out_buf, sinks=..., sm_scale=self.scale)

@@ -170,7 +170,7 @@ def test_attention_sink(
         max_q_len=seq_len,
         max_kv_len=seq_len,
     )
-    attn = PagedAttention(device, workspace_buffer=float_workspace_buffer)
+    attn = PagedAttention(float_workspace_buffer)
     attn.plan(
         metadata,
         num_qo_heads=num_qo_heads,
@@ -230,7 +230,7 @@ def test_attention_sink(
             max_q_len=seq_len,
             max_kv_len=seq_len,
         )
-        attn_frag = PagedAttention(device, workspace_buffer=float_workspace_buffer)
+        attn_frag = PagedAttention(float_workspace_buffer)
         attn_frag.plan(
             metadata_frag,
             num_qo_heads=num_qo_heads,
@@ -388,7 +388,7 @@ def test_attention_sink_incremental_generation(
             max_q_len=1,
             max_kv_len=current_kv_len,
         )
-        attn = PagedAttention(device, workspace_buffer=float_workspace_buffer)
+        attn = PagedAttention(float_workspace_buffer)
         attn.plan(
             metadata,
             num_qo_heads=num_qo_heads,
@@ -451,7 +451,7 @@ def test_attention_sink_incremental_generation(
                 max_q_len=1,
                 max_kv_len=current_kv_len,
             )
-            attn_frag = PagedAttention(device, workspace_buffer=float_workspace_buffer)
+            attn_frag = PagedAttention(float_workspace_buffer)
             attn_frag.plan(
                 metadata_frag,
                 num_qo_heads=num_qo_heads,
@@ -602,7 +602,7 @@ def test_attention_sink_chunk_prefill(
         max_q_len=chunk_size,
         max_kv_len=total_kv_len,
     )
-    attn = PagedAttention(device, workspace_buffer=float_workspace_buffer)
+    attn = PagedAttention(float_workspace_buffer)
     attn.plan(
         metadata,
         num_qo_heads=num_qo_heads,
@@ -664,7 +664,7 @@ def test_attention_sink_chunk_prefill(
             max_q_len=chunk_size,
             max_kv_len=total_kv_len,
         )
-        attn_frag = PagedAttention(device, workspace_buffer=float_workspace_buffer)
+        attn_frag = PagedAttention(float_workspace_buffer)
         attn_frag.plan(
             metadata_frag,
             num_qo_heads=num_qo_heads,
@@ -823,7 +823,7 @@ def test_attention_sink_varlen(
         max_q_len=max_q_len,
         max_kv_len=max_kv_len,
     )
-    attn = PagedAttention(device, workspace_buffer=float_workspace_buffer)
+    attn = PagedAttention(float_workspace_buffer)
     attn.plan(
         metadata,
         num_qo_heads=num_qo_heads,
@@ -885,7 +885,7 @@ def test_attention_sink_varlen(
             max_q_len=max_q_len,
             max_kv_len=max_kv_len,
         )
-        attn_frag = PagedAttention(device, workspace_buffer=float_workspace_buffer)
+        attn_frag = PagedAttention(float_workspace_buffer)
         attn_frag.plan(
             metadata_frag,
             num_qo_heads=num_qo_heads,

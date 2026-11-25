@@ -29,7 +29,7 @@ from flashinfer.prefill import (
     resolve_paged_attention,
 )
 
-from .paged_attention_reference import reference_paged_prefill
+from .paged_attention_reference import reference_paged_prefill, scratch_workspace
 from .test_paged_attention_coverage import build_problem
 from .test_paged_attention_prototype import LSE_TOL, OUT_TOL, make_metadata
 
@@ -119,7 +119,7 @@ def _plan_kw(p, **extra):
 
 
 def _run(p, *, sinks=None, attn=None, **plan_extra):
-    attn = attn or PagedAttention(DEVICE)
+    attn = attn or PagedAttention(scratch_workspace(DEVICE))
     attn.plan(
         make_metadata(p), **_plan_kw(p, use_sinks=sinks is not None, **plan_extra)
     )
@@ -378,7 +378,7 @@ def test_split_kv_control_excludes_the_other_backends(control):
         if name != "fa2":
             assert "split-KV control" in res.excluded[name]
             with pytest.raises(ValueError, match="split-KV control"):
-                PagedAttention(DEVICE).plan(
+                PagedAttention(scratch_workspace(DEVICE)).plan(
                     make_metadata(p), **_plan_kw(p, backend=name, **control)
                 )
 
@@ -401,7 +401,7 @@ def test_split_kv_control_is_part_of_the_pinned_resolution():
     )
     plain = resolve_paged_attention(**resolve_kw)
     pinned = resolve_paged_attention(**resolve_kw, fixed_split_size=8)
-    attn = PagedAttention(DEVICE)
+    attn = PagedAttention(scratch_workspace(DEVICE))
     # a Resolution resolved without the control does not cover a plan with it,
     # nor the other way round, nor another split size
     for res, control in (
@@ -441,7 +441,7 @@ def test_disable_split_kv_under_cuda_graph():
     requests; the first plan freezes the argument."""
     a = _problem((64, 100, 30), (2000, 500, 3000), seed=37)
     b = _view(a, (64, 80, 50), (2000, 300, 1000))
-    attn = PagedAttention(DEVICE, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(DEVICE), use_cuda_graph=True)
     q, k, v = a["q"], a["k_cache"], a["v_cache"]
     out = torch.empty_like(q)
     lse = torch.empty(q.shape[0], a["num_qo_heads"], dtype=torch.float32, device=DEVICE)
@@ -473,7 +473,7 @@ def test_fixed_split_size_is_rejected_under_cuda_graph():
     captured graph launches what the first plan decided: refused, on a first
     plan (which leaves no capacity behind) and on a re-plan."""
     p = _problem((64, 100, 30), (2000, 500, 3000), seed=41)
-    attn = PagedAttention(DEVICE, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(DEVICE), use_cuda_graph=True)
     with pytest.raises(ValueError, match="fixed_split_size=8 with use_cuda_graph=True"):
         attn.plan(make_metadata(p), **_plan_kw(p, fixed_split_size=8))
     assert attn.backend is None
@@ -527,9 +527,7 @@ def _planner_float_bytes(p, *, window_left=-1, **control):
 def _need_via_plan(p, *, window_left=-1, **control):
     """The per-batch need of the plan-time check, read from the ValueError a
     16-byte buffer provokes; 0 when the plan goes through on 16 bytes."""
-    attn = PagedAttention(
-        DEVICE, workspace_buffer=torch.empty(16, dtype=torch.uint8, device=DEVICE)
-    )
+    attn = PagedAttention(torch.empty(16, dtype=torch.uint8, device=DEVICE))
     try:
         attn.plan(make_metadata(p), **_plan_kw(p, window_left=window_left, **control))
     except ValueError as exc:
@@ -590,16 +588,11 @@ def test_split_kv_control_and_workspace_requirements():
 
     # a buffer of the bound, and one of exactly the planner's bytes, plan and run
     for nbytes in (fixed, need):
-        attn = PagedAttention(
-            DEVICE,
-            workspace_buffer=torch.empty(nbytes, dtype=torch.uint8, device=DEVICE),
-        )
+        attn = PagedAttention(torch.empty(nbytes, dtype=torch.uint8, device=DEVICE))
         _, out, lse = _run(p, attn=attn, fixed_split_size=1)
         _assert_matches(out, lse, _reference(p))
     # the bound computed without the argument does not cover the plan
-    small = PagedAttention(
-        DEVICE, workspace_buffer=torch.empty(default, dtype=torch.uint8, device=DEVICE)
-    )
+    small = PagedAttention(torch.empty(default, dtype=torch.uint8, device=DEVICE))
     with pytest.raises(ValueError, match=rf"needs {need} bytes of scratch workspace"):
         small.plan(make_metadata(p), **_plan_kw(p, fixed_split_size=1))
 
@@ -607,9 +600,7 @@ def test_split_kv_control_and_workspace_requirements():
     assert _requirements(p, disable_split_kv=True) == 0
     assert _requirements(p, disable_split_kv=True, use_cuda_graph=True) == 0
     assert _planner_float_bytes(p, disable_split_kv=True) == 0
-    tiny = PagedAttention(
-        DEVICE, workspace_buffer=torch.empty(16, dtype=torch.uint8, device=DEVICE)
-    )
+    tiny = PagedAttention(torch.empty(16, dtype=torch.uint8, device=DEVICE))
     _, out, lse = _run(p, attn=tiny, disable_split_kv=True)
     _assert_matches(out, lse, _reference(p))
 

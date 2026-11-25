@@ -181,7 +181,7 @@ def test_cudnn_prefill(
         max_q_len=s_qo,
         max_kv_len=s_kv,
     )
-    attn = PagedAttention(torch.device(device), workspace_buffer=workspace_buffer)
+    attn = PagedAttention(workspace_buffer)
     attn.plan(
         metadata,
         num_qo_heads=num_qo_heads,

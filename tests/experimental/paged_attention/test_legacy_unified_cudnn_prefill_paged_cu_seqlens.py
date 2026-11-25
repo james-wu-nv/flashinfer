@@ -191,7 +191,7 @@ def test_cudnn_paged_prefill_token_offsets_match_legacy(
             return direct
 
         monkeypatch.setattr(cudnn_prefill, "_cudnn_supports_paged_token_offsets", gate)
-        attn = PagedAttention(torch.device(device), workspace_buffer=ws)
+        attn = PagedAttention(ws)
         attn.plan(
             md,
             num_qo_heads=num_qo_heads,

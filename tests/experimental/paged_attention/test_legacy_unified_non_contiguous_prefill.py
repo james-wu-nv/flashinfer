@@ -124,7 +124,7 @@ def test_batch_paged_prefill_packed_input(
         max_q_len=seq_len,
         max_kv_len=seq_len,
     )
-    attn = PagedAttention(torch.device("cuda:0"), workspace_buffer=workspace_buffer)
+    attn = PagedAttention(workspace_buffer)
     attn.plan(
         metadata,
         num_qo_heads=num_qo_heads,

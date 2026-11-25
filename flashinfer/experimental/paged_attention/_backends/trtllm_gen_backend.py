@@ -7,9 +7,8 @@ from); the only derivations are cum_kv_seq_lens and the bmm scale fold
 (bmm1 = sm_scale * k_scale, bmm2 = v_scale; 1.0 for an omitted scale).
 Attention sinks are a native run-time argument.
 
-Buffers: the controller's scratch workspace (the per-device default or the
-caller's buffer) is ordinary softmax-stats/scratch and is the shared
-one every backend runs on (the legacy wrapper's trtllm-gen branch uses its
+Buffers: the controller's scratch workspace (the caller's buffer) is
+ordinary softmax-stats/scratch and is the one every backend runs on (the legacy wrapper's trtllm-gen branch uses its
 shared float workspace the same way).  The kernel's multi-CTA KV
 *counters* are the only thing that must be zero-initialized; they live in a
 separate KB-sized buffer this backend owns and passes explicitly, sized at
@@ -33,7 +32,7 @@ from ._capabilities import _BackendPlanUnsupportedError, _workspace_too_small
 # capability table declares the same set, each measured on B200).
 _KERNEL_PAGE_SIZES = frozenset({16, 32, 64, 128, 256, 512, 1024})
 
-# Scratch the context launcher carves out of the shared workspace
+# Scratch the context launcher carves out of the workspace
 # (csrc/trtllm_fmha_kernel_launcher.cu, trtllm_paged_attention_launcher):
 # only with an LSE output, the softmax-stats buffer of
 # float2[num_qo_heads, batch_size, round_up(max_q_len, 256)] plus a 1 MiB
@@ -54,7 +53,7 @@ class _TrtllmGenBackend:
 
     def __init__(self, device, kv_layout, workspace, backend: str = "trtllm-gen"):
         self.name = backend  # "trtllm-gen" or "cake"
-        self._workspace = workspace  # the controller's shared scratch
+        self._workspace = workspace  # the controller's scratch
         self._kv_layout = kv_layout
         self._device = device
         self._sm_count: Optional[int] = None

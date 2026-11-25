@@ -20,6 +20,7 @@ from flashinfer.experimental.paged_attention import GraphCapacity
 from flashinfer.experimental.paged_attention import _auto_policy
 from flashinfer.prefill import PagedAttention, resolve_paged_attention
 
+from .paged_attention_reference import scratch_workspace
 from .test_paged_attention_prototype import (
     LSE_TOL,
     OUT_TOL,
@@ -107,7 +108,7 @@ def _workload(**changes):
 @needs_cuda
 def test_out_is_required(tuner):
     p, res, md, order = _setup(139)
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     attn.plan(md, backend=res, **_plan_kw(p))
     with pytest.raises(ValueError, match="out must be provided"):
         attn.run(p["q"], (p["k_cache"], p["v_cache"]))
@@ -226,7 +227,7 @@ def _setup(seed, input_form="block_tables"):
     md = make_metadata(p)
     # the order the auto policy walks this batch in: what autotune measures
     # over, and what it falls back to
-    auto = PagedAttention(torch.device(p["device"]))
+    auto = PagedAttention(scratch_workspace(torch.device(p["device"])))
     auto.plan(md, backend=dataclasses.replace(res, autotune=False), **_plan_kw(p))
     order = auto._impl.selection_order
     assert set(order) == set(res.backends)
@@ -261,7 +262,7 @@ def test_first_run_measures_every_accepting_candidate(tuner, monkeypatch):
     p, res, md, order = _setup(101)
     winner = order[-1]  # not the heuristic head: the measurement decides
     timed = _rank(tuner, monkeypatch, winner)
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     with flashinfer.autotune(True):
         attn.plan(md, backend=res, **_plan_kw(p))
         # every candidate accepted and planned; the head is provisional
@@ -295,9 +296,11 @@ def test_real_profiling_times_every_candidate(tuner, graph):
     p, res, md, order = _setup(151)
     dev = torch.device(p["device"])
     attn = (
-        PagedAttention(dev, graph_capacity=GraphCapacity.from_metadata(md))
+        PagedAttention(
+            scratch_workspace(dev), graph_capacity=GraphCapacity.from_metadata(md)
+        )
         if graph
-        else PagedAttention(dev)
+        else PagedAttention(scratch_workspace(dev))
     )
     with flashinfer.autotune(True):
         attn.plan(md, backend=res, **_plan_kw(p))
@@ -334,7 +337,7 @@ def test_caller_buffers_are_written_once_by_the_winner(tuner, monkeypatch):
 
     for backend_cls in {_CLASSES[n] for n in order}:
         spy(backend_cls)
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     with flashinfer.autotune(True):
         attn.plan(md, backend=res, **_plan_kw(p))
         attn.run(p["q"], (p["k_cache"], p["v_cache"]), out=out, lse=lse)
@@ -352,7 +355,7 @@ def test_a_cached_result_selects_without_profiling(
     winner = order[-1]
     _rank(tuner, monkeypatch, winner)
     cache = str(tmp_path / "paged-attention-autotune.json")
-    first = PagedAttention(torch.device(p["device"]))
+    first = PagedAttention(scratch_workspace(torch.device(p["device"])))
     with flashinfer.autotune(True, cache=cache):
         first.plan(md, backend=res, **_plan_kw(p))
         _run(first, p)
@@ -365,7 +368,7 @@ def test_a_cached_result_selects_without_profiling(
     monkeypatch.setattr(tuner, "choose_one", _forbidden)
     # the same workload on a fresh instance, by name, with other query values
     q = dict(p, q=p["q"] * 0.5)
-    second = PagedAttention(torch.device(p["device"]))
+    second = PagedAttention(scratch_workspace(torch.device(p["device"])))
     with flashinfer.autotune(False, cache=cache if source == "disk" else None):
         second.plan(make_metadata(q), backend="autotune", **_plan_kw(q))
         # the plan still prepares every candidate; the first run() selects
@@ -381,7 +384,7 @@ def test_a_cached_result_selects_without_profiling(
 def test_a_miss_outside_the_context_raises(tuner, monkeypatch):
     p, res, md, order = _setup(113)
     monkeypatch.setattr(tuner, "choose_one", _forbidden)
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     attn.plan(md, backend=res, **_plan_kw(p))
     with pytest.raises(RuntimeError, match="No cached PagedAttention autotune result"):
         _run(attn, p)
@@ -397,7 +400,7 @@ def test_a_miss_outside_the_context_raises(tuner, monkeypatch):
 def test_another_workload_is_not_a_cache_hit(tuner, monkeypatch):
     p, res, md, order = _setup(109)
     _rank(tuner, monkeypatch, order[-1])
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     with flashinfer.autotune(True):
         attn.plan(md, backend=res, **_plan_kw(p))
         _run(attn, p)
@@ -410,7 +413,7 @@ def test_another_workload_is_not_a_cache_hit(tuner, monkeypatch):
 @needs_cuda
 def test_skipped_profiling_is_an_error(tuner):
     p, res, md, order = _setup(127)
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     with flashinfer.autotune(True, skip_ops={_auto_policy._OP}):
         attn.plan(md, backend=res, **_plan_kw(p))
         with pytest.raises(RuntimeError, match="produced no measured selection"):
@@ -421,7 +424,7 @@ def test_skipped_profiling_is_an_error(tuner):
 @needs_cuda
 def test_profiling_is_refused_under_capture(tuner, monkeypatch):
     p, res, md, order = _setup(131)
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     with flashinfer.autotune(True):
         attn.plan(md, backend=res, **_plan_kw(p))
         with monkeypatch.context() as capturing:
@@ -450,7 +453,7 @@ def test_graph_mode_freezes_the_measured_winner(tuner, monkeypatch, input_form, 
     _rank(tuner, monkeypatch, winner)
     dev = torch.device(p["device"])
     cap = GraphCapacity.from_metadata(md)
-    g = PagedAttention(dev, graph_capacity=cap)
+    g = PagedAttention(scratch_workspace(dev), graph_capacity=cap)
     q_buf = p["q"].clone()
     out_buf = torch.empty(
         q_buf.shape[0],
@@ -491,11 +494,13 @@ def test_graph_mode_cached_result_freezes_at_the_first_run(tuner, monkeypatch):
     dev = torch.device(p["device"])
     cap = GraphCapacity.from_metadata(md)
     with flashinfer.autotune(True):
-        first = PagedAttention(dev, graph_capacity=cap)
+        first = PagedAttention(scratch_workspace(dev), graph_capacity=cap)
         first.plan(md, backend=res, **_plan_kw(p))
         _run(first, p)
     monkeypatch.setattr(tuner, "choose_one", _forbidden)
-    second = PagedAttention(dev, graph_capacity=dataclasses.replace(cap))
+    second = PagedAttention(
+        scratch_workspace(dev), graph_capacity=dataclasses.replace(cap)
+    )
     second.plan(md, backend=res, **_plan_kw(p))
     with pytest.raises(RuntimeError, match="autotune selection is open"):
         second.plan(md, backend=res, **_plan_kw(p))

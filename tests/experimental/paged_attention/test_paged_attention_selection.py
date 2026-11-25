@@ -28,6 +28,7 @@ from flashinfer.experimental.paged_attention._backends._capabilities import (
 )
 from flashinfer.prefill import PagedAttention, resolve_paged_attention
 
+from .paged_attention_reference import scratch_workspace
 from .test_paged_attention_prototype import (
     _resolve_or_skip,
     make_metadata,
@@ -136,7 +137,7 @@ def test_plan_rejects_a_resolution_pinned_elsewhere():
     res = _resolve_or_skip(p, "auto")
     major, minor, index = res.device_binding
     md = make_metadata(p)
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     plan_kw = dict(
         num_qo_heads=p["num_qo_heads"],
         num_kv_heads=p["num_kv_heads"],
@@ -208,7 +209,7 @@ def _plan_time_order(p, res):
     """The order plan() walks ``res``'s candidates in for this batch: the
     auto policy ranks the pinned set per batch, so it need not be
     ``res.backends``."""
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     attn.plan(make_metadata(p), backend=res, **_plan_kw(p))
     return attn._impl.selection_order
 
@@ -225,7 +226,7 @@ def test_typed_unsupported_moves_to_the_next_candidate(monkeypatch):
         first,
         _BackendPlanUnsupportedError("injected: cannot do this batch"),
     )
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     attn.plan(make_metadata(p), backend=res, **_plan_kw(p))
     assert attn.backend == second
     trace = attn._impl.selection_trace
@@ -243,7 +244,7 @@ def test_other_exceptions_from_a_candidate_are_not_swallowed(monkeypatch):
     res = _resolve_or_skip(p, "auto")
     first = _plan_time_order(p, res)[0]
     _inject_preflight(monkeypatch, first, ValueError("boom: not a fallback"))
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     with pytest.raises(ValueError, match="boom: not a fallback"):
         attn.plan(make_metadata(p), backend=res, **_plan_kw(p))
     assert attn.backend is None
@@ -257,7 +258,7 @@ def test_explicit_backend_never_falls_back(monkeypatch):
     p = make_problem(seed=79, **_SHAPE)
     _resolve_or_skip(p, "fa2")
     _inject_preflight(monkeypatch, "fa2", _BackendPlanUnsupportedError("declined"))
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     with pytest.raises(ValueError, match="'fa2' cannot plan this batch: declined"):
         attn.plan(make_metadata(p), backend="fa2", **_plan_kw(p))
     # a Resolution whose every member declines: ValueError with the trace
@@ -276,7 +277,9 @@ def test_graph_replan_publishes_the_frozen_backend_alone(monkeypatch):
     res = _resolve_or_skip(p, "auto")
     if len(res.backends) < 2:
         pytest.skip("needs two runnable candidates")
-    attn = PagedAttention(torch.device(p["device"]), use_cuda_graph=True)
+    attn = PagedAttention(
+        scratch_workspace(torch.device(p["device"])), use_cuda_graph=True
+    )
     attn.plan(make_metadata(p), **_plan_kw(p))
     impl, frozen = attn._impl, attn.backend
     # the first plan could choose from the whole set
@@ -332,7 +335,8 @@ def test_preflight_runs_before_any_reserved_buffer_write(monkeypatch):
     # (the graph-lifecycle rule), which is checked in the cuda_graph suite.
     md = make_metadata(p)
     attn = PagedAttention(
-        torch.device(p["device"]), graph_capacity=GraphCapacity.from_metadata(md)
+        scratch_workspace(torch.device(p["device"])),
+        graph_capacity=GraphCapacity.from_metadata(md),
     )
     with pytest.raises(ValueError, match="no pinned candidate"):
         attn.plan(md, backend=res, **_plan_kw(p))
@@ -473,7 +477,7 @@ def test_no_hint_keeps_the_default_order_and_plan_ranks_from_the_batch():
         need_lse=True,
         max_q_len=1,
     )
-    attn = PagedAttention(dev)
+    attn = PagedAttention(scratch_workspace(dev))
     attn.plan(make_metadata(p), backend=res_hint, **_plan_kw(p))
     hinted = attn.backend
     assert hinted == attn._impl.selection_order[0]
@@ -511,7 +515,7 @@ def test_plan_rejects_a_batch_above_the_hint():
         )
 
     md = make_metadata(p)
-    attn = PagedAttention(dev)
+    attn = PagedAttention(scratch_workspace(dev))
     with pytest.raises(ValueError, match=r"max_q_len \d+ of this batch exceeds"):
         attn.plan(md, backend=resolve(1), **_plan_kw(p))
     assert attn.backend is None
@@ -520,7 +524,7 @@ def test_plan_rejects_a_batch_above_the_hint():
     # graph mode: the CAPACITY is what the kernels are planned with, so it is
     # what the hint is checked against, and nothing is reserved on rejection
     cap = GraphCapacity.from_metadata(md)
-    g = PagedAttention(dev, graph_capacity=cap)
+    g = PagedAttention(scratch_workspace(dev), graph_capacity=cap)
     with pytest.raises(ValueError, match="of this graph capacity exceeds"):
         g.plan(md, backend=resolve(1), **_plan_kw(p))
     assert g.backend is None

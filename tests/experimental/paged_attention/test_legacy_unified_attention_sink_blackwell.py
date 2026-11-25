@@ -130,7 +130,7 @@ def test_blackwell_trtllm_gen_context_attention_sink(
         max_q_len=seq_len,
         max_kv_len=seq_len,
     )
-    attn = PagedAttention(torch.device(device), workspace_buffer=workspace_buffer)
+    attn = PagedAttention(workspace_buffer)
     attn.plan(
         metadata,
         num_qo_heads=num_qo_heads,

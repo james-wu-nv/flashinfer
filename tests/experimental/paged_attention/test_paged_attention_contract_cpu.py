@@ -873,7 +873,7 @@ def test_metadata_constructor_rejects_cpu_tensors_and_paging_form_errors():
 
 
 def test_controller_rejects_calls_before_plan_without_cuda():
-    ctl = PagedAttentionController(torch.device("cpu"))
+    ctl = PagedAttentionController(torch.empty(64, dtype=torch.uint8))
     assert ctl.backend is None and ctl.resolution is None
     z = torch.zeros(1)
     with pytest.raises(ValueError, match="before plan"):
@@ -982,7 +982,7 @@ def test_plan_checks_head_counts_alike_on_every_backend_path(
     by the auto policy on the plans that happen to rank -- and before
     anything is resolved or published."""
     backend = {"auto": "auto", "named": "fa2", "pinned": _resolve(10, **_HEADS)}[path]
-    ctl = PagedAttentionController(torch.device("cpu"))
+    ctl = PagedAttentionController(torch.empty(64, dtype=torch.uint8))
     kwargs = dict(_HEADS, head_dim_qk=128, q_dtype=torch.bfloat16, lse_mode="base2")
     kwargs.update(heads)
     with pytest.raises(ValueError, match=match) as error:
@@ -1008,17 +1008,19 @@ def test_auto_candidates_take_any_unit_inner_stride_query():
 
 
 def test_public_class_validates_workspace_buffer_without_cuda():
-    dev = torch.device("cpu")
-    PagedAttention(dev, workspace_buffer=torch.empty(64, dtype=torch.uint8))
-    PagedAttention(dev, workspace_buffer=torch.empty(64, dtype=torch.int8))
+    # the instance runs on the buffer's device
+    assert PagedAttention(torch.empty(64, dtype=torch.uint8)).device.type == "cpu"
+    PagedAttention(torch.empty(64, dtype=torch.int8))
+    with pytest.raises(TypeError, match="workspace_buffer"):
+        PagedAttention()  # required: the library allocates no workspace
     with pytest.raises(ValueError, match="1-D"):
-        PagedAttention(dev, workspace_buffer=torch.empty(4, 4, dtype=torch.uint8))
+        PagedAttention(torch.empty(4, 4, dtype=torch.uint8))
     with pytest.raises(ValueError, match="uint8"):
-        PagedAttention(dev, workspace_buffer=torch.empty(16, dtype=torch.float32))
+        PagedAttention(torch.empty(16, dtype=torch.float32))
     with pytest.raises(ValueError, match="torch.Tensor"):
-        PagedAttention(dev, workspace_buffer=1 << 20)
+        PagedAttention(1 << 20)
     with pytest.raises(ValueError, match="1-D"):
-        PagedAttention(dev, workspace_buffer=torch.empty(64, dtype=torch.uint8)[::2])
+        PagedAttention(torch.empty(64, dtype=torch.uint8)[::2])
 
 
 # ---------------------------------------------------------------------------

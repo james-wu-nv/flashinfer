@@ -40,7 +40,7 @@ The plan/run flow is:
 flashinfer.prefill.resolve_paged_attention()        (engine init, tensor-free)
   -> Resolution: the candidate set + exclusion reasons, pinned to a device
 
-flashinfer.prefill.PagedAttention(device, graph_capacity=..., workspace_buffer=...)
+flashinfer.prefill.PagedAttention(workspace_buffer, graph_capacity=...)
   -> PagedAttentionMetadata.dense(...) / .csr(...)   (once per scheduler step)
   -> plan(metadata, **semantic kwargs, backend=Resolution | name | "auto")
        -> validate; pin against the Resolution or resolve now
@@ -173,8 +173,7 @@ plans over one batch derive once.
 ### `PagedAttention`
 
 ```python
-PagedAttention(device=None, *, graph_capacity=None, use_cuda_graph=False,
-               workspace_buffer=None)
+PagedAttention(workspace_buffer, *, graph_capacity=None, use_cuda_graph=False)
 .plan(metadata, *, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo=None,
       q_dtype, kv_dtype=None, kv_layout="HND", causal=True, window_left=-1,
       lse_mode="none", logits_soft_cap=None, custom_mask=None,
@@ -225,7 +224,7 @@ res = resolve_paged_attention(
     q_dtype=torch.bfloat16, page_size=16, kv_layout="HND",
     causal=True, need_lse=True,
 )
-attn = PagedAttention(device, workspace_buffer=engine_workspace)
+attn = PagedAttention(engine_workspace)
 
 for step in scheduler:
     md = PagedAttentionMetadata.dense(
@@ -247,7 +246,7 @@ from flashinfer.prefill import GraphCapacity
 
 cap = GraphCapacity(batch_size=256, total_q_tokens=1024, max_q_len=4,
                     max_kv_len=8192 * 16, page_size=16, table_width=8192)
-attn = PagedAttention(device, graph_capacity=cap, workspace_buffer=engine_workspace)
+attn = PagedAttention(engine_workspace, graph_capacity=cap)
 attn.plan(md0, num_qo_heads=32, num_kv_heads=8, head_dim_qk=128,
           q_dtype=torch.bfloat16, kv_layout="HND", causal=True,
           lse_mode="base2", backend=res)          # freezes backend + semantics
@@ -1350,17 +1349,19 @@ scales.
 ## Workspace
 
 Every backend runs on one plain scratch buffer, the role of the legacy
-wrappers' `float_workspace_buffer` (`_controller.py`, top of file). By
-default all instances on a device share one lazily allocated library-owned
-pool of `_WORKSPACE_BYTES = 512 MiB` (the upper end of what the engines
-allocate for the same kernels), so one instance per graph bucket costs no
-workspace per bucket. A caller may pass `workspace_buffer=`: a contiguous
-1-D `uint8` or `int8` tensor on the instance's device, viewed as `uint8`. The
+wrappers' `float_workspace_buffer` (`_controller.py`, top of file). It is
+caller-owned and required, as in the legacy wrappers and the MLA wrapper:
+`workspace_buffer` is the constructor's first argument, a contiguous 1-D
+`uint8` or `int8` tensor viewed as `uint8`, and the instance runs on its
+device. The library allocates no workspace of its own, so the bytes are in
+the engine's memory budget from init and are released with the engine's
+buffer. One buffer may back every instance (one per graph bucket costs no
+workspace per bucket). The
 generated-FA wrapper receives it as its float workspace; cuDNN views it as
 `int8`; trtllm-gen and cake use it as their softmax-stats scratch and keep a
 separate small zero-initialized multi-CTA counter buffer of their own.
 Instances sharing a workspace must not run concurrently on different streams;
-pass a private buffer where that isolation is needed.
+give each its own buffer where that isolation is needed.
 
 The fa2 split-KV planner is the only consumer whose need grows with the
 geometry (ledger M14). trtllm-gen and cake need the softmax-stats scratch of
@@ -1479,7 +1480,7 @@ and referred to by id elsewhere.
 
 | id | limitation | state |
 | --- | --- | --- |
-| M14 | The fa2 split-KV planner carves scratch that grows with the geometry (heads, head dim, SM count, and in graph mode the capacity's query tokens), so a bucket can need more than the buffer in use, the shared 512 MiB default included. | `PagedAttention.workspace_requirements()` bounds the need for sizing a caller-owned buffer. fa2 declines a batch that does not fit at `plan()` with the typed signal: `auto` moves on to the next candidate, a named backend raises `ValueError` naming the bytes. |
+| M14 | The fa2 split-KV planner carves scratch that grows with the geometry (heads, head dim, SM count, and in graph mode the capacity's query tokens), so a bucket can need more than the caller's buffer holds (the legacy wrappers' documented 128 MiB included). | `PagedAttention.workspace_requirements()` bounds the need for sizing the buffer. fa2 declines a batch that does not fit at `plan()` with the typed signal: `auto` moves on to the next candidate, a named backend raises `ValueError` naming the bytes. |
 | M24 | `fixed_split_size` / `disable_split_kv` fix the KV split, not the query tile. The fa2 planner derives the tile from the batch's average packed query length in eager mode (`FA2DetermineCtaTileQ`: thresholds at 16 and 64 packed rows below head dim 512) and from the capacity in graph mode, and the tile changes the last bits of a request's output. Measured on GB200 (bf16, head dim 128): with either control a request is bitwise the same in a batch and in a prefix of it when both plan the same tile, mixed KV and query lengths included; a request of 8 query tokens (8 query / 2 KV heads) planned alone (tile 64) and next to a 200-token request (tile 128) differs by up to 9.8e-4, both within the oracle tolerance. The planner is the one the legacy wrapper calls. | Documented; `tests/experimental/paged_attention/test_paged_attention_split_kv.py::test_split_kv_control_does_not_fix_the_query_tile` is an expected failure that fails once the two outputs are bitwise equal. Invariance across arbitrary batches needs the tile fixed too; the stable wrapper's `batch_invariant=True` class (`flashinfer/attention/batch_invariant/`) is a separate mechanism that this API does not reach. |
 | M15 | `flashinfer/cudnn/decode.py` keeps the older graph-cache key and decorator order that the prefill path fixed. | Out of this package; recorded. |
 | M16 | trtllm-gen and cake compute silently wrong results when the V cache's page stride differs from the K cache's (independently allocated pools); cuDNN and fa2 are correct. | Rejected at `run()` in the trtllm-gen backend (a `ValueError` naming the stride constraint); `tests/experimental/paged_attention/test_paged_attention_coverage.py::test_tc05_strided_inputs[trtllm-gen-kv_independent_strides]` pins it. |

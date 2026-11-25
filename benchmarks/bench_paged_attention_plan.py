@@ -5,7 +5,7 @@ script measures, on the experimental ``flashinfer.prefill.PagedAttention``:
 
   (a) ``PagedAttentionMetadata`` construction,
   (b) eager ``plan()`` on a fresh metadata object,
-  (c) graph-mode re-plan (``PagedAttention(use_cuda_graph=True)``, every plan
+  (c) graph-mode re-plan (``PagedAttention(workspace, use_cuda_graph=True)``, every plan
       after the first one, which fixes the capture shapes),
 
 as host time (the call alone; what an asynchronous plan() costs the engine)
@@ -270,7 +270,7 @@ def bench_cell(
 
     # (b) eager plan on a fresh metadata object each time (derivation is
     # cached per object, so reusing one object would measure nothing)
-    attn = PagedAttention(dev, workspace_buffer=workspace)
+    attn = PagedAttention(workspace)
     mds = [prob.metadata(form, mirrors) for _ in range(n)]
     plan_calls = [
         (lambda md=md: attn.plan(md, backend=resolution, **spec)) for md in mds
@@ -288,7 +288,7 @@ def bench_cell(
 
     # (c) graph-mode re-plan: the first plan fixes the capture shapes and is
     # excluded; every later plan stages into the reserved storage
-    attn_g = PagedAttention(dev, use_cuda_graph=True, workspace_buffer=workspace)
+    attn_g = PagedAttention(workspace, use_cuda_graph=True)
     attn_g.plan(prob.metadata(form, mirrors), backend=resolution, **spec)
     mds_g = [prob.metadata(form, mirrors) for _ in range(n)]
     replan_calls = [

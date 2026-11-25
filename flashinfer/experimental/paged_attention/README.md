@@ -74,7 +74,9 @@ metadata = PagedAttentionMetadata.dense(
     max_kv_len=kv_len,
 )
 
-attn = PagedAttention(device)
+# caller-owned scratch, as the legacy wrappers' float_workspace_buffer
+workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+attn = PagedAttention(workspace)
 attn.plan(metadata, lse_mode="base2", backend=resolution, **config)
 
 q = torch.randn(batch * q_len, 32, 128, dtype=torch.bfloat16, device=device)
@@ -124,7 +126,7 @@ argument reference.
 
 CUDA graphs follow a three-stage lifecycle:
 
-1. `PagedAttention(graph_capacity=GraphCapacity(...))` reserves the metadata
+1. `PagedAttention(workspace, graph_capacity=GraphCapacity(...))` reserves the metadata
    storage of one graph bucket at construction (`use_cuda_graph=True` infers
    the capacity from the first plan).
 2. The first graph-mode `plan()` freezes the backend and every semantic
@@ -146,9 +148,13 @@ asking for the prewarm).
 
 ### Workspace
 
-The kernel workspace is shared per device (a 512 MiB pool) or caller-supplied
-via `workspace_buffer=`, so one instance per graph bucket costs no workspace
-per bucket; `PagedAttention.workspace_requirements()` returns, for a
+The kernel workspace is caller-owned and required, as in the legacy wrappers
+and the MLA wrapper: `PagedAttention(workspace_buffer, ...)` takes a
+contiguous 1-D `uint8` buffer and runs on its device; the library allocates
+none. One buffer may back several instances (one per graph bucket costs no
+workspace per bucket), but instances sharing a buffer must not run
+concurrently on different streams.
+`PagedAttention.workspace_requirements()` returns, for a
 `GraphCapacity` and a model configuration, a conservative bound on the bytes
 the resolvable backends' planners carve out of that buffer (the fa2 split-KV
 scratch dominates), so an engine can size the buffer before capture. A
@@ -399,7 +405,7 @@ by measurement. It follows `backend="autotune"` of
 `Resolution.autotune` set, so `plan(backend=resolution)` carries the mode.
 
 ```python
-attn = flashinfer.prefill.PagedAttention(device)
+attn = flashinfer.prefill.PagedAttention(workspace)
 with flashinfer.autotune(True, cache="paged_attention.json"):
     attn.plan(metadata, backend="autotune", **config)  # prepares every candidate
     attn.run(q, (k_cache, v_cache), out=out)           # profiles, keeps the winner

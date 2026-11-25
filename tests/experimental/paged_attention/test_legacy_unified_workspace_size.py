@@ -208,9 +208,7 @@ def test_batch_prefill_workspace_size_plans_fixed_split_with_exact_buffers():
         **control,
     )
     assert nbytes > 0  # the legacy assertion: a fixed split needs float scratch
-    attn = PagedAttention(
-        device, workspace_buffer=torch.empty(nbytes, dtype=torch.uint8, device=device)
-    )
+    attn = PagedAttention(torch.empty(nbytes, dtype=torch.uint8, device=device))
     attn.plan(metadata, **PLAN_KWARGS, lse_mode="base2", backend="fa2", **control)
     assert attn.backend == "fa2"
     q, k, v = _qkv(device)
@@ -228,9 +226,7 @@ def test_batch_prefill_workspace_size_plans_cuda_graph_with_exact_buffers(backen
         capacity, device=device, **PLAN_KWARGS, use_cuda_graph=True, backend=backend
     )
     attn = PagedAttention(
-        device,
-        graph_capacity=capacity,
-        workspace_buffer=torch.empty(nbytes, dtype=torch.uint8, device=device),
+        torch.empty(nbytes, dtype=torch.uint8, device=device), graph_capacity=capacity
     )
     attn.plan(metadata, **PLAN_KWARGS, lse_mode="base2", backend=backend)
     assert attn.backend == backend
@@ -255,9 +251,7 @@ def test_batch_prefill_workspace_size_plans_no_split_cuda_graph_with_exact_buffe
     )
     assert nbytes == 0  # an unsplit plan takes no float scratch
     attn = PagedAttention(
-        device,
-        graph_capacity=capacity,
-        workspace_buffer=torch.empty(nbytes, dtype=torch.uint8, device=device),
+        torch.empty(nbytes, dtype=torch.uint8, device=device), graph_capacity=capacity
     )
     attn.plan(metadata, **PLAN_KWARGS, lse_mode="base2", backend="fa2", **control)
     assert attn.backend == "fa2"
@@ -272,7 +266,7 @@ def test_batch_prefill_workspace_size_rejects_unaligned_workspace_buffer(backend
     device = torch.device("cuda:0")
     workspace = torch.empty(32 * 1024 * 1024 + 1, dtype=torch.uint8, device=device)[1:]
     assert workspace.data_ptr() % 16 != 0
-    attn = PagedAttention(device, workspace_buffer=workspace)
+    attn = PagedAttention(workspace)
     try:
         attn.plan(_metadata(), **PLAN_KWARGS, backend=backend)
     except ValueError as e:

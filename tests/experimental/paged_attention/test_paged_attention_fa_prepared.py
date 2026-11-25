@@ -51,7 +51,7 @@ from flashinfer.prefill import (
 )
 from flashinfer.utils import _get_cache_alibi_slopes_buf
 
-from .paged_attention_reference import reference_paged_prefill
+from .paged_attention_reference import reference_paged_prefill, scratch_workspace
 from .test_paged_attention_coverage import (
     assert_canaries,
     build_problem,
@@ -189,7 +189,9 @@ def _plan(p, backend, *, attn=None, graph_capacity=None, **plan_kw):
     if reason is not None:
         pytest.skip(f"{backend} not runnable here: {reason}")
     if attn is None:
-        attn = PagedAttention(torch.device(DEVICE), graph_capacity=graph_capacity)
+        attn = PagedAttention(
+            scratch_workspace(torch.device(DEVICE)), graph_capacity=graph_capacity
+        )
     plan_kw.setdefault("lse_mode", "base2")
     attn.plan(
         make_metadata(p),

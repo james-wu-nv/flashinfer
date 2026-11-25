@@ -106,7 +106,7 @@ def test_kv_scale_forwarding_effect(dtype, backend):
     )
 
     workspace_buffer = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda")
-    attn = PagedAttention(q.device, workspace_buffer=workspace_buffer)
+    attn = PagedAttention(workspace_buffer)
     attn.plan(
         metadata,
         num_qo_heads=H_QO,
@@ -196,7 +196,7 @@ def test_kv_scale_forwarding_math_property(dtype: torch.dtype, backend):
 
     # ---------------- PagedAttention ----------------
     workspace = torch.empty(16 * 1024 * 1024, dtype=torch.uint8, device="cuda")
-    attn = PagedAttention(q.device, workspace_buffer=workspace)
+    attn = PagedAttention(workspace)
     attn.plan(
         metadata,
         num_qo_heads=H_QO,

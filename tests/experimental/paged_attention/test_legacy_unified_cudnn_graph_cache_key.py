@@ -150,10 +150,7 @@ def _metadata(qo_indptr, kv_lens, block_tables, page_size):
 
 def _plan_cudnn(md, num_heads, head_dim, kv_layout="HND", attn=None):
     attn = attn or PagedAttention(
-        torch.device("cuda:0"),
-        workspace_buffer=torch.empty(
-            128 * 1024 * 1024, dtype=torch.int8, device="cuda:0"
-        ),
+        torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     )
     attn.plan(
         md,

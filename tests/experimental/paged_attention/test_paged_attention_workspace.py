@@ -1,36 +1,24 @@
 """Workspace ownership of PagedAttention (experimental).
 
-Problem under test: every ``PagedAttention`` instance owns its workspace and
-there is no way to hand it a shared one.
+``PagedAttention`` runs on one caller-owned scratch workspace, the first
+constructor argument, as the legacy wrappers and the MLA wrapper take their
+``float_workspace_buffer``; the library allocates none.  A serving engine
+holds one instance per graph bucket, so the contract is:
 
-- ``_controller._shared_workspace()`` allocates a private 128 MB scratch
-  buffer per instance, unconditionally, on the first ``plan()``
-  (``make_backend(..., self._shared_workspace(), ...)``).
-- The trtllm-gen backend additionally allocates its own zero-initialized
-  128 MB buffer, so a trtllm-gen instance holds 256 MB of which the shared
-  half is never touched.
-- The class docstring prescribes "one PagedAttention(use_cuda_graph=True)
-  instance per graph bucket".  A serving engine has tens of graph buckets, so
-  the workspace cost scales as ``num_buckets x 128 MB`` (or ``x 256 MB`` on
-  trtllm-gen) — where the legacy wrappers share ONE caller-owned workspace
-  across every instance.
-
-Contract these tests assert (the controller implements it as one per-device
-shared scratch buffer plus an optional caller-supplied one):
-
-1. Adding one more graph-bucket instance must not cost another workspace.
-2. trtllm-gen runs on the same shared scratch (its 128 MB buffer is ordinary
-   softmax-stats/scratch); the zero-initialized part it really needs is a
-   KB-sized counter buffer the backend owns, so run() allocates nothing.
-3. A caller-supplied ``workspace_buffer`` is what every backend runs on, and a
-   buffer on the wrong device / of the wrong shape is rejected loudly.
+1. Every instance built over one buffer runs on it: one more graph-bucket
+   instance costs no workspace.
+2. trtllm-gen runs on the same buffer (ordinary softmax-stats/scratch); the
+   zero-initialized part it really needs is a KB-sized counter buffer the
+   backend owns, so run() allocates nothing.
+3. The instance runs on the buffer's device; a buffer of the wrong type,
+   shape or dtype is rejected loudly, and so is a missing one.
 
 Sizing (ledger M14): the fa2 split-KV planner carves ``tmp_v`` / ``tmp_s`` out
 of this buffer; before it reserved per query row (#5177) the legacy 128 MiB
-default overflowed on one request of q = kv = 2048 with 32/8 heads in graph
+buffer overflowed on one request of q = kv = 2048 with 32/8 heads in graph
 mode (129 MiB; now 32.25 MiB).  Contract:
 
-4. That shape plans and runs on the default workspace and matches the oracle.
+4. That shape plans and runs on a 128 MiB workspace and matches the oracle.
 5. ``PagedAttention.workspace_requirements()`` is >= the bytes the fa2 planner
    actually allocates (observed through the legacy wrapper's
    ``workspace_size()``, the planner's own counting mode), and the per-batch
@@ -64,7 +52,6 @@ from flashinfer.experimental.paged_attention._backends.trtllm_gen_backend import
     _TrtllmGenBackend,
 )
 from flashinfer.experimental.paged_attention._controller import (
-    _WORKSPACE_BYTES,
     PagedAttentionController,
 )
 from flashinfer.prefill import (
@@ -74,7 +61,11 @@ from flashinfer.prefill import (
     resolve_paged_attention,
 )
 
-from .paged_attention_reference import reference_paged_prefill
+from .paged_attention_reference import (
+    SCRATCH_WORKSPACE_BYTES,
+    reference_paged_prefill,
+    scratch_workspace,
+)
 from .test_paged_attention_contract_cpu import _host_metadata
 from .test_paged_attention_prototype import (
     BACKENDS,
@@ -89,14 +80,13 @@ from .test_paged_attention_prototype import (
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 MB = 1024 * 1024
-# What _controller._shared_workspace() reserves per device (the trtllm-gen
-# backend runs on the same buffer).
-WORKSPACE_MB = _WORKSPACE_BYTES // MB
+# The tests' workspace (scratch_workspace(): one buffer per device).
+WORKSPACE_MB = SCRATCH_WORKSPACE_BYTES // MB
 # Generous ceiling for the legitimate per-bucket state of one more instance:
 # reserved int32 metadata (KBs) plus the generated-FA wrapper's 8 MB int
 # workspace.  Half a workspace is far above that and far below one workspace,
 # so the assertion is insensitive to allocator rounding and only trips on a
-# duplicated 128 MB buffer.
+# duplicated workspace.
 PER_BUCKET_LIMIT_MB = WORKSPACE_MB // 2
 # Engine-shaped bucket count kept small so the test itself stays cheap; the
 # waste is linear in it, so 4 is enough to show the slope.
@@ -172,58 +162,30 @@ def _describe(instances) -> str:
 @needs_cuda
 @pytest.mark.parametrize("backend", BACKENDS)
 def test_workspace_not_duplicated_per_graph_bucket(backend):
-    """One instance per graph bucket must not mean one 128 MB workspace per bucket."""
+    """One instance per graph bucket over one caller buffer must not mean one
+    workspace per bucket."""
     p = make_problem(seed=7, **_SHAPE)
     _resolve_or_skip(p, backend)
     dev = torch.device(p["device"])
 
     # Warm-up instance: pays every one-time cost (JIT module load, cuDNN
     # handle, first derivation) so the measured slope is per-bucket state only.
-    warm = PagedAttention(dev, use_cuda_graph=True)
+    warm = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     _plan(warm, p, backend)
 
     before = _allocated_mb(dev)
     buckets = []
     for _ in range(NUM_BUCKETS):
-        attn = PagedAttention(dev, use_cuda_graph=True)
+        attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
         _plan(attn, p, backend)
         buckets.append(attn)
     per_bucket = (_allocated_mb(dev) - before) / NUM_BUCKETS
 
     assert per_bucket < PER_BUCKET_LIMIT_MB, (
-        f"[{backend}] each additional PagedAttention(use_cuda_graph=True) "
+        f"[{backend}] each additional PagedAttention(workspace, use_cuda_graph=True) "
         f"instance costs {per_bucket:.1f} MB of device memory (limit "
-        f"{PER_BUCKET_LIMIT_MB} MB): every graph bucket allocates its own "
-        f"{WORKSPACE_MB} MB workspace instead of sharing one.\n"
-        + _describe([warm, *buckets])
-    )
-
-
-@needs_cuda
-def test_trtllm_gen_runs_on_the_shared_workspace():
-    """trtllm-gen's 128 MB buffer is ordinary scratch: it must be the shared
-    workspace, not a second private allocation next to it.  The only thing the
-    kernel needs zero-initialized is its KB-sized multi-CTA KV counter buffer."""
-    p = make_problem(seed=7, **_SHAPE)
-    _resolve_or_skip(p, "trtllm-gen")
-    dev = torch.device(p["device"])
-
-    before = _allocated_mb(dev)
-    attn = PagedAttention(dev)
-    _plan(attn, p, "trtllm-gen")
-    growth = _allocated_mb(dev) - before
-
-    # at most the one shared workspace (first user on this device pays it);
-    # anything past 1.5x of it means a second workspace was allocated alongside
-    limit = WORKSPACE_MB * 3 // 2
-    assert growth < limit, (
-        f"[trtllm-gen] planning one instance allocated {growth:.1f} MB "
-        f"(limit {limit} MB): a second {WORKSPACE_MB} MB workspace was allocated "
-        "next to the shared one.\n" + _describe([attn])
-    )
-    held = {t.data_ptr() for _, t in _large_buffers(attn)}
-    assert len(held) <= 1, "[trtllm-gen] holds two distinct >=64 MB buffers\n" + (
-        _describe([attn])
+        f"{PER_BUCKET_LIMIT_MB} MB): every graph bucket allocates a workspace "
+        "of its own instead of running on the caller's.\n" + _describe([warm, *buckets])
     )
 
 
@@ -236,7 +198,7 @@ def test_trtllm_gen_run_allocates_nothing():
     p = make_problem(seed=7, **_SHAPE)
     _resolve_or_skip(p, "trtllm-gen")
     dev = torch.device(p["device"])
-    attn = PagedAttention(dev)
+    attn = PagedAttention(scratch_workspace(dev))
     _plan(attn, p, "trtllm-gen")
     out = torch.empty(
         p["q"].shape[0],
@@ -272,11 +234,11 @@ def test_caller_supplied_workspace_is_used(backend):
     dev = torch.device(p["device"])
     ws = torch.empty(WORKSPACE_MB * MB, dtype=torch.uint8, device=dev)
 
-    warm = PagedAttention(dev, workspace_buffer=ws)  # one-time costs (JIT etc.)
+    warm = PagedAttention(ws)  # one-time costs (JIT etc.)
     _plan(warm, p, backend)
 
     before = _allocated_mb(dev)
-    attn = PagedAttention(dev, workspace_buffer=ws)
+    attn = PagedAttention(ws)
     _plan(attn, p, backend)
     growth = _allocated_mb(dev) - before
     assert growth < PER_BUCKET_LIMIT_MB, (
@@ -298,17 +260,18 @@ def test_caller_supplied_workspace_is_used(backend):
 def test_workspace_buffer_validation():
     dev = torch.device("cuda:0")
     with pytest.raises(ValueError, match="1-D"):
-        PagedAttention(
-            dev, workspace_buffer=torch.empty(4, 4, dtype=torch.uint8, device=dev)
-        )
+        PagedAttention(torch.empty(4, 4, dtype=torch.uint8, device=dev))
     with pytest.raises(ValueError, match="uint8"):
-        PagedAttention(
-            dev, workspace_buffer=torch.empty(16, dtype=torch.float32, device=dev)
-        )
-    with pytest.raises(ValueError, match="lives on"):
-        PagedAttention(dev, workspace_buffer=torch.empty(16, dtype=torch.uint8))
+        PagedAttention(torch.empty(16, dtype=torch.float32, device=dev))
     with pytest.raises(ValueError, match="torch.Tensor"):
-        PagedAttention(dev, workspace_buffer=WORKSPACE_MB * MB)
+        PagedAttention(WORKSPACE_MB * MB)
+    with pytest.raises(ValueError, match="torch.Tensor"):
+        PagedAttention(dev)  # a device is not a workspace
+    with pytest.raises(TypeError, match="workspace_buffer"):
+        PagedAttention()  # the library allocates none
+    # the instance runs on the buffer's device
+    assert PagedAttention(torch.empty(16, dtype=torch.uint8, device=dev)).device == dev
+    assert PagedAttention(torch.empty(16, dtype=torch.uint8)).device.type == "cpu"
 
 
 # ---------------------------------------------------------------------------
@@ -480,9 +443,8 @@ def _fa2_need_via_plan(p, *, graph, total_q_tokens=None, window_left=-1):
     dev = torch.device(p["device"])
     tiny = torch.empty(16, dtype=torch.uint8, device=dev)
     attn = PagedAttention(
-        dev,
+        tiny,
         graph_capacity=_capacity(p, total_q_tokens=total_q_tokens) if graph else None,
-        workspace_buffer=tiny,
     )
     try:
         attn.plan(
@@ -512,16 +474,18 @@ def _requirements(p, *, graph, total_q_tokens=None, window_left=-1, backend="fa2
 
 @needs_cuda
 @pytest.mark.parametrize("graph", [True, False], ids=["graph", "eager"])
-def test_m14_shape_runs_on_default_workspace(graph):
-    """The shape that overflowed the 128 MiB default before #5177 (fa2 graph
-    mode now needs 32.25 MiB) plans and runs on the default shared workspace and matches the
-    fp32 oracle."""
+def test_m14_shape_runs_on_a_128_mib_workspace(graph):
+    """The shape that overflowed the legacy wrappers' documented 128 MiB
+    before #5177 (fa2 graph mode now needs 32.25 MiB) plans and runs on a
+    buffer of that size and matches the fp32 oracle."""
     p = _exact_problem(seed=14, **M14)
     _resolve_or_skip(p, "fa2")
     dev = torch.device(p["device"])
-    attn = PagedAttention(dev, graph_capacity=_capacity(p) if graph else None)
+    attn = PagedAttention(
+        scratch_workspace(dev, 128 * MB),
+        graph_capacity=_capacity(p) if graph else None,
+    )
     attn.plan(make_metadata(p), backend="fa2", **_plan_kwargs(p))
-    assert attn._impl._workspace.numel() == _WORKSPACE_BYTES
     out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]))
     torch.cuda.synchronize(dev)
     ref_out, ref_lse = reference_paged_prefill(
@@ -726,15 +690,13 @@ def test_workspace_requirements_bound_is_runnable():
     # 32 heads x ceil(64 tiles x 128 packed rows / gqa 4) x (128 + 1) x 4 B
     assert bound == 33816576
     ws = torch.empty(bound, dtype=torch.uint8, device=dev)
-    attn = PagedAttention(dev, graph_capacity=_capacity(p), workspace_buffer=ws)
+    attn = PagedAttention(ws, graph_capacity=_capacity(p))
     attn.plan(make_metadata(p), backend="fa2", **_plan_kwargs(p))
     out, lse = attn.run(p["q"], (p["k_cache"], p["v_cache"]))
     torch.cuda.synchronize(dev)
     assert torch.isfinite(out).all() and torch.isfinite(lse).all()
 
-    short = PagedAttention(
-        dev, graph_capacity=_capacity(p), workspace_buffer=ws[: bound - 16]
-    )
+    short = PagedAttention(ws[: bound - 16], graph_capacity=_capacity(p))
     with pytest.raises(ValueError, match=rf"needs {bound} bytes"):
         short.plan(make_metadata(p), backend="fa2", **_plan_kwargs(p))
 
@@ -748,7 +710,7 @@ def test_too_small_workspace_rejected_at_plan_fa2():
     _resolve_or_skip(p, "fa2")
     dev = torch.device(p["device"])
     ws = torch.empty(32 * MB, dtype=torch.uint8, device=dev)
-    attn = PagedAttention(dev, graph_capacity=_capacity(p), workspace_buffer=ws)
+    attn = PagedAttention(ws, graph_capacity=_capacity(p))
     with pytest.raises(ValueError) as info:
         attn.plan(make_metadata(p), backend="fa2", **_plan_kwargs(p))
     msg = str(info.value)
@@ -773,9 +735,7 @@ def test_too_small_workspace_rejected_at_plan_trtllm_gen():
     need = _requirements(p, graph=False, backend="trtllm-gen")
     # 8 B x heads x batch x round_up(max_q_len, 256) + the 1 MiB guard
     assert need == 8 * p["num_qo_heads"] * 4 * 256 + MB
-    attn = PagedAttention(
-        dev, workspace_buffer=torch.empty(MB, dtype=torch.uint8, device=dev)
-    )
+    attn = PagedAttention(torch.empty(MB, dtype=torch.uint8, device=dev))
     with pytest.raises(ValueError, match=rf"needs {need} bytes") as info:
         attn.plan(make_metadata(p), backend="trtllm-gen", **_plan_kwargs(p))
     assert str(info.value) == (
@@ -816,7 +776,7 @@ def test_too_small_workspace_moves_auto_to_the_next_candidate(monkeypatch):
     _lead_with(monkeypatch, "fa2")
     dev = torch.device(p["device"])
     ws = torch.empty(32 * MB, dtype=torch.uint8, device=dev)
-    attn = PagedAttention(dev, graph_capacity=_capacity(p), workspace_buffer=ws)
+    attn = PagedAttention(ws, graph_capacity=_capacity(p))
     attn.plan(make_metadata(p), backend="auto", **_plan_kwargs(p))
     trace = attn._impl.selection_trace
     assert trace[0] == (
@@ -909,9 +869,8 @@ def _host_controller(monkeypatch, workspace_bytes, *, first):
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: "stream")
     _lead_with(monkeypatch, first, *(n for n in _M14_NEED if n != first))
     return PagedAttentionController(
-        torch.device("cpu"),
+        torch.empty(workspace_bytes, dtype=torch.uint8),
         graph_capacity=_M14_CAPACITY,
-        workspace_buffer=torch.empty(workspace_bytes, dtype=torch.uint8),
     )
 
 

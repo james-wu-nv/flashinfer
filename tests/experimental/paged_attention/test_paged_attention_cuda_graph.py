@@ -1,6 +1,6 @@
 """CUDA-graph re-plan protocol for PagedAttention (experimental).
 
-Contract under test (``PagedAttention(use_cuda_graph=True)``):
+Contract under test (``PagedAttention(workspace, use_cuda_graph=True)``):
 
 1. ``run()`` planned once can be captured into a ``torch.cuda.CUDAGraph``.
 2. A later ``plan()`` with a new batch that FITS the capacity re-fills the
@@ -23,7 +23,7 @@ Contract under test (``PagedAttention(use_cuda_graph=True)``):
    backend and every non-per-batch ``PlanMetadata`` field); a later plan that
    changes any of them is rejected before anything is written, because the
    captured graph would keep launching the old kernels.
-8. ``PagedAttention(graph_capacity=GraphCapacity(...))`` allocates the
+8. ``PagedAttention(workspace, graph_capacity=GraphCapacity(...))`` allocates the
    reserved storage at construction; in the flat ``kv_page_indices`` form the
    dense block table is reserved only for a backend that reads it (never at
    ``page_size < 8``, where it would be ``(batch, max_context)``).
@@ -45,7 +45,7 @@ from flashinfer.prefill import (
     resolve_paged_attention,
 )
 
-from .paged_attention_reference import reference_paged_prefill
+from .paged_attention_reference import reference_paged_prefill, scratch_workspace
 from .test_paged_attention_coverage import build_problem
 from .test_paged_attention_prototype import (
     BACKENDS,
@@ -194,7 +194,7 @@ def test_capture_replan_replay(backend):
     p2 = _sibling_batch(p1, seed=42)
     dev = torch.device(p1["device"])
 
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     # static input/output storage the graph will read and write
     q = p1["q"].clone()
     k = p1["k_cache"].clone()
@@ -262,7 +262,7 @@ def test_capture_replan_replay_large_pages(backend):
     _resolve_or_skip(p1, backend)
     p2 = _sibling_batch(p1, seed=46)
     dev = torch.device(p1["device"])
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     q, k, v = p1["q"].clone(), p1["k_cache"].clone(), p1["v_cache"].clone()
     out = torch.empty(
         q.shape[0], p1["num_qo_heads"], p1["head_dim_vo"], dtype=q.dtype, device=dev
@@ -302,7 +302,9 @@ def test_capture_replan_replay_large_pages(backend):
 def test_replan_rejects_capture_shape_drift(backend):
     p1 = make_problem(seed=43, **_SHAPE)
     _resolve_or_skip(p1, backend)
-    attn = PagedAttention(torch.device(p1["device"]), use_cuda_graph=True)
+    attn = PagedAttention(
+        scratch_workspace(torch.device(p1["device"])), use_cuda_graph=True
+    )
     _plan(attn, p1, backend)
     smaller = make_problem(seed=44, **dict(_SHAPE, batch_size=3))
     with pytest.raises(ValueError, match="CUDA graph re-plan: batch_size"):
@@ -317,7 +319,7 @@ def test_failed_replan_restores_previous_plan(backend):
     p1 = make_problem(seed=45, **_SHAPE)
     _resolve_or_skip(p1, backend)
     dev = torch.device(p1["device"])
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     q, k, v = p1["q"].clone(), p1["k_cache"].clone(), p1["v_cache"].clone()
     out = torch.empty(
         q.shape[0], p1["num_qo_heads"], p1["head_dim_vo"], dtype=q.dtype, device=dev
@@ -410,7 +412,7 @@ def test_failed_staging_copy_restores_previous_plan(fail_at):
     p1 = make_problem(seed=48, **_SHAPE)
     _resolve_or_skip(p1, "fa2")
     dev = torch.device(p1["device"])
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     q, k, v = p1["q"].clone(), p1["k_cache"].clone(), p1["v_cache"].clone()
     out = torch.empty(
         q.shape[0], p1["num_qo_heads"], p1["head_dim_vo"], dtype=q.dtype, device=dev
@@ -476,7 +478,9 @@ def test_failed_first_plan_leaves_no_capacity(monkeypatch, stage):
 
     p2 = make_problem(seed=50, **_SHAPE)
     _resolve_or_skip(p2, "fa2")
-    attn = PagedAttention(torch.device(p2["device"]), use_cuda_graph=True)
+    attn = PagedAttention(
+        scratch_workspace(torch.device(p2["device"])), use_cuda_graph=True
+    )
 
     failed = []
     if stage == "construct":
@@ -568,7 +572,7 @@ def test_graph_replan_rejects_semantic_drift(field, drift):
     if field == "backend":
         _resolve_or_skip(p, drift["backend"])
     dev = torch.device(p["device"])
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     q, k, v = p["q"].clone(), p["k_cache"].clone(), p["v_cache"].clone()
     out = torch.empty(
         q.shape[0], p["num_qo_heads"], p["head_dim_vo"], dtype=q.dtype, device=dev
@@ -645,7 +649,7 @@ def test_explicit_capacity_allocates_at_construction():
     _resolve_or_skip(p, "fa2")
     dev = torch.device(p["device"])
     cap = _graph_capacity_of(p)
-    attn = PagedAttention(dev, graph_capacity=cap)
+    attn = PagedAttention(scratch_workspace(dev), graph_capacity=cap)
     gb = attn._impl._graph
     assert gb is not None and gb.capacity == cap
     assert tuple(gb.block_tables.shape) == (cap.batch_size, cap.table_width)
@@ -663,7 +667,7 @@ def test_explicit_capacity_allocates_at_construction():
     with pytest.raises(ValueError, match="CUDA graph re-plan: batch_size"):
         _plan(attn, other, "fa2")
     with pytest.raises(ValueError, match="must be a GraphCapacity"):
-        PagedAttention(dev, graph_capacity=dict(batch_size=4))
+        PagedAttention(scratch_workspace(dev), graph_capacity=dict(batch_size=4))
 
 
 @pytest.mark.parametrize("backend", ["fa2", "fa3", "cudnn", "trtllm-gen"])
@@ -674,7 +678,7 @@ def test_csr_graph_instance_reserves_dense_table_only_for_dense_backends(backend
     p = make_problem(seed=55, **dict(_SHAPE, input_form="page_indices"))
     _resolve_or_skip(p, backend)
     dev = torch.device(p["device"])
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     _plan(attn, p, backend)
     gb = attn._impl._graph
     needs_dense = backend in ("cudnn", "trtllm-gen")
@@ -703,7 +707,9 @@ def test_csr_graph_instance_reserves_dense_table_only_for_dense_backends(backend
 def test_dense_graph_instance_mirrors_the_caller_width_table():
     p = make_problem(seed=56, **_SHAPE)
     _resolve_or_skip(p, "fa2")
-    attn = PagedAttention(torch.device(p["device"]), use_cuda_graph=True)
+    attn = PagedAttention(
+        scratch_workspace(torch.device(p["device"])), use_cuda_graph=True
+    )
     _plan(attn, p, "fa2")
     assert tuple(attn._impl._graph.block_tables.shape) == tuple(p["block_tables"].shape)
 
@@ -751,14 +757,14 @@ def test_csr_page_size_1_graph_instance_reserves_no_dense_table():
             kv_seq_lens_cpu=kv_lens,
         )
 
-    # one-time costs (JIT module, per-device shared workspace) on a warm instance
-    warm = PagedAttention(dev, use_cuda_graph=True)
+    # one-time costs (JIT module, first scratch_workspace() allocation) on a warm instance
+    warm = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     warm.plan(metadata(), backend="fa2", **semantic)
     torch.cuda.synchronize(dev)
     gc.collect()
     before = torch.cuda.memory_allocated(dev)
 
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     attn.plan(metadata(), backend="fa2", **semantic)
     torch.cuda.synchronize(dev)
     gc.collect()
@@ -881,7 +887,7 @@ def test_capture_replan_smaller_batch_replay(backend, input_form):
     assert p2["max_q_len"] < p1["max_q_len"] and p2["max_kv_len"] < p1["max_kv_len"]
     dev = torch.device(p1["device"])
 
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     q, k, v = p1["q"].clone(), p1["k_cache"].clone(), p1["v_cache"].clone()
     out = torch.empty(
         total1, p1["num_qo_heads"], p1["head_dim_vo"], dtype=q.dtype, device=dev
@@ -943,7 +949,7 @@ def test_explicit_capacity_headroom_replay(backend):
     total1, total2 = int(p1["qo_indptr_cpu"][-1]), int(p2["qo_indptr_cpu"][-1])
     dev = torch.device(p1["device"])
     cap = _graph_capacity_of(p1, extra_rows=16, extra_q=8)
-    attn = PagedAttention(dev, graph_capacity=cap)
+    attn = PagedAttention(scratch_workspace(dev), graph_capacity=cap)
 
     rows = cap.total_q_tokens
     q = torch.zeros(
@@ -1019,7 +1025,7 @@ def test_replan_sibling_replay_without_sync(backend):
     _resolve_or_skip(p1, backend)
     dev = torch.device(p1["device"])
     total1 = int(p1["qo_indptr_cpu"][-1])
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     q, k, v = p1["q"].clone(), p1["k_cache"].clone(), p1["v_cache"].clone()
     out = torch.empty(
         total1, p1["num_qo_heads"], p1["head_dim_vo"], dtype=q.dtype, device=dev
@@ -1063,7 +1069,7 @@ def test_plan_during_capture_raises():
     p = make_problem(seed=66, **_SHAPE)
     _resolve_or_skip(p, "fa2")
     dev = torch.device(p["device"])
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     q, k, v = p["q"], p["k_cache"], p["v_cache"]
     out = torch.empty(
         q.shape[0], p["num_qo_heads"], p["head_dim_vo"], dtype=q.dtype, device=dev
@@ -1136,7 +1142,7 @@ def test_replan_toggles_padding_rows(backend, input_form):
     assert int(pad_a[3]) and int(pad_b[1]) and a["max_kv_len"] == b["max_kv_len"]
     _resolve_or_skip(a, backend)
     dev = torch.device(a["device"])
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     q, k, v = a["q"].clone(), a["k_cache"].clone(), a["v_cache"].clone()
     out = torch.empty_like(q)
     lse = torch.empty(q.shape[0], a["num_qo_heads"], dtype=torch.float32, device=dev)
@@ -1252,7 +1258,9 @@ def test_replan_waits_for_the_previous_schedule_upload():
     with B's schedule (request/tile indices, merge offsets) and is wrong."""
     p1 = make_problem(seed=90, **_SHAPE)
     _resolve_or_skip(p1, "fa2")
-    attn = PagedAttention(torch.device(p1["device"]), use_cuda_graph=True)
+    attn = PagedAttention(
+        scratch_workspace(torch.device(p1["device"])), use_cuda_graph=True
+    )
     g, q, k, v, out, lse = _capture(attn, p1, "fa2")
     p2 = _sibling_batch(p1, seed=91)
     total = int(p1["qo_indptr_cpu"][-1])
@@ -1288,7 +1296,7 @@ def test_capture_on_smaller_buffers_binds_the_row_count(backend):
     _resolve_or_skip(p1, backend)
     dev = torch.device(p1["device"])
     cap = _graph_capacity_of(p1, extra_rows=16, extra_q=8)
-    attn = PagedAttention(dev, graph_capacity=cap)
+    attn = PagedAttention(scratch_workspace(dev), graph_capacity=cap)
     total = int(p1["qo_indptr_cpu"][-1])
     g, q, k, v, out, lse = _capture(attn, p1, backend)  # rows == total < capacity
     assert attn._impl._graph.rows == total
@@ -1334,7 +1342,9 @@ def test_replan_on_another_stream_is_rejected():
     replay."""
     p = make_problem(seed=94, **_SHAPE)
     _resolve_or_skip(p, "fa2")
-    attn = PagedAttention(torch.device(p["device"]), use_cuda_graph=True)
+    attn = PagedAttention(
+        scratch_workspace(torch.device(p["device"])), use_cuda_graph=True
+    )
     _plan(attn, p, "fa2")
     other = torch.cuda.Stream()
     with torch.cuda.stream(other), pytest.raises(ValueError, match="stream"):
@@ -1349,7 +1359,9 @@ def test_replan_reuses_the_pinned_resolution(monkeypatch):
     from flashinfer.experimental.paged_attention import _controller
 
     p = make_problem(seed=95, **_SHAPE)
-    attn = PagedAttention(torch.device(p["device"]), use_cuda_graph=True)
+    attn = PagedAttention(
+        scratch_workspace(torch.device(p["device"])), use_cuda_graph=True
+    )
     pinned = _resolve_or_skip(p, "auto")
     _plan(attn, p, pinned)
     before = attn.explain()
@@ -1388,7 +1400,7 @@ def test_flat_first_batch_with_padding_rows_infers_a_capacity():
         qo_indptr_cpu=qo,
         kv_seq_lens_cpu=kv,
     )
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     attn.plan(
         md,
         num_qo_heads=8,
@@ -1459,7 +1471,7 @@ def test_replan_toggles_zero_q_rows(backend):
     assert b["block_tables"].shape == a["block_tables"].shape
     _resolve_or_skip(a, backend)
     dev = torch.device(a["device"])
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     q, k, v = a["q"].clone(), a["k_cache"].clone(), a["v_cache"].clone()
     out = torch.empty_like(q)
     lse = torch.empty(q.shape[0], a["num_qo_heads"], dtype=torch.float32, device=dev)
@@ -1499,7 +1511,7 @@ def test_decode_bucket_replan_with_zero_q_tail_rows(backend, style):
         pytest.skip("cake declines kv_len == 0 rows (ledger M19)")
     _resolve_or_skip(full, backend)
     dev = torch.device(full["device"])
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     q, k, v = full["q"].clone(), full["k_cache"].clone(), full["v_cache"].clone()
     out = torch.empty_like(q)
     lse = torch.empty(q.shape[0], full["num_qo_heads"], dtype=torch.float32, device=dev)
@@ -1550,7 +1562,7 @@ def test_cake_capture_requires_an_eager_run_on_the_captured_tensors():
     p = make_problem(seed=41, **_SHAPE)
     _resolve_or_skip(p, "cake")
     dev = torch.device(p["device"])
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     _plan(attn, p, "cake")
     assert attn.backend == "cake"
     ref_out, ref_lse = _reference(p)
@@ -1690,7 +1702,7 @@ def test_graph_growth_covers_lse_fold_and_v_scale(kv, lse_mode):
         page_size=16,
         table_width=4,
     )
-    attn = PagedAttention(dev, graph_capacity=cap)
+    attn = PagedAttention(scratch_workspace(dev), graph_capacity=cap)
     plan_kw = dict(
         num_qo_heads=p["num_qo_heads"],
         num_kv_heads=p["num_kv_heads"],
@@ -1755,7 +1767,7 @@ def test_inferred_capacity_accepts_a_zero_query_first_batch():
         qo_indptr_cpu=qo,
         kv_seq_lens_cpu=kv,
     )
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     attn.plan(
         md,
         num_qo_heads=p["num_qo_heads"],
@@ -1803,7 +1815,7 @@ def test_inferred_capacity_covers_a_declared_max_q_len():
         qo_indptr_cpu=qo,
         kv_seq_lens_cpu=kv,
     )
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     attn.plan(
         md,
         num_qo_heads=p["num_qo_heads"],

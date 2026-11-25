@@ -378,7 +378,7 @@ def test_batch_prefill_with_paged_kv_cache(
         workspace_buffer = torch.empty(
             256 * 1024 * 1024, dtype=torch.int8, device="cuda:0"
         )
-        attn = PagedAttention(DEVICE, workspace_buffer=workspace_buffer)
+        attn = PagedAttention(workspace_buffer)
         attn.plan(
             metadata,
             **plan_kw,
@@ -418,9 +418,7 @@ def test_batch_prefill_with_paged_kv_cache(
             dtype=torch.uint8,
             device="cuda:0",
         )
-        attn = PagedAttention(
-            DEVICE, graph_capacity=capacity, workspace_buffer=workspace_buffer
-        )
+        attn = PagedAttention(workspace_buffer, graph_capacity=capacity)
         warmup_kv_len = min(qo_len, kv_len)
         warmup_pages = (warmup_kv_len + page_size - 1) // page_size
         metadata_warmup = PagedAttentionMetadata.csr(
@@ -582,10 +580,7 @@ def test_batch_prefill_lazy_stride_router_plan_reuse(kv_layout, head_dim):
         max_kv_len=kv_len,
     )
     attn = PagedAttention(
-        DEVICE,
-        workspace_buffer=torch.empty(
-            128 * 1024 * 1024, device="cuda", dtype=torch.uint8
-        ),
+        torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8)
     )
     # fixed_split_size=2 (pages) forces split-KV, as the legacy plan does: the
     # 7-page KV range of each request is planned in 4 chunks
@@ -703,7 +698,7 @@ def test_batch_prefill_with_paged_kv_cache_head_dim_512(
         max_q_len=qo_len,
         max_kv_len=kv_len,
     )
-    attn = PagedAttention(DEVICE, workspace_buffer=workspace_buffer)
+    attn = PagedAttention(workspace_buffer)
     attn.plan(
         metadata,
         num_qo_heads=num_qo_heads,
@@ -883,7 +878,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         workspace_buffer = torch.empty(
             256 * 1024 * 1024, dtype=torch.int8, device="cuda:0"
         )
-        attn = PagedAttention(DEVICE, workspace_buffer=workspace_buffer)
+        attn = PagedAttention(workspace_buffer)
         attn.plan(
             metadata,
             **plan_kw,
@@ -910,9 +905,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
             dtype=torch.uint8,
             device="cuda:0",
         )
-        attn = PagedAttention(
-            DEVICE, graph_capacity=capacity, workspace_buffer=workspace_buffer
-        )
+        attn = PagedAttention(workspace_buffer, graph_capacity=capacity)
         warmup_kv_len = min(qo_len, kv_len)
         warmup_pages = (warmup_kv_len + page_size - 1) // page_size
         metadata_warmup = PagedAttentionMetadata.csr(
@@ -1094,7 +1087,7 @@ def test_batch_prefill_with_paged_kv_cache_custom_mask(
         max_q_len=qo_len,
         max_kv_len=kv_len,
     )
-    attn = PagedAttention(DEVICE, workspace_buffer=workspace_buffer)
+    attn = PagedAttention(workspace_buffer)
     plan_kw = dict(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
@@ -1346,7 +1339,7 @@ def test_batch_prefill_paged_shared_kv_smem_unequal_kv_strides(kv_layout, qo_len
         max_q_len=qo_len,
         max_kv_len=kv_len,
     )
-    attn = PagedAttention(DEVICE, workspace_buffer=workspace_buffer)
+    attn = PagedAttention(workspace_buffer)
     attn.plan(
         metadata,
         num_qo_heads=num_qo_heads,
@@ -1467,7 +1460,7 @@ def test_paged_prefill_split_kv_empty_chunk(dtype):
         max_q_len=qo_len,
         max_kv_len=kv_len,
     )
-    attn = PagedAttention(DEVICE, workspace_buffer=workspace)
+    attn = PagedAttention(workspace)
     attn.plan(
         metadata,
         num_qo_heads=num_qo_heads,

@@ -33,7 +33,7 @@ from flashinfer.prefill import (
     resolve_paged_attention,
 )
 
-from .paged_attention_reference import reference_paged_prefill
+from .paged_attention_reference import reference_paged_prefill, scratch_workspace
 
 # Read by the legacy <-> unified parity report:
 # (legacy nodeid, [unified test functions], status, note)
@@ -133,7 +133,7 @@ def test_batch_prefill_tensor_cores(
     kv_cache = (kv_data[:, 0], kv_data[:, 1])  # PagedAttention takes the (K, V) pair
     kv_indices = torch.arange(total_num_pages, device=DEVICE, dtype=torch.int32)
 
-    attn = PagedAttention(DEVICE)
+    attn = PagedAttention(scratch_workspace(DEVICE))
 
     def run(num_requests):
         qo_indptr_cpu = torch.arange(num_requests + 1, dtype=torch.int32) * qo_len

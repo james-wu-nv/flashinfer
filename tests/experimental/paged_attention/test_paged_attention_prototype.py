@@ -21,7 +21,7 @@ from flashinfer.prefill import (
     resolve_paged_attention,
 )
 
-from .paged_attention_reference import reference_paged_prefill
+from .paged_attention_reference import reference_paged_prefill, scratch_workspace
 
 BACKENDS = ["fa2", "fa3", "cudnn", "trtllm-gen", "cake", "auto"]
 
@@ -200,7 +200,7 @@ def run_unified(
     """Plan and run one batch; the feature axes (``logits_soft_cap``, a
     flattened ``custom_mask``, per-head ``sinks``) are forwarded to plan()
     (``use_sinks`` follows ``sinks is not None``) and run()."""
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     md = make_metadata(p, with_mirrors=with_mirrors)
     attn.plan(
         md,
@@ -549,7 +549,7 @@ def test_resolution_pinning():
         dtype=torch.bfloat16,
     )
     res = _resolve_or_skip(p, "auto")
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     md = make_metadata(p)
     attn.plan(
         md,
@@ -983,7 +983,7 @@ def test_warm_plan_uploads_from_pinned_memory_only(backend, input_form):
         input_form=input_form,
     )
     res = _resolve_or_skip(p, backend)
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     spec = dict(
         num_qo_heads=p["num_qo_heads"],
         num_kv_heads=p["num_kv_heads"],

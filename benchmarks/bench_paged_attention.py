@@ -208,9 +208,9 @@ LSE_TOL = dict(rtol=2e-2, atol=3e-2)
 TABLE_SLACK_COLUMNS = 3
 POOL_SLACK_PAGES = 8
 # One caller-owned scratch buffer handed to the facade AND to the legacy APIs,
-# sized like testBatchPrefillWithPagedKVCacheWrapper's and like the facade's
-# default per-device pool (512 MiB). Passing one buffer to both sides keeps
-# the comparison about the API path, not the pool size.
+# sized like testBatchPrefillWithPagedKVCacheWrapper's (512 MiB). Passing one
+# buffer to both sides keeps the comparison about the API path, not the
+# buffer size.
 WORKSPACE_BYTES = 512 * 1024 * 1024
 
 
@@ -662,11 +662,7 @@ def _bench_unified(args, case, backend, ctx):
     # from the cache, as a tuned engine does at steady state
     tune = flashinfer.autotune if backend == "autotune" else None
 
-    attn = PagedAttention(
-        ctx["device"],
-        use_cuda_graph=ctx["use_cuda_graph"],
-        workspace_buffer=ctx["workspace"],
-    )
+    attn = PagedAttention(ctx["workspace"], use_cuda_graph=ctx["use_cuda_graph"])
     plan_kwargs = dict(ctx["static_kwargs"])
     plan_kwargs.update(
         causal=args.causal, window_left=args.window_left, lse_mode=args.lse_mode

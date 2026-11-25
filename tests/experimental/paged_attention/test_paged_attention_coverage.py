@@ -39,7 +39,7 @@ import torch
 
 from flashinfer.prefill import PagedAttention, resolve_paged_attention
 
-from .paged_attention_reference import reference_paged_prefill
+from .paged_attention_reference import reference_paged_prefill, scratch_workspace
 from .test_paged_attention_prototype import (
     LSE_TOL,
     OUT_TOL,
@@ -245,7 +245,7 @@ def plan_and_check(p, backend, **kw):
         p, backend, causal=causal, need_lse=lse_mode != "none", window_left=window_left
     )
     attn = plan(
-        PagedAttention(torch.device(p["device"])),
+        PagedAttention(scratch_workspace(torch.device(p["device"]))),
         p,
         backend,
         causal=causal,
@@ -321,7 +321,12 @@ def test_tc01_lse_modes_and_caller_buffers(backend, lse_mode, buffers, kv):
         seed=101,
     )
     _resolve_or_skip(p, backend, need_lse=lse_mode != "none")
-    attn = plan(PagedAttention(torch.device(DEVICE)), p, backend, lse_mode=lse_mode)
+    attn = plan(
+        PagedAttention(scratch_workspace(torch.device(DEVICE))),
+        p,
+        backend,
+        lse_mode=lse_mode,
+    )
     pad = 64
     out_big, out_buf, lse_big, lse_buf = canary_buffers(p, pad)
     if buffers == "caller":
@@ -368,7 +373,7 @@ def test_tc02_same_plan_layer_scales(backend):
         [7, 20, 1], [64, 30, 100], dtype=torch.bfloat16, seed=202, **_TC02_SHAPE
     )
     _resolve_or_skip(p, backend)
-    attn = plan(PagedAttention(torch.device(DEVICE)), p, backend)
+    attn = plan(PagedAttention(scratch_workspace(torch.device(DEVICE))), p, backend)
     s = 1.0 / math.sqrt(p["head_dim_qk"])
     results = []
     for scale in (s, 3.0 * s, s):
@@ -393,7 +398,7 @@ def test_tc02_same_plan_fp8_kv_scale_pairs(backend):
         **_TC02_SHAPE,
     )
     _resolve_or_skip(p, backend)
-    attn = plan(PagedAttention(torch.device(DEVICE)), p, backend)
+    attn = plan(PagedAttention(scratch_workspace(torch.device(DEVICE))), p, backend)
     base_k, base_v = p["k_scale"], p["v_scale"]
     for ks, vs in ((base_k, base_v), (2.0 * base_k, 0.5 * base_v), (base_k, base_v)):
         out, lse = run(attn, p, k_scale=ks, v_scale=vs)
@@ -405,7 +410,7 @@ def test_tc02_same_plan_fp8_kv_scale_pairs(backend):
 def test_tc02_invalid_scales_rejected_before_launch(backend):
     p = build_problem([4, 9], [30, 40], dtype=torch.bfloat16, seed=204, **_TC02_SHAPE)
     _resolve_or_skip(p, backend)
-    attn = plan(PagedAttention(torch.device(DEVICE)), p, backend)
+    attn = plan(PagedAttention(scratch_workspace(torch.device(DEVICE))), p, backend)
     calls = launch_spy(attn)
     for bad in (float("nan"), float("inf"), -float("inf"), 0.0, -1.0):
         with pytest.raises(ValueError, match="sm_scale"):
@@ -437,7 +442,7 @@ def test_tc02_invalid_scales_rejected_before_launch(backend):
         backend="auto",
     ).backends or backend not in ("fa2", "auto"):
         return
-    attn8 = plan(PagedAttention(torch.device(DEVICE)), p8, backend)
+    attn8 = plan(PagedAttention(scratch_workspace(torch.device(DEVICE))), p8, backend)
     calls8 = launch_spy(attn8)
     for nm in ("k_scale", "v_scale"):
         for bad in (float("nan"), float("inf"), 0.0, -0.5):
@@ -463,7 +468,7 @@ def test_tc02_float_kv_scales_effect(backend, dtype):
     run the same fixture."""
     p = build_problem([8], [8], dtype=dtype, seed=207, **_TC02_SHAPE)
     _resolve_or_skip(p, backend)
-    attn = plan(PagedAttention(torch.device(DEVICE)), p, backend)
+    attn = plan(PagedAttention(scratch_workspace(torch.device(DEVICE))), p, backend)
     s = 1.0 / math.sqrt(p["head_dim_qk"])
     outs = []
     for sc in (0.1, 2.0):
@@ -490,7 +495,7 @@ def test_tc02_float_kv_scales_math_property(backend, dtype):
         build_problem([7, 20, 1], [64, 30, 100], dtype=dtype, seed=209, **_TC02_SHAPE),
     ):
         _resolve_or_skip(p, backend)
-        attn = plan(PagedAttention(torch.device(DEVICE)), p, backend)
+        attn = plan(PagedAttention(scratch_workspace(torch.device(DEVICE))), p, backend)
         s = 1.0 / math.sqrt(p["head_dim_qk"])
         plain_out, plain_lse = reference(p)
         for ks, vs in ((0.5, None), (None, 2.0), (0.5, 2.0)):
@@ -520,7 +525,7 @@ def test_tc02_graph_bakes_the_captured_kv_scales(backend):
     p = build_problem([6, 12], [40, 70], dtype=torch.bfloat16, seed=210, **_TC02_SHAPE)
     _resolve_or_skip(p, backend)
     dev = torch.device(DEVICE)
-    attn = plan(PagedAttention(dev, use_cuda_graph=True), p, backend)
+    attn = plan(PagedAttention(scratch_workspace(dev), use_cuda_graph=True), p, backend)
     out = torch.empty(p["q"].shape[0], 8, 128, dtype=torch.bfloat16, device=dev)
     lse = torch.empty(p["q"].shape[0], 8, dtype=torch.float32, device=dev)
     s = 1.0 / math.sqrt(128)
@@ -555,7 +560,7 @@ def test_tc02_graph_bakes_the_captured_sm_scale(backend):
     p = build_problem([6, 12], [40, 70], dtype=torch.bfloat16, seed=206, **_TC02_SHAPE)
     _resolve_or_skip(p, backend)
     dev = torch.device(DEVICE)
-    attn = plan(PagedAttention(dev, use_cuda_graph=True), p, backend)
+    attn = plan(PagedAttention(scratch_workspace(dev), use_cuda_graph=True), p, backend)
     out = torch.empty(p["q"].shape[0], 8, 128, dtype=torch.bfloat16, device=dev)
     lse = torch.empty(p["q"].shape[0], 8, dtype=torch.float32, device=dev)
     s = 1.0 / math.sqrt(128)
@@ -777,7 +782,7 @@ def test_tc09_zero_kv_row():
     # zero-row contract: q rows of request 1 are padding; rows 0 and 2 must
     # equal the same problem without request 1
     md = make_metadata(p0)
-    attn = PagedAttention(torch.device(DEVICE)).plan(
+    attn = PagedAttention(scratch_workspace(torch.device(DEVICE))).plan(
         md,
         num_qo_heads=8,
         num_kv_heads=2,
@@ -858,9 +863,13 @@ def test_tc09_zero_q_row(backend, kv_zero):
     )
     if backend == "cake" and kv_zero:
         with pytest.raises(ValueError, match="kv_len == 0"):
-            PagedAttention(torch.device(DEVICE)).plan(md, backend=backend, **kw)
+            PagedAttention(scratch_workspace(torch.device(DEVICE))).plan(
+                md, backend=backend, **kw
+            )
         return
-    attn = PagedAttention(torch.device(DEVICE)).plan(md, backend=backend, **kw)
+    attn = PagedAttention(scratch_workspace(torch.device(DEVICE))).plan(
+        md, backend=backend, **kw
+    )
     out, lse = run(attn, p0)
     ref_out, ref_lse = reference(compact, causal=True)
     assert out.shape[0] == ref_out.shape[0] == int(p0["qo_indptr_cpu"][-1])
@@ -892,7 +901,9 @@ def test_tc09_zero_kv_row_cake_declines(monkeypatch):
     )
     _resolve_or_skip(p0, "cake")
     with pytest.raises(ValueError, match="kv_len == 0"):
-        PagedAttention(torch.device(DEVICE)).plan(md, backend="cake", **kw)
+        PagedAttention(scratch_workspace(torch.device(DEVICE))).plan(
+            md, backend="cake", **kw
+        )
     auto = _resolve_or_skip(p0, "auto")
     with_cake = dataclasses.replace(
         auto,
@@ -900,7 +911,9 @@ def test_tc09_zero_kv_row_cake_declines(monkeypatch):
         excluded={k: v for k, v in auto.excluded.items() if k != "cake"},
     )
     _lead_with(monkeypatch, "cake")
-    attn = PagedAttention(torch.device(DEVICE)).plan(md, backend=with_cake, **kw)
+    attn = PagedAttention(scratch_workspace(torch.device(DEVICE))).plan(
+        md, backend=with_cake, **kw
+    )
     trace = attn._impl.selection_trace
     assert trace[0][:2] == ("cake", "preflight") and "kv_len == 0" in trace[0][2]
     assert trace[-1] == (attn.backend, "preflight", "accepted")
@@ -940,7 +953,7 @@ def test_tc09_plan_rejections(label, over, match):
         backend="auto",
     )
     kw.update(over)
-    attn = PagedAttention(torch.device(DEVICE))
+    attn = PagedAttention(scratch_workspace(torch.device(DEVICE)))
     with pytest.raises(ValueError, match=match):
         attn.plan(make_metadata(p), **kw)
     assert attn.backend is None  # nothing was published
@@ -952,7 +965,7 @@ def test_tc09_causal_envelope_and_metadata_device():
     p = _legal(seed=903)
     kv = p["kv_seq_lens_cpu"].clone()
     kv[1] = 7  # q_len 8 > kv_len 7
-    attn = PagedAttention(torch.device(DEVICE))
+    attn = PagedAttention(scratch_workspace(torch.device(DEVICE)))
     with pytest.raises(ValueError, match="q_len_i <= kv_len_i"):
         plan(attn, _with_kv_lens(p, kv), "auto", causal=True)
     # the same metadata is legal non-causal
@@ -977,10 +990,10 @@ def test_tc09_run_rejections_before_launch(backend):
     p = _legal(seed=904)
     _resolve_or_skip(p, backend)
     dev = torch.device(DEVICE)
-    fresh = PagedAttention(dev)
+    fresh = PagedAttention(scratch_workspace(dev))
     with pytest.raises(ValueError, match="before plan"):
         run(fresh, p)
-    attn = plan(PagedAttention(dev), p, backend)
+    attn = plan(PagedAttention(scratch_workspace(dev)), p, backend)
     calls = launch_spy(attn)
     q, k, v = p["q"], p["k_cache"], p["v_cache"]
     total, h, d = q.shape
@@ -1211,7 +1224,7 @@ def plan_and_check_required(p, backend, **kw):
         p, backend, causal=causal, need_lse=lse_mode != "none", window_left=window_left
     )
     attn = plan(
-        PagedAttention(torch.device(p["device"])),
+        PagedAttention(scratch_workspace(torch.device(p["device"]))),
         p,
         backend,
         causal=causal,
@@ -1289,7 +1302,11 @@ def test_tc03_graph_mode_csr_page1_reserves_no_dense_table():
         seed=333,
     )
     resolve_required(p, "fa2")
-    attn = plan(PagedAttention(torch.device(DEVICE), use_cuda_graph=True), p, "fa2")
+    attn = plan(
+        PagedAttention(scratch_workspace(torch.device(DEVICE)), use_cuda_graph=True),
+        p,
+        "fa2",
+    )
     gb = attn._impl._graph  # white-box on purpose: the reservation is the bug
     dense = getattr(gb, "block_tables", None)
     assert dense is None or dense.numel() == 0, (
@@ -1591,7 +1608,7 @@ def test_tc05_strided_inputs(backend, case, monkeypatch):
 
     p2 = dict(p, q=q, k_cache=k, v_cache=v, k_ref=k.to(dev), v_ref=v, block_tables=bt)
     try:
-        attn = plan(PagedAttention(dev), p2, backend)
+        attn = plan(PagedAttention(scratch_workspace(dev)), p2, backend)
     except ValueError as e:  # rejected at plan time (before any state moved)
         assert not required, f"{backend} rejected a supported strided input: {e}"
         assert str(e)
@@ -1679,7 +1696,7 @@ def test_tc06_shared_prefix_pages_and_nan_canaries(backend, form):
         return q, dead
 
     p1, dead = poison_unreferenced(p, bt)
-    attn = plan(PagedAttention(dev), p1, backend)
+    attn = plan(PagedAttention(scratch_workspace(dev)), p1, backend)
     out, lse = run(attn, p1)
     assert_matches(out, lse, p1, lse_mode="base2")
 
@@ -1797,7 +1814,7 @@ def test_tc07_graph_cross_feature_replay(backend, feature):
     )
     _resolve_or_skip(p1, backend, need_lse=lse_mode != "none", window_left=window_left)
     dev = torch.device(DEVICE)
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     plan(attn, p1, backend, window_left=window_left, lse_mode=lse_mode)
     q = p1["q"].clone()
     k = p1["k_cache"].clone()
@@ -2046,7 +2063,7 @@ def test_tc08_capability_required_rows(row):
         pytest.fail(f"capability regression: required row rejected by resolve(): {e}")
     assert res.backends == (row["backend"],)
     attn = plan(
-        PagedAttention(torch.device(DEVICE)),
+        PagedAttention(scratch_workspace(torch.device(DEVICE))),
         p,
         res,
         causal=row["causal"],
@@ -2095,9 +2112,9 @@ def test_tc11_multi_instance_shared_workspace_oracle(backend):
     for p in probs:
         _resolve_or_skip(p, backend)
     insts = [
-        PagedAttention(dev, use_cuda_graph=True),
-        PagedAttention(dev, use_cuda_graph=True),
-        PagedAttention(dev),
+        PagedAttention(scratch_workspace(dev), use_cuda_graph=True),
+        PagedAttention(scratch_workspace(dev), use_cuda_graph=True),
+        PagedAttention(scratch_workspace(dev)),
     ]
     for attn, p in zip(insts, probs, strict=True):
         plan(attn, p, backend)

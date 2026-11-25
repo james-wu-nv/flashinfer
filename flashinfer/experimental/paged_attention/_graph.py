@@ -55,11 +55,11 @@ class GraphCapacity:
 
         cap = GraphCapacity(batch_size=256, total_q_tokens=1024, max_q_len=4,
                             max_kv_len=131072, page_size=16, table_width=8192)
-        attn = PagedAttention(device, graph_capacity=cap)
+        attn = PagedAttention(workspace, graph_capacity=cap)
 
     That is the dense ``block_tables`` form; the flat ``kv_page_indices`` form
     passes ``kv_input_form="page_indices"`` and ``flat_capacity=`` instead of
-    ``table_width=``.  ``PagedAttention(use_cuda_graph=True)`` infers the
+    ``table_width=``.  ``PagedAttention(workspace, use_cuda_graph=True)`` infers the
     capacity from the first plan instead (:meth:`from_metadata`).
 
     Rules every later batch (a re-``plan()``) is checked against:

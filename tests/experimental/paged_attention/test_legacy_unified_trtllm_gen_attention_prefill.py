@@ -415,7 +415,7 @@ def _test_trtllm_batch_prefill(
         max_q_len=max_q_len_val,
         max_kv_len=torch.max(seq_lens).item(),
     )
-    attn = PagedAttention(DEVICE, workspace_buffer=workspace_buffer)
+    attn = PagedAttention(workspace_buffer)
     attn.plan(
         metadata,
         num_qo_heads=num_qo_heads,

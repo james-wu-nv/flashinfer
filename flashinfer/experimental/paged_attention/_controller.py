@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import dataclasses
 import math
-import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -63,44 +62,28 @@ from ._planning import FORM_BLOCK_TABLES, Derived
 from ._selection import resolve_paged_attention
 
 # ---------------------------------------------------------------------------
-# Scratch workspace.  Every backend runs on plain scratch (the role of the
-# legacy wrappers' caller-owned float_workspace_buffer; trtllm-gen carves its
-# softmax-stats/scratch regions out of the same kind of buffer).  An engine
-# holds one controller per CUDA-graph bucket, so the workspace is ONE lazily
-# allocated pool per device shared by every instance, unless the caller passes
-# its own (e.g. the buffer it already shares with legacy wrappers).  Sharing
-# follows the legacy wrappers' rule: instances sharing a workspace must not
-# run concurrently on different streams.
+# Scratch workspace.  Every backend runs on one caller-owned buffer, passed to
+# the constructor as the legacy wrappers and the MLA wrapper take their
+# float_workspace_buffer: fa2 carves its split-KV scratch out of it,
+# trtllm-gen its softmax stats, cuDNN its graph workspace.  The library
+# allocates none, so the bytes are in the engine's memory budget from init
+# and are released with the engine's buffer.  One buffer may back every
+# instance of an engine (one controller per CUDA-graph bucket) under the
+# legacy rule: instances sharing a workspace must not run concurrently on
+# different streams.
 #
-# Default size.  The fa2 split-KV planner is the only consumer whose need
-# grows with the geometry (formulas in _backends/fa_backend.py).  Before the
-# planner reserved per query row (#5177) the legacy wrappers' documented
-# 128 MiB overflowed on an ordinary prefill shape (ledger M14: one request,
-# q = kv = 2048, 32 query / 8 KV heads, head_dim 128, graph mode needed
-# 129 MiB; now 32.25 MiB).  512 MiB is the upper end of what the engines
-# settled on for the same kernels (vLLM 394 MiB, SGLang 384 MiB and 512 MiB
-# for Qwen2/3); on a B200 (148 SMs) it covers, for 32/8 heads at head_dim
-# 128, eager prefill of any batch (18.75 MiB), decode graph buckets up to
-# 1024 requests (80.5 MiB), 4096-token graph prefill (64.5 MiB) and an
-# 8192-token single-request graph capture (129 MiB).  It is one allocation
-# per device.  Anything larger is a caller-owned buffer sized by
-# workspace_requirements().  A backend whose planner would overflow the
-# buffer declines the batch in its preflight (typed), before any kernel-side
-# error: auto tries the next candidate, and a named backend -- or a set in
-# which no candidate fits -- gets a ValueError naming the bytes.
+# Size.  The fa2 split-KV planner is the only consumer whose need grows with
+# the geometry (formulas in _backends/fa_backend.py); workspace_requirements()
+# bounds it for a capacity.  For scale, on a B200 (148 SMs) at 32/8 heads and
+# head_dim 128: eager prefill of any batch 18.75 MiB, decode graph buckets up
+# to 1024 requests 80.5 MiB, 4096-token graph prefill 64.5 MiB, an
+# 8192-token single-request graph capture 129 MiB (the engines settled on
+# 394 MiB in vLLM, 384 MiB and 512 MiB in SGLang for the same kernels).  A
+# backend whose planner would overflow the buffer declines the batch in its
+# preflight (typed), before any kernel-side error: auto tries the next
+# candidate, and a named backend -- or a set in which no candidate fits --
+# gets a ValueError naming the bytes.
 # ---------------------------------------------------------------------------
-_WORKSPACE_BYTES = 512 * 1024 * 1024
-_shared_workspaces: Dict[torch.device, torch.Tensor] = {}
-_shared_workspaces_lock = threading.Lock()
-
-
-def _shared_workspace(device: torch.device) -> torch.Tensor:
-    with _shared_workspaces_lock:
-        ws = _shared_workspaces.get(device)
-        if ws is None:
-            ws = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
-            _shared_workspaces[device] = ws
-        return ws
 
 
 def workspace_requirements(
@@ -198,15 +181,14 @@ def workspace_requirements(
     return max(workspace_bound(name, **geometry) for name in candidates)
 
 
-def _validate_workspace_buffer(buf: Any, device: torch.device) -> torch.Tensor:
-    """Caller-supplied scratch workspace -> flat uint8 view on ``device``."""
+def _validate_workspace_buffer(buf: Any) -> torch.Tensor:
+    """Caller-owned scratch workspace -> flat uint8 view (on its device)."""
     _expect(
         isinstance(buf, torch.Tensor),
-        f"workspace_buffer must be a torch.Tensor, got {type(buf).__name__}",
-    )
-    _expect(
-        buf.device == device,
-        f"workspace_buffer lives on {buf.device} but this instance is bound to {device}",
+        "workspace_buffer must be a torch.Tensor (a contiguous 1-D uint8 "
+        "buffer on the device to run on, sized with "
+        "PagedAttention.workspace_requirements(...)), got "
+        f"{type(buf).__name__}",
     )
     _expect(
         buf.dim() == 1 and buf.is_contiguous(),
@@ -299,24 +281,18 @@ def _narrowed_to(resolution: Resolution, name: str) -> Resolution:
 class PagedAttentionController:
     def __init__(
         self,
-        device: Optional[torch.device] = None,
+        workspace_buffer: torch.Tensor,
         *,
         graph_capacity: Optional[GraphCapacity] = None,
         use_cuda_graph: bool = False,
-        workspace_buffer: Optional[torch.Tensor] = None,
     ):
-        dev = torch.device(device) if device is not None else torch.device("cuda")
+        # the caller's scratch buffer; the instance runs on its device
+        self._workspace: torch.Tensor = _validate_workspace_buffer(workspace_buffer)
+        dev = self._workspace.device
         if dev.type == "cuda" and dev.index is None:
             dev = torch.device("cuda", torch.cuda.current_device())
         self.device = dev
         self._backends: Dict[Any, Any] = {}
-        # the caller's scratch buffer, or (lazily, on the first plan) the
-        # per-device shared one — never a per-instance allocation
-        self._workspace: Optional[torch.Tensor] = (
-            _validate_workspace_buffer(workspace_buffer, dev)
-            if workspace_buffer is not None
-            else None
-        )
         # CUDA-graph mode: reserved storage (_graph.py) sized by an explicit
         # GraphCapacity here, or by the first plan when only use_cuda_graph=True
         if graph_capacity is not None:
@@ -362,11 +338,6 @@ class PagedAttentionController:
     @property
     def resolution(self) -> Optional[Resolution]:
         return self._resolution
-
-    def _scratch_workspace(self) -> torch.Tensor:
-        if self._workspace is None:
-            self._workspace = _shared_workspace(self.device)
-        return self._workspace
 
     def _device_binding(self) -> Tuple[int, int, int]:
         """``(cc_major, cc_minor, device_index)`` of the device this instance runs on."""
@@ -678,7 +649,7 @@ class PagedAttentionController:
                     name,
                     self.device,
                     kv_layout,
-                    self._scratch_workspace(),
+                    self._workspace,
                     graph_capacity=gb.capacity if gb is not None else None,
                 )
                 if gb is None or self._graph is not None:
@@ -713,7 +684,7 @@ class PagedAttentionController:
                     f"planned {[a[0] for a in accepted]}; the first run() selects",
                 )
             )
-            workspace = self._scratch_workspace()
+            workspace = self._workspace
             workload = autotune_workload(
                 config=resolution.config[:-2] + (resolution.device_binding[:2],),
                 facts=facts,

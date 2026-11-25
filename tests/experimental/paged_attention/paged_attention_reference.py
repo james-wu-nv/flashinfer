@@ -1,4 +1,4 @@
-"""Reference oracle for the unified paged-prefill prototype tests/fuzzer.
+"""Reference oracle (and the scratch workspace) for the unified paged-prefill tests.
 
 Pure-torch fp32 implementation of paged batch prefill with bottom-right
 causal masking, returning both the output and the contract-form LSE
@@ -12,6 +12,25 @@ import math
 from typing import Optional, Tuple
 
 import torch
+
+# ``PagedAttention`` runs on a caller-owned scratch workspace.  The tests take
+# theirs from here: one buffer per device, reused by every instance (they run
+# one at a time), of the size the engines allocate at the upper end.
+SCRATCH_WORKSPACE_BYTES = 512 * 1024 * 1024
+_scratch_workspaces = {}
+
+
+def scratch_workspace(device=None, nbytes: int = SCRATCH_WORKSPACE_BYTES):
+    """The tests' scratch workspace on ``device`` (default: the current CUDA
+    device): a 1-D uint8 buffer of ``nbytes``, allocated once per device and
+    size."""
+    dev = torch.device(device) if device is not None else torch.device("cuda")
+    if dev.type == "cuda" and dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
+    key = (dev, nbytes)
+    if key not in _scratch_workspaces:
+        _scratch_workspaces[key] = torch.empty(nbytes, dtype=torch.uint8, device=dev)
+    return _scratch_workspaces[key]
 
 
 def reference_paged_prefill(

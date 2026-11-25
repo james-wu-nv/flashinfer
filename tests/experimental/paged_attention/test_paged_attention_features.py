@@ -16,7 +16,7 @@ from flashinfer.prefill import (
     resolve_paged_attention,
 )
 
-from .paged_attention_reference import reference_paged_prefill
+from .paged_attention_reference import reference_paged_prefill, scratch_workspace
 from .test_paged_attention_prototype import (
     LSE_TOL,
     OUT_TOL,
@@ -73,7 +73,7 @@ def _resolve_kw(p, **extra):
 
 
 def _run(p, backend, *, sinks=None, sm_scale=None, **plan_extra):
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     attn.plan(make_metadata(p), backend=backend, **_plan_kw(p, **plan_extra))
     run_kw = dict(sm_scale=sm_scale, k_scale=p.get("k_scale"), v_scale=p.get("v_scale"))
     if sinks is not None:
@@ -182,7 +182,7 @@ def test_logits_soft_cap_sees_the_k_scaled_logits(backend):
 def test_logits_soft_cap_excludes_backends_at_plan():
     p = make_problem(seed=93, **_SHAPE)
     res = _resolve_or_skip(p, "auto")
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     # a Resolution resolved without the feature cannot be used with it (pinning)
     with pytest.raises(ValueError, match="pinned Resolution"):
         attn.plan(make_metadata(p), backend=res, **_plan_kw(p, logits_soft_cap=30.0))
@@ -300,7 +300,7 @@ def test_custom_mask_tree(backend):
     v2 = p["v_cache"].clone()
     k2[page, :, slot, :] = 5.0
     v2[page, :, slot, :] = 5.0
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     attn.plan(
         make_metadata(p), backend=backend, **_plan_kw(p, custom_mask=p["custom_mask"])
     )
@@ -339,7 +339,7 @@ def test_custom_mask_plan_is_sync_free():
     numel = int((q_lens * p["kv_seq_lens_cpu"].to(torch.int64)).sum())
     g = torch.Generator(device=dev).manual_seed(107)
     mask = torch.rand(numel, device=dev, generator=g) < 0.7
-    attn = PagedAttention(dev)
+    attn = PagedAttention(scratch_workspace(dev))
     md = make_metadata(p)
     kw = _plan_kw(p, custom_mask=mask, window_left=16)
     attn.plan(md, backend="fa2", **kw)  # warm-up: JIT modules, allocator
@@ -361,7 +361,7 @@ def test_custom_mask_contract():
     numel = int((q_lens * p["kv_seq_lens_cpu"].to(torch.int64)).sum())
     dev = torch.device(p["device"])
     good = torch.ones(numel, dtype=torch.bool, device=dev)
-    attn = PagedAttention(dev)
+    attn = PagedAttention(scratch_workspace(dev))
     md = make_metadata(p)
     with pytest.raises(ValueError, match="sum\\(q_len_i \\* kv_len_i\\)"):
         attn.plan(md, backend="fa2", **_plan_kw(p, custom_mask=good[:-1]))
@@ -383,7 +383,7 @@ def test_custom_mask_contract():
         ):
             attn.plan(md, backend=backend, **_plan_kw(p, custom_mask=good))
     # graph mode: named follow-up, not a fallback
-    g = PagedAttention(dev, use_cuda_graph=True)
+    g = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     with pytest.raises(ValueError, match="follow-up"):
         g.plan(md, backend="fa2", **_plan_kw(p, custom_mask=good))
     assert g.backend is None
@@ -442,7 +442,7 @@ def test_attention_sinks_are_a_per_run_value(backend):
     """One plan, two run() calls with different sinks (per-layer values)."""
     p = make_problem(seed=113, **_SHAPE)
     _skip_unless_runnable(p, backend, sinks=True)
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     attn.plan(make_metadata(p), backend=backend, **_plan_kw(p, use_sinks=True))
     for seed in (1, 2):
         sinks = _sinks(p, seed)
@@ -483,7 +483,7 @@ def test_sinks_contract():
     res = resolve_paged_attention(backend="auto", **_resolve_kw(p, sinks=True))
     assert "cudnn" not in res.backends
     assert res.excluded["cudnn"] == "attention sinks not supported"
-    attn = PagedAttention(dev)
+    attn = PagedAttention(scratch_workspace(dev))
     md = make_metadata(p)
     # sinks without the plan flag: loud (the default kernels would drop them)
     attn.plan(md, backend="fa2", **_plan_kw(p))
@@ -514,7 +514,7 @@ def test_sinks_with_soft_cap_is_a_typed_rejection_on_fa():
     raises."""
     p = make_problem(seed=131, **_SHAPE)
     _skip_unless_runnable(p, "fa2", sinks=True)
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     md = make_metadata(p)
     kw = _plan_kw(p, use_sinks=True, logits_soft_cap=30.0)
     with pytest.raises(ValueError, match="no pinned candidate.*no logits soft cap"):
@@ -547,7 +547,7 @@ def test_sink_kernels_are_specialized_per_head_dim():
         p = make_problem(seed=seed, **dict(_SHAPE, head_dim_qk=d))
         _skip_unless_runnable(p, "fa2", sinks=True)
         sinks = _sinks(p, seed)
-        attn = PagedAttention(torch.device(p["device"]))
+        attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
         attn.plan(make_metadata(p), backend="fa2", **_plan_kw(p, use_sinks=True))
         out = torch.full(
             (p["q"].shape[0], p["num_qo_heads"], d),

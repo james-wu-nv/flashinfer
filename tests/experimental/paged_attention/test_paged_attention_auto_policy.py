@@ -53,7 +53,7 @@ from flashinfer.experimental.paged_attention._selection import (
     resolve_paged_attention as _resolve,
 )
 
-from .paged_attention_reference import reference_paged_prefill
+from .paged_attention_reference import reference_paged_prefill, scratch_workspace
 from .test_paged_attention_prototype import LSE_TOL, OUT_TOL, make_metadata
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1315,11 +1315,7 @@ class _Planners:
         }
 
     def controller(self, **kwargs):
-        return PagedAttentionController(
-            torch.device("cpu"),
-            workspace_buffer=torch.empty(8, dtype=torch.uint8),
-            **kwargs,
-        )
+        return PagedAttentionController(torch.empty(8, dtype=torch.uint8), **kwargs)
 
 
 def _cpu_planners(monkeypatch, cc=(10, 0)):
@@ -2272,4 +2268,4 @@ def test_auto_plan_does_not_read_the_device_back(monkeypatch, first, shape):
 def PagedAttentionFacade(**kwargs):
     from flashinfer.prefill import PagedAttention
 
-    return PagedAttention(torch.device("cuda:0"), **kwargs)
+    return PagedAttention(scratch_workspace(torch.device("cuda:0")), **kwargs)

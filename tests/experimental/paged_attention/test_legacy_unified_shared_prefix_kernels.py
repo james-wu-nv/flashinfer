@@ -197,7 +197,7 @@ def test_batch_attention_with_shared_prefix_paged_kv_cache(
         max_q_len=q.shape[0],
         max_kv_len=shared_kv_len,
     )
-    attn_top = PagedAttention(torch.device("cuda:0"), workspace_buffer=workspace)
+    attn_top = PagedAttention(workspace)
     attn_top.plan(metadata_top, **plan_kw, causal=False)
     assert attn_top.backend == backend
 
@@ -216,7 +216,7 @@ def test_batch_attention_with_shared_prefix_paged_kv_cache(
         max_q_len=q.shape[0] // batch_size,
         max_kv_len=unique_kv_len,
     )
-    attn_bottom = PagedAttention(torch.device("cuda:0"), workspace_buffer=workspace)
+    attn_bottom = PagedAttention(workspace)
     attn_bottom.plan(metadata_bottom, **plan_kw, causal=causal)
     assert attn_bottom.backend == backend
 

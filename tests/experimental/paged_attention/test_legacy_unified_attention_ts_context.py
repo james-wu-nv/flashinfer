@@ -34,6 +34,9 @@ from flashinfer.prefill import (
 )
 from flashinfer.utils import is_sm100a_supported
 
+from .paged_attention_reference import scratch_workspace
+
+
 # the legacy module importorskips the cutlass DSL, as the legacy file does
 from tests.attention.test_attention_ts_context import (
     _make_native_paged_metadata,
@@ -883,7 +886,7 @@ def test_attention_ts_context_one_shot_apis_reject_cuda_graph_capture(
         max_q_len=1,
         max_kv_len=1,
     )
-    attn = PagedAttention(torch.device("cuda"))
+    attn = PagedAttention(scratch_workspace(torch.device("cuda")))
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="cannot run during CUDA graph capture"):
         attn.plan(
@@ -1014,7 +1017,7 @@ def test_attention_ts_context_run_rejects_causal_q_longer_than_kv(paged: bool):
         seed=2026071930,
     )
     md = _dense(case, _make_native_paged_metadata(case))
-    attn = PagedAttention(torch.device("cuda"))
+    attn = PagedAttention(scratch_workspace(torch.device("cuda")))
     with pytest.raises(ValueError, match=r"request 1 has q_len 3 > kv_len 2"):
         attn.plan(
             md,

@@ -53,6 +53,7 @@ from flashinfer.cudnn import prefill as cudnn_prefill
 from flashinfer.experimental.paged_attention._backends import cudnn_backend
 from flashinfer.prefill import PagedAttention
 
+from .paged_attention_reference import scratch_workspace
 from .test_paged_attention_coverage import (
     assert_canaries,
     assert_matches,
@@ -155,7 +156,9 @@ def _require_prepared():
 def _plan_cudnn(p, *, causal=True, lse_mode="base2", attn=None, **attn_kwargs):
     """Resolve-or-skip, then plan ``p`` on cudnn; returns (attn, backend)."""
     _resolve_or_skip(p, "cudnn", causal=causal, need_lse=lse_mode != "none")
-    attn = attn or PagedAttention(torch.device(DEVICE), **attn_kwargs)
+    attn = attn or PagedAttention(
+        scratch_workspace(torch.device(DEVICE)), **attn_kwargs
+    )
     plan(attn, p, "cudnn", causal=causal, lse_mode=lse_mode)
     assert attn.backend == "cudnn"
     return attn, attn._impl._active

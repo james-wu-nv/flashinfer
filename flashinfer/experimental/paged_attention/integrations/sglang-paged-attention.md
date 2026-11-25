@@ -44,10 +44,9 @@ are those of `flashinfer/_paged_attention.py` at the integration head.
 +    kv_input_form="page_indices",     # the flat kv_indices sglang builds
 +    window_left=self.sliding_window_size if swa_layer_group else -1,
 +)
-+# workspace_buffer: hand it the workspace sglang already shares with its
-+# legacy wrappers (:438-444); omitted, instances share a 512 MiB per-device
-+# library pool
-+self.prefill_attn = PagedAttention(self.device, workspace_buffer=self.workspace_buffer)
++# workspace_buffer (required, as for the legacy wrappers): the workspace
++# sglang already shares with them (:438-444)
++self.prefill_attn = PagedAttention(self.workspace_buffer)
 ```
 
 `backend="fa2"` pinning becomes unnecessary: at `page_size=1` the
@@ -142,7 +141,7 @@ cap = GraphCapacity(
     page_size=1, kv_input_form="page_indices",
     flat_capacity=bs * max_context_len,        # reserved length of kv_indices
 )
-attn = PagedAttention(self.device, graph_capacity=cap, workspace_buffer=self.workspace_buffer)
+attn = PagedAttention(self.workspace_buffer, graph_capacity=cap)
 attn.plan(md_capture, ..., lse_mode="base2", backend=self._prefill_resolution)
 with torch.cuda.graph(g):
     attn.run(q_buf, (k_pool, v_pool), out=out_buf, lse=lse_buf, sm_scale=layer.scaling)

@@ -86,7 +86,7 @@ def test_gemma4_fp8_kv_head_dim_512_chunked_prefill_matches_torch(backend):
     )
 
     workspace = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=legacy.DEVICE)
-    attn = PagedAttention(legacy.DEVICE, workspace_buffer=workspace)
+    attn = PagedAttention(workspace)
     attn.plan(
         metadata,
         num_qo_heads=legacy.NUM_QO_HEADS,

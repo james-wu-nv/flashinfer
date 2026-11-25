@@ -22,7 +22,7 @@ import torch
 
 from flashinfer.prefill import resolve_paged_attention
 
-from .paged_attention_reference import reference_paged_prefill
+from .paged_attention_reference import reference_paged_prefill, scratch_workspace
 from .test_paged_attention_prototype import make_problem
 
 OUT_TOL = dict(atol=2e-2, rtol=2e-2)
@@ -448,7 +448,7 @@ def _plan(p, backend, **plan_kw):
         backend=backend,
     )
     kw.update(plan_kw)
-    attn = PagedAttention(torch.device(p["device"]))
+    attn = PagedAttention(scratch_workspace(torch.device(p["device"])))
     attn.plan(make_metadata(p), **kw)
     return attn
 
@@ -617,7 +617,7 @@ def test_auto_runs_a_fused_qkv_query_on_the_leading_candidate(
         **heads,
     )
     dev = torch.device(p["device"])
-    attn = PagedAttention(dev, use_cuda_graph=graph)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=graph)
     attn.plan(make_metadata(p), **plan_kw)
     assert attn.backend == first  # the forced rank, not a heuristic's
 
@@ -782,7 +782,7 @@ def test_capacity_width_block_table_graph_mode(backend):
     p, _ = _with_capacity_table(_problem(seed=106))
     _skip_unless_runnable(p, backend)
     dev = torch.device(p["device"])
-    attn = PagedAttention(dev, use_cuda_graph=True)
+    attn = PagedAttention(scratch_workspace(dev), use_cuda_graph=True)
     plan_kw = dict(
         num_qo_heads=p["num_qo_heads"],
         num_kv_heads=p["num_kv_heads"],

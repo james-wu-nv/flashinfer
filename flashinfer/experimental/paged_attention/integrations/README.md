@@ -78,5 +78,5 @@ Engine-side, to carry in the real PRs:
   custom mask is a library follow-up.
 
 Both engines: pass the workspace the engine already shares with its legacy
-wrappers. The library's shared default is 512 MiB;
+wrappers (the buffer is required; the library allocates none).
 `PagedAttention.workspace_requirements()` bounds the need of a bucket.

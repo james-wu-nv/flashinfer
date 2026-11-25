@@ -43,6 +43,9 @@ for i in range(B):
 q = torch.randn(int(q_lens.sum()), H_QO, D, dtype=torch.bfloat16, device=dev)
 k_cache = torch.randn(pool, H_KV, PAGE, D, dtype=torch.bfloat16, device=dev)
 v_cache = torch.randn(pool, H_KV, PAGE, D, dtype=torch.bfloat16, device=dev)
+# caller-owned scratch every backend runs on (the legacy wrappers'
+# float_workspace_buffer); PagedAttention.workspace_requirements() bounds it
+workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=dev)
 
 md = PagedAttentionMetadata.dense(
     qo_indptr_cpu.to(dev),
@@ -81,7 +84,7 @@ print(res.explain(), "\n")
 print("=== 2/3. same call, every runnable backend ===")
 results = {}
 for name in res.backends:
-    attn = PagedAttention(dev)
+    attn = PagedAttention(workspace)
     attn.plan(md, **cfg, backend=name)
     out, lse = attn.run(q, (k_cache, v_cache))
     results[name] = (out, lse)
@@ -112,7 +115,7 @@ md_d = PagedAttentionMetadata.dense(
     qo_indptr_cpu=qo1,
     kv_seq_lens_cpu=kv_lens,
 )
-attn = PagedAttention(dev)
+attn = PagedAttention(workspace)
 attn.plan(md_d, **cfg, backend="auto")
 out, lse = attn.run(q[:B], (k_cache, v_cache))
 print(f"auto chose: {attn.backend}; out={tuple(out.shape)} lse={tuple(lse.shape)}\n")

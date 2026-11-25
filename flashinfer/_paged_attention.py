@@ -72,7 +72,7 @@ Prototype simplifications (documented, not hidden):
 
 CUDA-graph lifecycle — three stages (``experimental/paged_attention/_graph.py``):
 
-1.  Construct.  ``PagedAttention(device, graph_capacity=GraphCapacity(...))``
+1.  Construct.  ``PagedAttention(workspace, graph_capacity=GraphCapacity(...))``
     reserves the metadata storage a captured ``run()`` reads, sized by the
     capacity (batch size, total query tokens, host maxes, page size, block
     table width or flat page-id capacity) — one instance per graph bucket.
@@ -279,7 +279,8 @@ class PagedAttention:
                                       head_dim_qk=128, q_dtype=torch.bfloat16,
                                       page_size=16, need_lse=True)
         # ... engine allocates its KV pool in res.kv_layout, sets dtypes ...
-        attn = PagedAttention(device)
+        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+        attn = PagedAttention(workspace)   # caller-owned scratch, as the legacy wrappers
         for step in engine:
             md = PagedAttentionMetadata.dense(qo_indptr, kv_seq_lens, block_tables,
                                               page_size=16, max_q_len=..., max_kv_len=...,
@@ -299,9 +300,8 @@ class PagedAttention:
         nbytes = PagedAttention.workspace_requirements(
             cap, device=device, num_qo_heads=8, num_kv_heads=2, head_dim_qk=128,
             q_dtype=torch.bfloat16)          # scratch every plan in cap fits
-        attn = PagedAttention(device, graph_capacity=cap,
-                              workspace_buffer=torch.empty(nbytes, dtype=torch.uint8,
-                                                           device=device))
+        attn = PagedAttention(torch.empty(nbytes, dtype=torch.uint8, device=device),
+                              graph_capacity=cap)
         attn.plan(md0, num_qo_heads=8, num_kv_heads=2, head_dim_qk=128,
                   q_dtype=torch.bfloat16, causal=True, lse_mode="base2",
                   backend=res)                           # freezes backend + semantics
@@ -317,13 +317,29 @@ class PagedAttention:
 
     def __init__(
         self,
-        device: Optional[torch.device] = None,
+        workspace_buffer: torch.Tensor,
         *,
         graph_capacity: Optional["GraphCapacity"] = None,
         use_cuda_graph: bool = False,
-        workspace_buffer: Optional[torch.Tensor] = None,
     ):
         """
+        - ``workspace_buffer``: the caller-owned scratch workspace every
+          backend's kernels run on, a contiguous 1-D uint8 (or int8) tensor —
+          the role of the legacy wrappers' and the MLA wrapper's
+          ``float_workspace_buffer``.  The instance runs on the buffer's
+          device (:attr:`device`); the library allocates no workspace of its
+          own.  Size it with :meth:`workspace_requirements` for the largest
+          geometry the instance will plan, or pass the buffer the engine
+          already shares with its legacy wrappers (128 MiB is their documented
+          starting point).  One buffer may back several instances — one per
+          graph bucket costs no workspace per bucket — but instances sharing
+          a workspace must not run concurrently on different streams.  A
+          backend whose planner allocation for a batch would not fit the
+          buffer declines the batch in ``plan()``: ``"auto"`` moves on to a
+          candidate that fits, and a named backend, or a candidate set in
+          which none fits, raises ``ValueError`` naming the required bytes
+          (``backend 'fa2' cannot plan this batch: needs N bytes of scratch
+          workspace ...``).
         - ``graph_capacity``: a :class:`GraphCapacity` — the capture shapes of
           one CUDA-graph bucket (batch size, total query tokens, host maxes,
           page size, block-table width or flat page-id capacity).  The
@@ -336,35 +352,18 @@ class PagedAttention:
           Use one instance per graph bucket; this is the recommended form.
         - ``use_cuda_graph``: graph mode with the capacity inferred from the
           FIRST plan (compatibility form of ``graph_capacity``).
-        - ``workspace_buffer``: optional caller-owned scratch workspace
-          (contiguous 1-D uint8 or int8 on ``device``) that every backend's
-          kernels run on — pass the buffer the engine already shares with its
-          legacy wrappers, sized with :meth:`workspace_requirements` for the
-          largest geometry it will plan.  By default every instance on a
-          device shares one lazily allocated library-owned 512 MiB pool (the
-          upper end of the engines' own defaults for these kernels), so
-          holding one instance per graph bucket costs no workspace per
-          bucket.  A backend whose planner allocation for a batch would not
-          fit the buffer in use declines the batch in ``plan()``: ``"auto"``
-          moves on to a candidate that fits, and a named backend, or a
-          candidate set in which none fits, raises ``ValueError`` naming the
-          required bytes (``backend 'fa2' cannot plan this batch: needs N
-          bytes of scratch workspace ...``).
-          Instances sharing a workspace must not run concurrently on
-          different streams; pass a private buffer where that isolation is
-          needed.
         """
         from .experimental.paged_attention import PagedAttentionController
 
         self._impl = PagedAttentionController(
-            device,
+            workspace_buffer,
             graph_capacity=graph_capacity,
             use_cuda_graph=use_cuda_graph,
-            workspace_buffer=workspace_buffer,
         )
 
     @property
     def device(self) -> torch.device:
+        """The device of ``workspace_buffer``, which the instance runs on."""
         return self._impl.device
 
     @property

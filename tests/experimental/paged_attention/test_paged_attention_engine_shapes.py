@@ -37,7 +37,7 @@ from flashinfer.prefill import (
     resolve_paged_attention,
 )
 
-from .paged_attention_reference import reference_paged_prefill
+from .paged_attention_reference import reference_paged_prefill, scratch_workspace
 
 DEVICE = "cuda:0"
 
@@ -111,7 +111,7 @@ def test_vllm_shaped_prefill_mixed_batch():
         need_lse=True,  # vLLM DCP consumes LSE
     )
 
-    attn = PagedAttention(torch.device(DEVICE))
+    attn = PagedAttention(scratch_workspace(torch.device(DEVICE)))
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
@@ -215,7 +215,7 @@ def test_sglang_shaped_prefill_token_csr():
     # sglang pins fa2 today; assert the pinned form is in the candidate set
     assert "fa2" in res.backends
 
-    attn = PagedAttention(torch.device(DEVICE))
+    attn = PagedAttention(scratch_workspace(torch.device(DEVICE)))
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
@@ -302,7 +302,7 @@ def test_vllm_shaped_sliding_window_uniform():
     )
     assert "cudnn" in res.excluded  # windowed: cudnn capability-excluded
 
-    attn = PagedAttention(torch.device(DEVICE))
+    attn = PagedAttention(scratch_workspace(torch.device(DEVICE)))
     md = PagedAttentionMetadata.dense(
         qo_indptr_cpu.to(DEVICE),
         kv_lens_cpu.to(DEVICE),

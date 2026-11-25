@@ -160,7 +160,7 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
     )
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
-    attn_f16 = PagedAttention(q.device, workspace_buffer=workspace_buffer)
+    attn_f16 = PagedAttention(workspace_buffer)
     attn_f16.plan(
         metadata,
         num_qo_heads=num_qo_heads,
@@ -181,7 +181,7 @@ def test_batch_prefill_with_paged_kv_cache_fp8_calibration_scale(
     v_fp8 = (v_data / v_scale).to(dtype)
     kv_data_fp8 = torch.cat([k_fp8, v_fp8], dim=1)
 
-    attn_f8 = PagedAttention(q.device, workspace_buffer=workspace_buffer)
+    attn_f8 = PagedAttention(workspace_buffer)
     attn_f8.plan(
         metadata,
         num_qo_heads=num_qo_heads,
@@ -269,7 +269,7 @@ def test_paged_fp8_h512_long_q_keeps_cta32(backend):
     )
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8).to(0)
-    attn = PagedAttention(q.device, workspace_buffer=workspace_buffer)
+    attn = PagedAttention(workspace_buffer)
     attn.plan(
         metadata,
         num_qo_heads=num_qo_heads,
