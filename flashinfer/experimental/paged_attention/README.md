@@ -505,11 +505,11 @@ its lengths under either bound.
 
 ## Benchmark
 
-`benchmarks/bench_paged_attention.py` is a standalone script (the API is
+`benchmarks/experimental/paged_attention/bench_paged_attention.py` is a standalone script (the API is
 experimental, so it is not a routine of the shared benchmark CLI):
 
 ```bash
-python benchmarks/bench_paged_attention.py \
+python benchmarks/experimental/paged_attention/bench_paged_attention.py \
     --backends fa2 cudnn trtllm-gen auto --batch_size 4 --s_qo 128 \
     --s_kv 1024 --num_qo_heads 32 --num_kv_heads 8 --head_dim_qk 128 \
     --page_size 16 --causal --kv_layout HND --lse_mode basee --refcheck
@@ -540,7 +540,7 @@ autotuning). `--backends autotune` warms each instance up inside
 `flashinfer.autotune(True)` and then times the selected backend; its eager
 `plan` rows include preparing every candidate. The benchmark generates
 fp16/bf16 Q and KV; the CSV columns are `OUTPUT_COLUMNS` in the script.
-`--testlist benchmarks/bench_paged_attention_testlist.txt` runs a list of
+`--testlist benchmarks/experimental/paged_attention/bench_paged_attention_testlist.txt` runs a list of
 such command lines into one CSV (`--output_path`).
 
 ## API logging and trace
@@ -580,8 +580,8 @@ only through deferred imports in `flashinfer/_paged_attention.py`.
 ```bash
 python -m pytest tests/experimental/paged_attention -q
 python examples/experimental/paged_attention.py
-python benchmarks/bench_paged_attention.py \
-    --testlist benchmarks/bench_paged_attention_testlist.txt --output_path pa.csv
+python benchmarks/experimental/paged_attention/bench_paged_attention.py \
+    --testlist benchmarks/experimental/paged_attention/bench_paged_attention_testlist.txt --output_path pa.csv
 ```
 
 `tests/experimental/paged_attention/` holds the suites of this API

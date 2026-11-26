@@ -1035,7 +1035,7 @@ only device work is the two cross-form conversions:
 The mirrors are trusted to match the device tensors; validating equality
 would cost the sync this path removes. With the mirrors supplied, the eager
 plan on trtllm-gen with a dense table issues zero kernel launches and one
-pinned host-to-device copy (`benchmarks/bench_paged_attention_plan.py`
+pinned host-to-device copy (`benchmarks/experimental/paged_attention/bench_paged_attention_plan.py`
 counts the launches and copies of a plan). The eager cuDNN plan adds the
 five small kernels that build its own page table (see "Page-table ABI per
 backend"). No warm plan uploads from pageable memory or
@@ -1395,7 +1395,7 @@ controller adds the backend's name as for every preflight reason).
 
 ### Benchmark
 
-`benchmarks/bench_paged_attention.py` (a standalone script; the API is
+`benchmarks/experimental/paged_attention/bench_paged_attention.py` (a standalone script; the API is
 experimental, so it is not a routine of the shared benchmark CLI) times one set of inputs for every
 requested backend (`fa2`, `fa3`, `cudnn`, `trtllm-gen`, `cake`, `auto`),
 gates each on the fp32 oracle before timing, and emits one CSV row per
@@ -1417,7 +1417,7 @@ view of the case's wider block table with the actual `max_kv_len` (the
 unified cuDNN backend declares other bounds: its capacity's in CUDA-graph
 mode, here the table's full width, and a shape class with a table of its
 own in an eager plan).
-`benchmarks/bench_paged_attention_plan.py` is the micro-benchmark for
+`benchmarks/experimental/paged_attention/bench_paged_attention_plan.py` is the micro-benchmark for
 metadata construction, eager plan and graph re-plan cost, with launch and
 memcpy counts from the profiler.
 

@@ -1,4 +1,4 @@
-"""Regressions for ``benchmarks/bench_paged_attention.py`` (the standalone
+"""Regressions for ``benchmarks/experimental/paged_attention/bench_paged_attention.py`` (the standalone
 PagedAttention benchmark), driven in-process through the script's parser.
 
 Each test pins a review finding on the routine itself and fails on the
@@ -26,7 +26,12 @@ import sys
 import pytest
 import torch
 
-BENCHMARKS_DIR = pathlib.Path(__file__).resolve().parents[3] / "benchmarks"
+BENCHMARKS_DIR = (
+    pathlib.Path(__file__).resolve().parents[3]
+    / "benchmarks"
+    / "experimental"
+    / "paged_attention"
+)
 if str(BENCHMARKS_DIR) not in sys.path:
     sys.path.insert(0, str(BENCHMARKS_DIR))
 

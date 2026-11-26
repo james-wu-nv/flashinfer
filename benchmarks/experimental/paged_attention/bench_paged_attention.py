@@ -2,13 +2,13 @@
 
 Usage::
 
-    python benchmarks/bench_paged_attention.py \
+    python benchmarks/experimental/paged_attention/bench_paged_attention.py \
         --backends fa2 cudnn trtllm-gen auto --batch_size 8 --s_qo 128 \
         --s_kv 4096 --num_qo_heads 32 --num_kv_heads 8 --head_dim_qk 128 \
         --page_size 16 --causal --pa_legacy --output_path pa.csv
 
-    python benchmarks/bench_paged_attention.py \
-        --testlist benchmarks/bench_paged_attention_testlist.txt \
+    python benchmarks/experimental/paged_attention/bench_paged_attention.py \
+        --testlist benchmarks/experimental/paged_attention/bench_paged_attention_testlist.txt \
         --output_path pa.csv
 
 Times the experimental :class:`flashinfer.prefill.PagedAttention` facade on
@@ -223,7 +223,7 @@ def _load_reference_oracle():
     suite and fuzzer use) and keeps ``--help`` free of any dependency on it.
     """
     path = (
-        pathlib.Path(__file__).resolve().parents[1]
+        pathlib.Path(__file__).resolve().parents[3]
         / "tests"
         / "experimental"
         / "paged_attention"

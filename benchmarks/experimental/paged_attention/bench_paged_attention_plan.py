@@ -26,7 +26,7 @@ the kernels run once, only to make the launch counts complete.
 
 Usage (inside the test container)::
 
-    python benchmarks/bench_paged_attention_plan.py \
+    python benchmarks/experimental/paged_attention/bench_paged_attention_plan.py \
         --backends fa2,cudnn,trtllm-gen --forms dense,csr --mirrors with,without \
         --shapes chunked,ragged --repeat 30 --json /tmp/plan_cost.json
 """
